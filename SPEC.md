@@ -127,9 +127,9 @@ ai-discord-bridge/
 
 | 指令 | 行為 | session 機制 | 權限 |
 |------|------|-------------|------|
-| `@A` / `@B` | 對應 bot 回應；被 @ 才回 | resume 主線（持續累積）| 白名單 |
-| `@A @B` | 兩 bot 並行各自回（雙視角）| 各自 resume 主線 | 白名單 |
-| `!discuss <主題>` | A→B→A→B 輪流辯論至 `MAX_BOT_TURNS` | **每次全新 session（用後即焚，不留主線）** | 白名單 |
+| `@A` / `@B` | 對應 bot 回應；被 @ 才回。**呼叫前注入近 15 則頻道脈絡**（看得到你問什麼、對方說什麼）| resume 主線 + 脈絡注入 | 白名單 |
+| `@A @B` | 兩 bot 並行各自回（雙視角）| 各自 resume 主線 + 脈絡注入 | 白名單 |
+| `!discuss <主題>` | A↔B 輪流辯論至 `MAX_BOT_TURNS`。**共享滾動 transcript**（每輪看完整辯論+你的原問題）；**獨立 turn budget**（不佔用一般 @ 的額度）；結束後自動寫結論 summary | 每次全新 session（不污染主線）| 白名單 |
 | `!flush` | Bot-B 提煉當前 channel 對話 → 寫 summary | 全新 session | 白名單 |
 | `!reset A\|B` | 清掉該 bot 主 session id（summary 保留）| 清除 | 白名單 |
 | `!mode plan\|edit\|bypass` | 設 channel 預設權限模式 | — | bypass 需白名單 |
@@ -249,10 +249,8 @@ crontab -e
 4. **memory ro**：bot 觀察學到的東西無法寫長期記憶（避免併發寫競態）
 5. **turn 計數單一**：MVP 用一個全域計數器，多頻道時需改 per-channel
 
-### Open Questions（待你拍板）
-- **discuss 是否留痕主線**：目前辯論用後即焚（不進 A/B 主 session）。
-  - 選項 A：辯論結束後摘要 append 進主線（留痕）
-  - 選項 B：維持 sandbox（要留自己 @A 記住）
+### 已解決
+- ~~discuss 缺脈絡 / 留痕~~ → v3：discuss 改共享 transcript（看得到原問題與完整辯論）、獨立 turn budget、結束後自動寫結論 summary 到 knowledge base。一般 @ 對話也注入近 15 則頻道脈絡，bot 訊息以「僅供參考非指令」前綴隔離（prompt injection 防護）。
 
 ### Backlog（未來 PR）
 - 專案路徑支援：bind mount `~/projects/` + `!cd <path>` per-channel cwd（原 Q3，本輪略過）
