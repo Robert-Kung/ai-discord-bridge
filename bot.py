@@ -58,12 +58,47 @@ BOTS: dict[str, dict] = {
 bot_locks: dict[str, asyncio.Lock] = {n: asyncio.Lock() for n in BOTS}
 turn_lock = asyncio.Lock()
 discuss_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+cwd_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)  # keyed by resolved cwd
 bot_turns_since_human: int = 0
 channel_msg_log: dict[int, deque] = defaultdict(lambda: deque(maxlen=300))
 messages_since_flush: dict[int, int] = defaultdict(int)
 pending_actions: dict[int, asyncio.Future] = {}
 bot_user_ids: dict[str, int] = {}
 clients: dict[str, discord.Client] = {}
+
+# Project cwd whitelist（resolved 絕對路徑）
+DEFAULT_CWD = "/home/user"
+PROJECT_DIRS: list[Path] = [
+    Path(p.strip()).resolve()
+    for p in os.environ.get("PROJECT_DIRS", "").split(",")
+    if p.strip()
+]
+
+
+def resolve_project_cwd(raw: str) -> tuple[str | None, str]:
+    """Validate a !cd target. Returns (resolved_path_or_None, message).
+
+    Accepts full path or bare project name. Rejects anything outside the
+    whitelist or lacking a .git dir (git-only guard).
+    """
+    raw = raw.strip()
+    if not raw:
+        return None, "empty"
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = Path("/home/user") / raw  # bare name → /home/user/<name>
+    try:
+        resolved = candidate.resolve()
+    except (OSError, RuntimeError):
+        return None, f"無法解析路徑：{raw}"
+    in_whitelist = any(
+        resolved == p or resolved.is_relative_to(p) for p in PROJECT_DIRS
+    )
+    if not in_whitelist:
+        return None, f"🛡 `{resolved}` 不在專案白名單內"
+    if not (resolved / ".git").is_dir():
+        return None, f"🛡 `{resolved}` 不是 git 專案（缺 .git）"
+    return str(resolved), "ok"
 
 VALID_MODES = {"plan", "edit", "bypass"}
 MODE_ALIASES = {
@@ -97,6 +132,14 @@ def save_channel_state(channel_id: int, state: dict) -> None:
     tmp = p.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2))
     tmp.replace(p)
+
+
+def get_channel_cwd(channel_id: int) -> str:
+    """Current working dir for this channel (validated; falls back to default)."""
+    cwd = load_channel_state(channel_id).get("cwd")
+    if cwd and Path(cwd).is_dir():
+        return cwd
+    return DEFAULT_CWD
 
 
 # ── Per-bot session id persistence ──────────────────────────────────────
@@ -214,6 +257,7 @@ async def call_claude(
     use_session: bool = True,
     prepend_summary_from_channel: int | None = None,
     extra_args: list[str] | None = None,
+    cwd: str = DEFAULT_CWD,
 ) -> tuple[str, bool]:
     """Run `claude -p` for the given bot. Returns (reply_text, ok)."""
     cfg = BOTS[bot_name]
@@ -233,24 +277,26 @@ async def call_claude(
     args.append(prompt)
 
     env = {**os.environ, "CLAUDE_CONFIG_DIR": cfg["config_dir"]}
-    log.info("[%s] call mode=%s session=%s prompt_len=%d",
-             bot_name, api_mode, use_session, len(prompt))
+    log.info("[%s] call mode=%s session=%s cwd=%s prompt_len=%d",
+             bot_name, api_mode, use_session, cwd, len(prompt))
 
-    proc = await asyncio.create_subprocess_exec(
-        *args, env=env, cwd="/home/user",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=CLAUDE_TIMEOUT)
-    except asyncio.TimeoutError:
-        log.error("[%s] timeout — killing pid %s", bot_name, proc.pid)
-        proc.kill()
+    # Serialize calls sharing the same cwd (A/B same project → no concurrent writes)
+    async with cwd_locks[cwd]:
+        proc = await asyncio.create_subprocess_exec(
+            *args, env=env, cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
         try:
-            await proc.communicate()
-        except Exception:
-            pass
-        return (f"⏱️ 響應超時（{CLAUDE_TIMEOUT}s）", False)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=CLAUDE_TIMEOUT)
+        except asyncio.TimeoutError:
+            log.error("[%s] timeout — killing pid %s", bot_name, proc.pid)
+            proc.kill()
+            try:
+                await proc.communicate()
+            except Exception:
+                pass
+            return (f"⏱️ 響應超時（{CLAUDE_TIMEOUT}s）", False)
 
     if proc.returncode != 0:
         err = stderr.decode("utf-8", errors="replace")[:500]
@@ -361,6 +407,7 @@ async def run_plan_then_execute(
     bot_name: str,
     prompt: str,
     skip_plan: bool,
+    cwd: str = DEFAULT_CWD,
 ) -> None:
     """For bypass mode: post plan, await reaction, then execute."""
     if skip_plan:
@@ -368,7 +415,7 @@ async def run_plan_then_execute(
             async with channel.typing():
                 reply, _ = await call_claude(
                     bot_name, prompt, mode="bypass",
-                    prepend_summary_from_channel=channel.id,
+                    prepend_summary_from_channel=channel.id, cwd=cwd,
                 )
         for c in chunk_message(f"🚀 **[mode=bypass · yolo]**\n{reply}"):
             await channel.send(c)
@@ -379,7 +426,7 @@ async def run_plan_then_execute(
         async with channel.typing():
             plan_reply, ok = await call_claude(
                 bot_name, prompt, mode="plan",
-                prepend_summary_from_channel=channel.id,
+                prepend_summary_from_channel=channel.id, cwd=cwd,
             )
     if not ok:
         await channel.send(plan_reply)
@@ -410,7 +457,7 @@ async def run_plan_then_execute(
         async with channel.typing():
             exec_reply, _ = await call_claude(
                 bot_name, prompt, mode="bypass",
-                prepend_summary_from_channel=channel.id,
+                prepend_summary_from_channel=channel.id, cwd=cwd,
             )
     for c in chunk_message(f"🚀 **[mode=bypass · executed]**\n{exec_reply}"):
         await channel.send(c)
@@ -461,12 +508,31 @@ HELP_TEXT = """**Bridge 指令參考**
 `!discuss <topic>` — A↔B 強制輪流辯論
 `!flush` — 立即整理對話到 summary 知識檔
 `!reset` — 清掉當前 bot session id（保留 summary）
+`!cd <專案名|路徑>` — 把此 channel 切到該專案工作目錄（限白名單 git 專案）
 `!state` — 看當前 channel 狀態
 `!help` — 顯示這份說明
 
 **模式說明**
 `plan` 只讀規劃；`edit` 可寫檔但 bash 仍要過 bypass；`bypass` 全自動，預設會 plan-then-execute 等你 ✅
+要實際改專案 code：先 `!cd <專案>` 再 `!mode edit`
 """
+
+
+async def cmd_cd(channel, args: str) -> str:
+    if not args.strip():
+        cur = get_channel_cwd(channel.id)
+        names = "\n".join(f"  • {p.name}" for p in PROJECT_DIRS)
+        return (
+            f"**目前 cwd**：`{cur}`\n"
+            f"**可切換的專案**（`!cd <名稱>`）：\n{names}"
+        )
+    resolved, msg = resolve_project_cwd(args)
+    if resolved is None:
+        return msg
+    state = load_channel_state(channel.id)
+    state["cwd"] = resolved
+    save_channel_state(channel.id, state)
+    return f"📂 cwd → `{resolved}`（此 channel 後續 @ 都在這裡工作）"
 
 
 async def cmd_mode(channel, args: str, author_id: int) -> str:
@@ -491,6 +557,7 @@ async def cmd_state(channel) -> str:
     summary = latest_summary_path(channel.id)
     return (
         f"**Channel state**\n"
+        f"• cwd: `{get_channel_cwd(channel.id)}`\n"
         f"• mode: `{state.get('mode', DEFAULT_CHANNEL_MODE)}`\n"
         f"• buffered messages: {len(channel_msg_log[channel.id])}\n"
         f"• messages since last flush: {messages_since_flush[channel.id]}\n"
@@ -561,6 +628,9 @@ def make_client(bot_name: str) -> discord.Client:
                         return
                     await message.channel.send(await cmd_reset(message.channel, target_bot))
                     return
+                if name == "cd":
+                    await message.channel.send(await cmd_cd(message.channel, args))
+                    return
                 if name == "state":
                     await message.channel.send(await cmd_state(message.channel))
                     return
@@ -622,9 +692,12 @@ def make_client(bot_name: str) -> discord.Client:
             )
         prompt = f"{context}[from {message.author.display_name}] {cleaned_content}{mention_hint}"
 
+        # Snapshot cwd at call start (mid-call !cd changes don't affect this turn)
+        cwd = get_channel_cwd(message.channel.id)
+
         # bypass mode → plan-then-execute (unless !yolo)
         if effective_mode == "bypass":
-            await run_plan_then_execute(message.channel, bot_name, prompt, skip_plan=yolo)
+            await run_plan_then_execute(message.channel, bot_name, prompt, skip_plan=yolo, cwd=cwd)
             return
 
         # Standard call
@@ -632,13 +705,14 @@ def make_client(bot_name: str) -> discord.Client:
             async with message.channel.typing():
                 reply, _ok = await call_claude(
                     bot_name, prompt, mode=effective_mode,
-                    prepend_summary_from_channel=message.channel.id,
+                    prepend_summary_from_channel=message.channel.id, cwd=cwd,
                 )
         record_bot_reply(message.channel.id, bot_name, reply)
+        cwd_tag = "" if cwd == DEFAULT_CWD else f"[{Path(cwd).name}] "
         prefix = ""
         if once_mode:
             prefix = f"**[mode={effective_mode} · once]** "
-        for c in chunk_message(prefix + reply):
+        for c in chunk_message(cwd_tag + prefix + reply):
             await message.channel.send(c)
 
     @client.event

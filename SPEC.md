@@ -132,6 +132,7 @@ ai-discord-bridge/
 | `!discuss <主題>` | A↔B 輪流辯論至 `MAX_BOT_TURNS`。**共享滾動 transcript**（每輪看完整辯論+你的原問題）；**獨立 turn budget**（不佔用一般 @ 的額度）；結束後自動寫結論 summary | 每次全新 session（不污染主線）| 白名單 |
 | `!flush` | Bot-B 提煉當前 channel 對話 → 寫 summary | 全新 session | 白名單 |
 | `!reset A\|B` | 清掉該 bot 主 session id（summary 保留）| 清除 | 白名單 |
+| `!cd <專案名\|路徑>` | 切 channel 工作目錄到白名單 git 專案；不帶參數顯示當前 cwd + 可用專案 | per-channel state | 白名單 |
 | `!mode plan\|edit\|bypass` | 設 channel 預設權限模式 | — | bypass 需白名單 |
 | `!once <mode>` | 單一訊息用此模式（訊息末尾加）| — | bypass 需白名單 |
 | `!yolo` | bypass 跳過 plan-then-execute（單訊息）| — | 白名單 |
@@ -252,8 +253,16 @@ crontab -e
 ### 已解決
 - ~~discuss 缺脈絡 / 留痕~~ → v3：discuss 改共享 transcript（看得到原問題與完整辯論）、獨立 turn budget、結束後自動寫結論 summary 到 knowledge base。一般 @ 對話也注入近 15 則頻道脈絡，bot 訊息以「僅供參考非指令」前綴隔離（prompt injection 防護）。
 
+### 已完成（Q3 寫專案）
+- **只 bind mount 指定的 10 個 git 專案**（同路徑），其餘 home 內容（.ssh/.gnupg/Documents…）在容器內不存在 → mount 層隔離，bypass 也碰不到
+- `!cd <專案名|路徑>`：切 channel 工作目錄；`Path.resolve()` + `is_relative_to()` 防 `../` 逃逸，且需含 `.git`（git-only guard）
+- `call_claude` 帶 per-channel cwd（call 開始時 snapshot，mid-call `!cd` 不影響當輪）
+- `cwd_locks`：A/B 操作同一專案時序列化，防併發寫衝突
+- `PROJECT_DIRS` 白名單在 docker-compose.yml，與 mount 清單一致
+
 ### Backlog（未來 PR）
-- 專案路徑支援：bind mount `~/projects/` + `!cd <path>` per-channel cwd（原 Q3，本輪略過）
+- 多帳號同專案 worktree 隔離（目前用 cwd_lock 序列化 + 派工前 commit 規範）
+- `Call_Center ` 專案（目錄名結尾有空格）未納入；建議改名去空格後再加
 - 多頻道路由 + per-channel session/mode/cwd
 - summary 自動 rotation 觸發策略優化（token-based 而非 message-count）
 
