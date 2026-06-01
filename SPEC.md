@@ -127,7 +127,7 @@ ai-discord-bridge/
 
 | 指令 | 行為 | session 機制 | 權限 |
 |------|------|-------------|------|
-| `@A` / `@B` | 對應 bot 回應；被 @ 才回。**呼叫前注入近 15 則頻道脈絡**（看得到你問什麼、對方說什麼）| resume 主線 + 脈絡注入 | 白名單 |
+| `@A` / `@B` | 對應 bot 回應；被 @ 才回。**呼叫前注入近 15 則頻道脈絡**（看得到你問什麼、對方說什麼）。bot 可在回覆中 `@對方` 徵詢第二意見 → 觸發 mention 鏈接話（受 `MAX_BOT_TURNS` 限制）| resume 主線 + 脈絡注入 | 白名單 |
 | `@A @B` | 兩 bot 並行各自回（雙視角）| 各自 resume 主線 + 脈絡注入 | 白名單 |
 | `!discuss <主題>` | A↔B 輪流辯論至 `MAX_BOT_TURNS`。**共享滾動 transcript**（每輪看完整辯論+你的原問題）；**獨立 turn budget**（不佔用一般 @ 的額度）；結束後自動寫結論 summary | 每次全新 session（不污染主線）| 白名單 |
 | `!flush` | Bot-B 提煉當前 channel 對話 → 寫 summary | 全新 session | 白名單 |

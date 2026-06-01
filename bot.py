@@ -609,7 +609,18 @@ def make_client(bot_name: str) -> discord.Client:
         # Inject recent channel context so the bot sees cross-bot exchanges
         # and the user's original question — not just this single message.
         context = build_context_prefix(message.channel.id, limit=15)
-        prompt = f"{context}[from {message.author.display_name}] {cleaned_content}"
+        # Collaboration hint: let this bot @ the other one when a second
+        # opinion genuinely adds value (realizes the natural mention chain).
+        other = "B" if bot_name == "A" else "A"
+        other_id = bot_user_ids.get(other)
+        mention_hint = ""
+        if other_id:
+            mention_hint = (
+                f"\n\n[協作提示] 若你認為 Bot-{other} 的觀點能明顯加值"
+                f"（跨領域、需要第二意見、或你不確定），可在回覆結尾 @他徵詢："
+                f"<@{other_id}>。不需要時就獨立答完，不要為了熱鬧而 @。"
+            )
+        prompt = f"{context}[from {message.author.display_name}] {cleaned_content}{mention_hint}"
 
         # bypass mode → plan-then-execute (unless !yolo)
         if effective_mode == "bypass":
