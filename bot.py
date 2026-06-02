@@ -52,7 +52,11 @@ ALLOWED_USER_IDS = {
 MAX_BOT_TURNS = int(os.environ.get("MAX_BOT_TURNS", "6"))
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "300"))
 AUTO_FLUSH_THRESHOLD = int(os.environ.get("AUTO_FLUSH_THRESHOLD", "20"))
+# token-based flush (autocompact analog): when a bot's resumed context reaches
+# this many tokens, write summary + reset that bot's session. 0 disables it.
+FLUSH_TOKEN_THRESHOLD = int(os.environ.get("FLUSH_TOKEN_THRESHOLD", "120000"))
 PLAN_REACTION_TIMEOUT = int(os.environ.get("PLAN_REACTION_TIMEOUT", "300"))
+CSWAP_USAGE_FILE = STATE_DIR / "cswap-usage.json"  # written by host cron, read here
 
 BOTS: dict[str, dict] = {
     "A": {"token": os.environ["DISCORD_BOT_A_TOKEN"], "config_dir": "/home/user/.claude"},
@@ -67,6 +71,8 @@ cwd_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)  # keyed by resol
 bot_turns_since_human: int = 0
 channel_msg_log: dict[int, deque] = defaultdict(lambda: deque(maxlen=300))
 messages_since_flush: dict[int, int] = defaultdict(int)
+# last-seen resumed-context size per (bot, cwd), from each call's usage report
+session_ctx_tokens: dict[tuple[str, str], int] = defaultdict(int)
 pending_actions: dict[int, asyncio.Future] = {}
 bot_user_ids: dict[str, int] = {}
 clients: dict[str, discord.Client] = {}
@@ -389,6 +395,14 @@ async def call_claude(
     new_sid = data.get("session_id")
     if new_sid and use_session:
         save_session(bot_name, new_sid, cwd)
+    # record real context size (input + cache) so token-based flush can fire
+    if use_session:
+        u = data.get("usage") or {}
+        ctx = (u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
+               + u.get("cache_creation_input_tokens", 0))
+        if ctx:
+            session_ctx_tokens[(bot_name, cwd)] = ctx
+            log.info("[%s] context now ~%dk tokens (cwd=%s)", bot_name, ctx // 1000, cwd)
     return (reply, True)
 
 
@@ -470,6 +484,27 @@ async def do_flush(channel_id: int, *, manual: bool = False,
         messages_since_flush[channel_id] = 0
     log.info("flushed channel=%d cwd=%s -> %s (manual=%s)", channel_id, cwd, path, manual)
     return f"📝 已寫入 summary：`{path.name}` ({len(reply)} chars)"
+
+
+async def maybe_token_flush(channel, bot_name: str, cwd: str) -> None:
+    """Autocompact analog: if this bot's resumed context crossed the token
+    threshold, write a summary (+ notes) then reset its session so the next
+    call starts small. The summary is auto-prepended on the next call, so state
+    survives the reset. Unlike the message-count flush, this DOES reset session."""
+    if not FLUSH_TOKEN_THRESHOLD:
+        return
+    ctx = session_ctx_tokens.get((bot_name, cwd), 0)
+    if ctx < FLUSH_TOKEN_THRESHOLD:
+        return
+    await do_flush(channel.id, manual=False)
+    clear_session(bot_name, cwd)
+    session_ctx_tokens[(bot_name, cwd)] = 0
+    where = "~" if cwd == DEFAULT_CWD else Path(cwd).name
+    await channel.send(
+        f"🧠 Bot-{bot_name} 在 `{where}` 的 context 已達 ~{ctx // 1000}k tokens"
+        f"（≥ {FLUSH_TOKEN_THRESHOLD // 1000}k autocompact 門檻）→ 已濃縮成 summary "
+        "並重置該對話線，摘要會在下次自動帶回。"
+    )
 
 
 # ── Discuss mode ────────────────────────────────────────────────────────
@@ -643,7 +678,7 @@ HELP_TEXT = """**Bridge 指令參考**
 `!flush` — 立即整理對話到 summary 知識檔
 `!reset` — 清掉當前 bot session id（保留 summary）
 `!cd <專案名|路徑>` — 把此 channel 切到該專案工作目錄（限白名單 git 專案）
-`!state` — 看當前 channel 狀態
+`!state` — 看當前狀態（cwd / mode / context tokens / A·B 帳號 5h·7d 用量）
 `!help` — 顯示這份說明
 
 **模式說明**
@@ -699,20 +734,50 @@ async def cmd_reset(channel, bot_name: str) -> str:
     return f"♻️ {bot_name} 在 `{Path(cwd).name}` 的 session 清除（summary 保留）"
 
 
+def read_cswap_usage() -> str:
+    """Render both accounts' 5h/7d quota from the host-written cswap snapshot.
+    cswap can't run inside the container, so a host cron writes this JSON."""
+    p = CSWAP_USAGE_FILE
+    if not p.exists():
+        return ("• 帳號用量: (無 cswap-usage.json — 需在 host 跑 "
+                "`scripts/refresh-cswap-usage.py`，建議掛 cron)")
+    try:
+        d = json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError):
+        return "• 帳號用量: (cswap-usage.json 解析失敗)"
+    age_min = int((time.time() - d.get("generated_at", 0)) // 60)
+    label = {1: "A", 2: "B"}
+    lines = [f"• 帳號用量（cswap · {age_min} 分前）:"]
+    for acc in d.get("accounts", []):
+        who = label.get(acc.get("slot"), f"slot{acc.get('slot')}")
+        active = " ⚡" if acc.get("active") else ""
+        lines.append(
+            f"   {who}{active} {acc.get('email', '?')}: "
+            f"5h {acc.get('h5_pct', '?')}%（reset {acc.get('h5_resets', '?')}）· "
+            f"7d {acc.get('d7_pct', '?')}%（reset {acc.get('d7_resets', '?')}）"
+        )
+    return "\n".join(lines)
+
+
 async def cmd_state(channel) -> str:
     state = load_channel_state(channel.id)
     cwd = get_channel_cwd(channel.id)
     summary = latest_summary_path(channel.id, cwd)
     notes = project_notes_path(cwd)
     has_notes = "✅" if (cwd != DEFAULT_CWD and notes.exists()) else "—"
+    a_ctx = session_ctx_tokens.get(("A", cwd), 0)
+    b_ctx = session_ctx_tokens.get(("B", cwd), 0)
     return (
         f"**Channel state**\n"
         f"• cwd: `{cwd}`\n"
         f"• mode: `{state.get('mode', DEFAULT_CHANNEL_MODE)}`\n"
         f"• buffered messages: {len(channel_msg_log[channel.id])}\n"
         f"• messages since last flush: {messages_since_flush[channel.id]}\n"
-        f"• latest summary (此 cwd): `{summary.name if summary else '(none)'}`\n"
-        f"• 專案筆記: {has_notes}"
+        f"• context（此 cwd）: A ~{a_ctx // 1000}k · B ~{b_ctx // 1000}k"
+        f"（token-flush 門檻 {FLUSH_TOKEN_THRESHOLD // 1000}k）\n"
+        f"• latest summary（此 cwd）: `{summary.name if summary else '(none)'}`\n"
+        f"• 專案筆記: {has_notes}\n"
+        + read_cswap_usage()
     )
 
 
@@ -867,6 +932,7 @@ def make_client(bot_name: str) -> discord.Client:
             prefix = f"**[mode={effective_mode} · once]** "
         for c in chunk_message(cwd_tag + prefix + reply):
             await message.channel.send(c)
+        await maybe_token_flush(message.channel, bot_name, cwd)
 
     @client.event
     async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
@@ -895,8 +961,10 @@ STARTUP_ANNOUNCEMENT = """🚀 **Bridge v3 上線**
 • `!flush` 立即整理對話 → summary（+ 在專案內時一併更新專案筆記）
 • `!reset A|B` 清掉 bot session（summary 保留）
 • 每 {auto} 則訊息自動 flush；summary / 專案筆記都**按 cwd 分開**
+• context 達 token 門檻自動「濃縮+重置對話線」（autocompact 模式，省 quota）
 • `!cd <專案>` 切走時自動把舊專案進度寫入專案筆記
 • 每次回應自動注入「該專案的 summary + 專案筆記」當 context
+• `!state` 可看兩帳號 5h/7d 用量（cswap）
 
 **🎭 多模式對話**
 • `@A`、`@B` 單獨叫 — 自然回，被 @ 才接話
