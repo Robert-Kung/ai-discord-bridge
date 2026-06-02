@@ -407,6 +407,10 @@ async def do_flush(channel_id: int, *, manual: bool = False,
     transcript = (transcript_override if transcript_override is not None
                   else format_buffer_transcript(channel_id, cwd=cwd))
     if not transcript or len(transcript) < 200:
+        # reset counter for current-cwd flushes so we don't re-spawn a skipped
+        # flush task on every subsequent message once over the threshold
+        if cwd_override is None:
+            messages_since_flush[channel_id] = 0
         return "(對話太短，跳過 flush)"
 
     is_project = cwd != DEFAULT_CWD
@@ -460,7 +464,8 @@ async def do_flush(channel_id: int, *, manual: bool = False,
                 f"+ 專案筆記 `{Path(cwd).name}/notes.md` ({len(proj_notes)} chars)")
 
     # DEFAULT_CWD, or project flush where the model didn't emit the delimiter
-    path = save_summary(channel_id, reply, cwd)
+    # (strip the summary header if it leaked through the non-delimited fallback)
+    path = save_summary(channel_id, reply.replace(_SUMMARY_DELIM, "").strip(), cwd)
     if cwd_override is None:
         messages_since_flush[channel_id] = 0
     log.info("flushed channel=%d cwd=%s -> %s (manual=%s)", channel_id, cwd, path, manual)
@@ -544,6 +549,7 @@ async def run_plan_then_execute(
                     bot_name, prompt, mode="bypass",
                     prepend_summary_from_channel=channel.id, cwd=cwd,
                 )
+        record_bot_reply(channel.id, bot_name, reply[:1000], cwd=cwd)
         for c in chunk_message(f"🚀 **[mode=bypass · yolo]**\n{reply}"):
             await channel.send(c)
         return
@@ -586,6 +592,7 @@ async def run_plan_then_execute(
                 bot_name, prompt, mode="bypass",
                 prepend_summary_from_channel=channel.id, cwd=cwd,
             )
+    record_bot_reply(channel.id, bot_name, exec_reply[:1000], cwd=cwd)
     for c in chunk_message(f"🚀 **[mode=bypass · executed]**\n{exec_reply}"):
         await channel.send(c)
 
@@ -669,6 +676,8 @@ async def cmd_cd(channel, args: str) -> str:
     state = load_channel_state(channel.id)
     state["cwd"] = resolved
     save_channel_state(channel.id, state)
+    # switching project = fresh flush count (old cwd's progress went to bg flush)
+    messages_since_flush[channel.id] = 0
     return f"📂 cwd → `{resolved}`（此 channel 後續 @ 都在這裡工作）{extra}"
 
 
@@ -736,8 +745,10 @@ def make_client(bot_name: str) -> discord.Client:
         # Only one bot writes to buffer + handles commands (Bot-A is primary)
         if bot_name == "A":
             buffer_append(message)
-            # auto-flush
+            # auto-flush — reset BEFORE spawning so messages arriving while the
+            # flush runs don't stack duplicate concurrent flush tasks (quota waste)
             if messages_since_flush[message.channel.id] >= AUTO_FLUSH_THRESHOLD:
+                messages_since_flush[message.channel.id] = 0
                 asyncio.create_task(do_flush(message.channel.id, manual=False))
 
         # mention check (user mention or bot's role)
