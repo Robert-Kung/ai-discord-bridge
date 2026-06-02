@@ -1,8 +1,10 @@
-"""Discord ↔ dual-account Claude Code bridge — v2.
+"""Discord ↔ dual-account Claude Code bridge — v3.
 
 Features:
   - Channel message buffer + manual !flush + auto-flush every N messages
-  - Summary persistence in ~/.claude-shared/discord-summaries/<channel>/
+  - Summary persistence (per-(channel, cwd)) in discord-summaries/<channel>/<cwd-slug>/
+  - Per-project notes (per-cwd) in discord-project-notes/<cwd-slug>/notes.md
+  - flush 一次呼叫產出 summary + project notes（雙段分隔，省 quota）
   - --append-system-prompt-file prepends latest summary into every call
   - !discuss <topic>     sequential A↔B debate
   - !mode plan|edit|bypass  per-channel default permission mode
@@ -37,8 +39,11 @@ log = logging.getLogger("bridge")
 SHARED_DIR = Path("/home/user/.claude-shared")
 STATE_DIR = SHARED_DIR / "discord-state"
 SUMMARIES_DIR = SHARED_DIR / "discord-summaries"
+# 專案層記憶：放 rw 的 .claude-shared 下、但不在容器內 ro 掛載的 memory/ → bot 可寫
+PROJECT_NOTES_DIR = SHARED_DIR / "discord-project-notes"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 SUMMARIES_DIR.mkdir(parents=True, exist_ok=True)
+PROJECT_NOTES_DIR.mkdir(parents=True, exist_ok=True)
 
 CHANNEL_ID = int(os.environ["DISCORD_CHANNEL_ID"])
 ALLOWED_USER_IDS = {
@@ -175,26 +180,77 @@ def clear_session(bot_name: str, cwd: str = DEFAULT_CWD) -> None:
     _session_path(bot_name, cwd).unlink(missing_ok=True)
 
 
-# ── Summary persistence ─────────────────────────────────────────────────
-def channel_summary_dir(channel_id: int) -> Path:
-    d = SUMMARIES_DIR / str(channel_id)
+# ── Summary persistence (中期層 · per-(channel, cwd)) ────────────────────
+def channel_summary_dir(channel_id: int, cwd: str = DEFAULT_CWD) -> Path:
+    d = SUMMARIES_DIR / str(channel_id) / _cwd_slug(cwd)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def latest_summary_path(channel_id: int) -> Path | None:
-    p = channel_summary_dir(channel_id) / "latest.md"
+def latest_summary_path(channel_id: int, cwd: str = DEFAULT_CWD) -> Path | None:
+    p = channel_summary_dir(channel_id, cwd) / "latest.md"
     return p if p.exists() else None
 
 
-def save_summary(channel_id: int, content: str) -> Path:
-    d = channel_summary_dir(channel_id)
+def save_summary(channel_id: int, content: str, cwd: str = DEFAULT_CWD) -> Path:
+    d = channel_summary_dir(channel_id, cwd)
     ts = time.strftime("%Y%m%d-%H%M%S")
     target = d / f"{ts}.md"
     target.write_text(content)
     latest = d / "latest.md"
     latest.write_text(content)  # plain copy avoids bind-mount symlink quirks
     return target
+
+
+# ── Project notes persistence (專案層 · per-cwd) ─────────────────────────
+def project_notes_dir(cwd: str) -> Path:
+    d = PROJECT_NOTES_DIR / _cwd_slug(cwd)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def project_notes_path(cwd: str) -> Path:
+    return project_notes_dir(cwd) / "notes.md"
+
+
+def save_project_notes(cwd: str, content: str) -> Path:
+    """Write notes.md; rotate the previous version to a timestamped snapshot,
+    keeping only the 3 most recent (人工回溯用，非 GC)。"""
+    d = project_notes_dir(cwd)
+    notes = d / "notes.md"
+    if notes.exists():
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        target = d / f"{ts}.md"
+        n = 1
+        while target.exists():  # same-second flushes must not clobber a snapshot
+            target = d / f"{ts}-{n}.md"
+            n += 1
+        notes.replace(target)
+        # keep the 3 most recent snapshots by mtime (robust to same-second names)
+        snaps = sorted(d.glob("2*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in snaps[3:]:
+            old.unlink(missing_ok=True)
+    notes.write_text(content)
+    return notes
+
+
+def build_combined_system_prompt(channel_id: int, cwd: str, bot_name: str) -> Path | None:
+    """Merge 中期 summary + 專案 notes into ONE file for --append-system-prompt-file
+    (the flag only takes one file). temp file is keyed by (channel, bot) so A/B
+    calling the same channel concurrently don't clobber each other's file."""
+    parts: list[str] = []
+    latest = latest_summary_path(channel_id, cwd)
+    if latest:
+        parts.append("# 對話摘要（中期記憶）\n\n" + latest.read_text())
+    if cwd != DEFAULT_CWD:
+        notes = project_notes_path(cwd)
+        if notes.exists():
+            parts.append(f"# 專案筆記（{Path(cwd).name}）\n\n" + notes.read_text())
+    if not parts:
+        return None
+    tmp = Path("/tmp") / f"_sysprompt_{channel_id}_{bot_name}.md"
+    tmp.write_text("\n\n---\n\n".join(parts))
+    return tmp
 
 
 # ── Message buffer ──────────────────────────────────────────────────────
@@ -208,16 +264,19 @@ def buffer_append(message: discord.Message) -> None:
         "bot": message.author.bot,
         "content": message.content,
         "ts": message.created_at.isoformat(),
+        "cwd": get_channel_cwd(message.channel.id),  # tag for per-cwd flush boundary
     })
     messages_since_flush[message.channel.id] += 1
 
 
-def record_bot_reply(channel_id: int, bot_name: str, content: str) -> None:
+def record_bot_reply(channel_id: int, bot_name: str, content: str,
+                     cwd: str = DEFAULT_CWD) -> None:
     """Record a bot's own outgoing reply into the transcript buffer.
 
     Needed because Bot-A filters out its own messages in on_message, so its
     replies would otherwise be missing from the shared channel transcript.
     Does NOT bump messages_since_flush (replies don't drive auto-flush).
+    Tagged with cwd so per-cwd flush only picks up that project's lines.
     """
     channel_msg_log[channel_id].append({
         "id": None,
@@ -225,11 +284,18 @@ def record_bot_reply(channel_id: int, bot_name: str, content: str) -> None:
         "bot": True,
         "content": content,
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "cwd": cwd,
     })
 
 
-def format_buffer_transcript(channel_id: int, limit: int = 80) -> str:
-    items = list(channel_msg_log[channel_id])[-limit:]
+def format_buffer_transcript(channel_id: int, cwd: str | None = None,
+                             limit: int = 80) -> str:
+    """Render buffered messages. If cwd given, only lines tagged with that cwd
+    (the flush boundary — a !flush for project X never mixes in project Y)."""
+    items = list(channel_msg_log[channel_id])
+    if cwd is not None:
+        items = [m for m in items if m.get("cwd", DEFAULT_CWD) == cwd]
+    items = items[-limit:]
     return "\n".join(
         f"[{m['ts'][:19]}] {m['author']}{' (bot)' if m['bot'] else ''}: {m['content']}"
         for m in items
@@ -279,9 +345,9 @@ async def call_claude(
         if sid:
             args += ["--resume", sid]
     if prepend_summary_from_channel is not None:
-        latest = latest_summary_path(prepend_summary_from_channel)
-        if latest:
-            args += ["--append-system-prompt-file", str(latest)]
+        combined = build_combined_system_prompt(prepend_summary_from_channel, cwd, bot_name)
+        if combined:
+            args += ["--append-system-prompt-file", str(combined)]
     if extra_args:
         args += extra_args
     args.append(prompt)
@@ -326,28 +392,78 @@ async def call_claude(
     return (reply, True)
 
 
-# ── Summary generation (uses Bot-B as worker by convention) ─────────────
-async def do_flush(channel_id: int, *, manual: bool = False) -> str:
-    transcript = format_buffer_transcript(channel_id)
+# ── Flush: 中期 summary + 專案 notes（單次呼叫雙段輸出）──────────────────
+# Bot-B 當 worker（慣例）。在專案 cwd 時一次產出 summary + project notes，
+# 用分隔線切分 → quota 減半。呼叫本身跑在 DEFAULT_CWD（純文字任務，不持
+# 專案 cwd_lock，避免卡在 Bot-B 該專案長任務後面）。
+_NOTES_DELIM = "=== PROJECT_NOTES ==="
+_SUMMARY_DELIM = "=== CHANNEL_SUMMARY ==="
+
+
+async def do_flush(channel_id: int, *, manual: bool = False,
+                   cwd_override: str | None = None,
+                   transcript_override: str | None = None) -> str:
+    cwd = cwd_override if cwd_override is not None else get_channel_cwd(channel_id)
+    transcript = (transcript_override if transcript_override is not None
+                  else format_buffer_transcript(channel_id, cwd=cwd))
     if not transcript or len(transcript) < 200:
         return "(對話太短，跳過 flush)"
 
-    prompt = (
-        "請整理以下 Discord 頻道對話為精煉 markdown 知識文件。\n"
-        "保留：(1) 決策與結論 (2) 進行中的任務 / open questions "
-        "(3) 提到的關鍵檔案/路徑 (4) 參與者與角色脈絡。\n"
-        "不要逐字複述，500 字內。\n\n--- 對話原文 ---\n" + transcript
-    )
+    is_project = cwd != DEFAULT_CWD
+    existing_notes = ""
+    if is_project:
+        np = project_notes_path(cwd)
+        if np.exists():
+            existing_notes = np.read_text()
+
+    if is_project:
+        compress_hint = ("（現有筆記已過長，請積極刪除過時資訊，嚴格控制篇幅）"
+                         if len(existing_notes) > 3000 else "")
+        prompt = (
+            "請整理以下 Discord 頻道對話，產出兩段，**嚴格**用分隔線隔開、"
+            "分隔線獨立成行：\n\n"
+            f"{_SUMMARY_DELIM}\n"
+            "（對話摘要，500 字內：保留 決策與結論、進行中任務/open questions、"
+            "提到的關鍵檔案路徑、參與者角色脈絡。不要逐字複述。）\n\n"
+            f"{_NOTES_DELIM}\n"
+            "（專案筆記，400 字內：合併「現有專案筆記」與本次新資訊（合併非追加），"
+            f"固定四區塊 `## 架構決策` / `## 進行中任務` / `## 關鍵路徑` / `## Open Questions`。{compress_hint}）\n\n"
+            f"=== 現有專案筆記 ===\n{existing_notes or '(尚無)'}\n\n"
+            f"=== 對話原文 ===\n{transcript}"
+        )
+    else:
+        prompt = (
+            "請整理以下 Discord 頻道對話為精煉 markdown 知識文件。\n"
+            "保留：(1) 決策與結論 (2) 進行中的任務 / open questions "
+            "(3) 提到的關鍵檔案/路徑 (4) 參與者與角色脈絡。\n"
+            "不要逐字複述，500 字內。\n\n--- 對話原文 ---\n" + transcript
+        )
+
     reply, ok = await call_claude(
         "B", prompt, mode="plan", use_session=False,
-        prepend_summary_from_channel=None,
+        prepend_summary_from_channel=None, cwd=DEFAULT_CWD,
     )
     if not ok:
         return reply
 
-    path = save_summary(channel_id, reply)
-    messages_since_flush[channel_id] = 0
-    log.info("flushed channel=%d -> %s (manual=%s)", channel_id, path, manual)
+    if is_project and _NOTES_DELIM in reply:
+        ch_part, notes_part = reply.split(_NOTES_DELIM, 1)
+        ch_summary = ch_part.replace(_SUMMARY_DELIM, "").strip()
+        proj_notes = notes_part.strip()
+        sum_path = save_summary(channel_id, ch_summary, cwd)
+        notes_path = save_project_notes(cwd, proj_notes)
+        if cwd_override is None:
+            messages_since_flush[channel_id] = 0
+        log.info("flushed channel=%d cwd=%s -> %s + notes %s (manual=%s)",
+                 channel_id, cwd, sum_path.name, notes_path.name, manual)
+        return (f"📝 summary `{sum_path.name}` ({len(ch_summary)} chars) "
+                f"+ 專案筆記 `{Path(cwd).name}/notes.md` ({len(proj_notes)} chars)")
+
+    # DEFAULT_CWD, or project flush where the model didn't emit the delimiter
+    path = save_summary(channel_id, reply, cwd)
+    if cwd_override is None:
+        messages_since_flush[channel_id] = 0
+    log.info("flushed channel=%d cwd=%s -> %s (manual=%s)", channel_id, cwd, path, manual)
     return f"📝 已寫入 summary：`{path.name}` ({len(reply)} chars)"
 
 
@@ -362,6 +478,7 @@ async def run_discuss(channel: discord.TextChannel, topic: str) -> None:
     - On completion, writes a summary into the shared knowledge base.
     """
     async with discuss_locks[channel.id]:
+        cwd = get_channel_cwd(channel.id)
         # Seed transcript with recent channel context (carries user's question)
         seed = build_context_prefix(channel.id, limit=12)
         transcript: list[str] = []  # ["[A 第1輪] ...", "[B 第1輪] ...", ...]
@@ -388,7 +505,7 @@ async def run_discuss(channel: discord.TextChannel, topic: str) -> None:
                 await channel.send(f"⚠️ discuss 中斷：{reply}")
                 return
             transcript.append(f"[{bot_name} 第{round_label}輪]\n{reply}")
-            record_bot_reply(channel.id, bot_name, f"(discuss) {reply}")
+            record_bot_reply(channel.id, bot_name, f"(discuss) {reply}", cwd=cwd)
             header = f"**[discuss {round_num + 1}/{MAX_BOT_TURNS} · {bot_name}]**"
             for chunk in chunk_message(f"{header}\n{reply}"):
                 await channel.send(chunk)
@@ -407,7 +524,7 @@ async def run_discuss(channel: discord.TextChannel, topic: str) -> None:
             "B", flush_prompt, mode="plan", use_session=False,
         )
         if ok:
-            path = save_summary(channel.id, summary)
+            path = save_summary(channel.id, summary, cwd)
             await channel.send(f"📝 辯論結論已存：`{path.name}`")
 
 
@@ -539,10 +656,20 @@ async def cmd_cd(channel, args: str) -> str:
     resolved, msg = resolve_project_cwd(args)
     if resolved is None:
         return msg
+    # flush-before-switch: snapshot the OLD project's transcript BEFORE we mutate
+    # state, then update notes in the background (B review a — fix snapshot order).
+    old_cwd = get_channel_cwd(channel.id)
+    extra = ""
+    if old_cwd != resolved and old_cwd != DEFAULT_CWD:
+        transcript = format_buffer_transcript(channel.id, cwd=old_cwd)
+        if transcript and len(transcript) >= 200:
+            asyncio.create_task(do_flush(
+                channel.id, cwd_override=old_cwd, transcript_override=transcript))
+            extra = f"\n💾 已在背景把 `{Path(old_cwd).name}` 的進度寫入專案筆記"
     state = load_channel_state(channel.id)
     state["cwd"] = resolved
     save_channel_state(channel.id, state)
-    return f"📂 cwd → `{resolved}`（此 channel 後續 @ 都在這裡工作）"
+    return f"📂 cwd → `{resolved}`（此 channel 後續 @ 都在這裡工作）{extra}"
 
 
 async def cmd_mode(channel, args: str, author_id: int) -> str:
@@ -565,14 +692,18 @@ async def cmd_reset(channel, bot_name: str) -> str:
 
 async def cmd_state(channel) -> str:
     state = load_channel_state(channel.id)
-    summary = latest_summary_path(channel.id)
+    cwd = get_channel_cwd(channel.id)
+    summary = latest_summary_path(channel.id, cwd)
+    notes = project_notes_path(cwd)
+    has_notes = "✅" if (cwd != DEFAULT_CWD and notes.exists()) else "—"
     return (
         f"**Channel state**\n"
-        f"• cwd: `{get_channel_cwd(channel.id)}`\n"
+        f"• cwd: `{cwd}`\n"
         f"• mode: `{state.get('mode', DEFAULT_CHANNEL_MODE)}`\n"
         f"• buffered messages: {len(channel_msg_log[channel.id])}\n"
         f"• messages since last flush: {messages_since_flush[channel.id]}\n"
-        f"• latest summary: `{summary.name if summary else '(none)'}`"
+        f"• latest summary (此 cwd): `{summary.name if summary else '(none)'}`\n"
+        f"• 專案筆記: {has_notes}"
     )
 
 
@@ -718,7 +849,7 @@ def make_client(bot_name: str) -> discord.Client:
                     bot_name, prompt, mode=effective_mode,
                     prepend_summary_from_channel=message.channel.id, cwd=cwd,
                 )
-        record_bot_reply(message.channel.id, bot_name, reply)
+        record_bot_reply(message.channel.id, bot_name, reply, cwd=cwd)
         cwd_tag = "" if cwd == DEFAULT_CWD else f"[{Path(cwd).name}] "
         prefix = ""
         if once_mode:
@@ -747,13 +878,14 @@ def make_client(bot_name: str) -> discord.Client:
 
 
 # ── Startup announcement ────────────────────────────────────────────────
-STARTUP_ANNOUNCEMENT = """🚀 **Bridge v2 上線**
+STARTUP_ANNOUNCEMENT = """🚀 **Bridge v3 上線**
 
-**🧠 記憶**
-• `!flush` 立即整理本 channel 對話到 summary
+**🧠 記憶（四層 · 按專案切）**
+• `!flush` 立即整理對話 → summary（+ 在專案內時一併更新專案筆記）
 • `!reset A|B` 清掉 bot session（summary 保留）
-• 每 {auto} 則訊息自動 flush
-• 每次回應自動 prepend 最新 summary 當 context
+• 每 {auto} 則訊息自動 flush；summary / 專案筆記都**按 cwd 分開**
+• `!cd <專案>` 切走時自動把舊專案進度寫入專案筆記
+• 每次回應自動注入「該專案的 summary + 專案筆記」當 context
 
 **🎭 多模式對話**
 • `@A`、`@B` 單獨叫 — 自然回，被 @ 才接話
@@ -778,7 +910,7 @@ async def main():
     global clients
     for name in BOTS:
         clients[name] = make_client(name)
-    log.info("starting bridge v2: channel=%d allowed=%s max_turns=%d auto_flush=%d",
+    log.info("starting bridge v3: channel=%d allowed=%s max_turns=%d auto_flush=%d",
              CHANNEL_ID, sorted(ALLOWED_USER_IDS), MAX_BOT_TURNS, AUTO_FLUSH_THRESHOLD)
     await asyncio.gather(*(clients[n].start(BOTS[n]["token"]) for n in BOTS))
 
