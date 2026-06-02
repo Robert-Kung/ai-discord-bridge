@@ -142,9 +142,20 @@ def get_channel_cwd(channel_id: int) -> str:
     return DEFAULT_CWD
 
 
-# ── Per-bot session id persistence ──────────────────────────────────────
-def load_session(bot_name: str) -> str | None:
-    p = STATE_DIR / f"{bot_name}.json"
+# ── Per-(bot, cwd) session id persistence ───────────────────────────────
+# Claude Code stores sessions per project dir (cwd). A session created at
+# /home/user can't be --resume'd from /home/user/my-project, so the session id
+# must be keyed by (bot, cwd), not just bot.
+def _cwd_slug(cwd: str) -> str:
+    return cwd.strip("/").replace("/", "-") or "root"
+
+
+def _session_path(bot_name: str, cwd: str) -> Path:
+    return STATE_DIR / f"{bot_name}__{_cwd_slug(cwd)}.json"
+
+
+def load_session(bot_name: str, cwd: str = DEFAULT_CWD) -> str | None:
+    p = _session_path(bot_name, cwd)
     if not p.exists():
         return None
     try:
@@ -153,16 +164,15 @@ def load_session(bot_name: str) -> str | None:
         return None
 
 
-def save_session(bot_name: str, sid: str) -> None:
-    p = STATE_DIR / f"{bot_name}.json"
+def save_session(bot_name: str, sid: str, cwd: str = DEFAULT_CWD) -> None:
+    p = _session_path(bot_name, cwd)
     tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps({"session_id": sid}))
+    tmp.write_text(json.dumps({"session_id": sid, "cwd": cwd}))
     tmp.replace(p)
 
 
-def clear_session(bot_name: str) -> None:
-    p = STATE_DIR / f"{bot_name}.json"
-    p.unlink(missing_ok=True)
+def clear_session(bot_name: str, cwd: str = DEFAULT_CWD) -> None:
+    _session_path(bot_name, cwd).unlink(missing_ok=True)
 
 
 # ── Summary persistence ─────────────────────────────────────────────────
@@ -265,7 +275,7 @@ async def call_claude(
 
     args = ["claude", "-p", "--output-format", "json", "--permission-mode", api_mode]
     if use_session:
-        sid = load_session(bot_name)
+        sid = load_session(bot_name, cwd)
         if sid:
             args += ["--resume", sid]
     if prepend_summary_from_channel is not None:
@@ -312,7 +322,7 @@ async def call_claude(
     reply = data.get("result") or "(空回覆)"
     new_sid = data.get("session_id")
     if new_sid and use_session:
-        save_session(bot_name, new_sid)
+        save_session(bot_name, new_sid, cwd)
     return (reply, True)
 
 
@@ -548,8 +558,9 @@ async def cmd_mode(channel, args: str, author_id: int) -> str:
 
 
 async def cmd_reset(channel, bot_name: str) -> str:
-    clear_session(bot_name)
-    return f"♻️ {bot_name} session 清除（summary 保留，下輪會 prepend）"
+    cwd = get_channel_cwd(channel.id)
+    clear_session(bot_name, cwd)
+    return f"♻️ {bot_name} 在 `{Path(cwd).name}` 的 session 清除（summary 保留）"
 
 
 async def cmd_state(channel) -> str:
