@@ -52,9 +52,14 @@ ALLOWED_USER_IDS = {
 MAX_BOT_TURNS = int(os.environ.get("MAX_BOT_TURNS", "6"))
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "300"))
 AUTO_FLUSH_THRESHOLD = int(os.environ.get("AUTO_FLUSH_THRESHOLD", "20"))
-# token-based flush (autocompact analog): when a bot's resumed context reaches
-# this many tokens, write summary + reset that bot's session. 0 disables it.
-FLUSH_TOKEN_THRESHOLD = int(os.environ.get("FLUSH_TOKEN_THRESHOLD", "120000"))
+# token-based flush — TWO stages, tuned for the opus[1m] 1M context window:
+#  • FLUSH_TOKEN_THRESHOLD (400k): write a summary checkpoint, KEEP the session
+#    (continuity preserved; gives a crash-safe summary on disk early).
+#  • RESET_TOKEN_THRESHOLD (700k): write a fresh summary AND reset the session
+#    (the real autocompact analog; summary auto-prepends next call).
+# Set either to 0 to disable that stage.
+FLUSH_TOKEN_THRESHOLD = int(os.environ.get("FLUSH_TOKEN_THRESHOLD", "400000"))
+RESET_TOKEN_THRESHOLD = int(os.environ.get("RESET_TOKEN_THRESHOLD", "700000"))
 PLAN_REACTION_TIMEOUT = int(os.environ.get("PLAN_REACTION_TIMEOUT", "300"))
 CSWAP_USAGE_FILE = STATE_DIR / "cswap-usage.json"  # written by host cron, read here
 
@@ -73,6 +78,9 @@ channel_msg_log: dict[int, deque] = defaultdict(lambda: deque(maxlen=300))
 messages_since_flush: dict[int, int] = defaultdict(int)
 # last-seen resumed-context size per (bot, cwd), from each call's usage report
 session_ctx_tokens: dict[tuple[str, str], int] = defaultdict(int)
+# whether a 400k checkpoint summary was already written this growth cycle
+# (cleared on reset), so we don't re-flush every call between 400k and 700k
+token_checkpointed: dict[tuple[str, str], bool] = {}
 pending_actions: dict[int, asyncio.Future] = {}
 bot_user_ids: dict[str, int] = {}
 clients: dict[str, discord.Client] = {}
@@ -395,11 +403,16 @@ async def call_claude(
     new_sid = data.get("session_id")
     if new_sid and use_session:
         save_session(bot_name, new_sid, cwd)
-    # record real context size (input + cache) so token-based flush can fire
+    # record real context size so token-based flush can fire. Use the LAST
+    # iteration's tokens, NOT the top-level usage: an agentic call sums tokens
+    # across every tool-use iteration (each re-reads the cached context), which
+    # massively overcounts — real context-window size is bounded by ~200k.
     if use_session:
         u = data.get("usage") or {}
-        ctx = (u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
-               + u.get("cache_creation_input_tokens", 0))
+        iters = u.get("iterations")
+        src = iters[-1] if iters else u
+        ctx = (src.get("input_tokens", 0) + src.get("cache_read_input_tokens", 0)
+               + src.get("cache_creation_input_tokens", 0))
         if ctx:
             session_ctx_tokens[(bot_name, cwd)] = ctx
             log.info("[%s] context now ~%dk tokens (cwd=%s)", bot_name, ctx // 1000, cwd)
@@ -487,24 +500,41 @@ async def do_flush(channel_id: int, *, manual: bool = False,
 
 
 async def maybe_token_flush(channel, bot_name: str, cwd: str) -> None:
-    """Autocompact analog: if this bot's resumed context crossed the token
-    threshold, write a summary (+ notes) then reset its session so the next
-    call starts small. The summary is auto-prepended on the next call, so state
-    survives the reset. Unlike the message-count flush, this DOES reset session."""
-    if not FLUSH_TOKEN_THRESHOLD:
-        return
+    """Two-stage token-based memory management for the 1M context window:
+      • ≥ RESET_TOKEN_THRESHOLD (700k): fresh summary + reset session (autocompact
+        analog; summary auto-prepends next call so state survives).
+      • ≥ FLUSH_TOKEN_THRESHOLD (400k): one summary checkpoint, KEEP session.
+    Both summarise from the channel buffer; if it's empty (e.g. after a restart)
+    do_flush returns non-📝 and we skip — never reset without a fresh summary."""
     ctx = session_ctx_tokens.get((bot_name, cwd), 0)
-    if ctx < FLUSH_TOKEN_THRESHOLD:
-        return
-    await do_flush(channel.id, manual=False)
-    clear_session(bot_name, cwd)
-    session_ctx_tokens[(bot_name, cwd)] = 0
     where = "~" if cwd == DEFAULT_CWD else Path(cwd).name
-    await channel.send(
-        f"🧠 Bot-{bot_name} 在 `{where}` 的 context 已達 ~{ctx // 1000}k tokens"
-        f"（≥ {FLUSH_TOKEN_THRESHOLD // 1000}k autocompact 門檻）→ 已濃縮成 summary "
-        "並重置該對話線，摘要會在下次自動帶回。"
-    )
+    key = (bot_name, cwd)
+
+    if RESET_TOKEN_THRESHOLD and ctx >= RESET_TOKEN_THRESHOLD:
+        result = await do_flush(channel.id, manual=False)
+        if not result.startswith("📝"):
+            log.warning("[%s] token-reset at ~%dk skipped: %s", bot_name, ctx // 1000, result)
+            return
+        clear_session(bot_name, cwd)
+        session_ctx_tokens[key] = 0
+        token_checkpointed.pop(key, None)
+        await channel.send(
+            f"🧠 Bot-{bot_name} 在 `{where}` context 達 ~{ctx // 1000}k"
+            f"（≥ {RESET_TOKEN_THRESHOLD // 1000}k）→ 濃縮 summary + 重置對話線，下次自動帶回。"
+        )
+        return
+
+    if FLUSH_TOKEN_THRESHOLD and ctx >= FLUSH_TOKEN_THRESHOLD and not token_checkpointed.get(key):
+        result = await do_flush(channel.id, manual=False)
+        if not result.startswith("📝"):
+            log.warning("[%s] token-checkpoint at ~%dk skipped: %s", bot_name, ctx // 1000, result)
+            return
+        token_checkpointed[key] = True
+        await channel.send(
+            f"📝 Bot-{bot_name} 在 `{where}` context 達 ~{ctx // 1000}k"
+            f"（≥ {FLUSH_TOKEN_THRESHOLD // 1000}k）→ 寫了 summary 存檔（對話線保留，"
+            f"到 {RESET_TOKEN_THRESHOLD // 1000}k 才重置）。"
+        )
 
 
 # ── Discuss mode ────────────────────────────────────────────────────────
@@ -774,7 +804,7 @@ async def cmd_state(channel) -> str:
         f"• buffered messages: {len(channel_msg_log[channel.id])}\n"
         f"• messages since last flush: {messages_since_flush[channel.id]}\n"
         f"• context（此 cwd）: A ~{a_ctx // 1000}k · B ~{b_ctx // 1000}k"
-        f"（token-flush 門檻 {FLUSH_TOKEN_THRESHOLD // 1000}k）\n"
+        f"（{FLUSH_TOKEN_THRESHOLD // 1000}k 存檔 / {RESET_TOKEN_THRESHOLD // 1000}k 重置 · 1M 視窗）\n"
         f"• latest summary（此 cwd）: `{summary.name if summary else '(none)'}`\n"
         f"• 專案筆記: {has_notes}\n"
         + read_cswap_usage()
@@ -916,6 +946,8 @@ def make_client(bot_name: str) -> discord.Client:
         # bypass mode → plan-then-execute (unless !yolo)
         if effective_mode == "bypass":
             await run_plan_then_execute(message.channel, bot_name, prompt, skip_plan=yolo, cwd=cwd)
+            # token-flush AFTER the whole flow (never mid plan→execute, which resumes)
+            await maybe_token_flush(message.channel, bot_name, cwd)
             return
 
         # Standard call
@@ -961,7 +993,7 @@ STARTUP_ANNOUNCEMENT = """🚀 **Bridge v3 上線**
 • `!flush` 立即整理對話 → summary（+ 在專案內時一併更新專案筆記）
 • `!reset A|B` 清掉 bot session（summary 保留）
 • 每 {auto} 則訊息自動 flush；summary / 專案筆記都**按 cwd 分開**
-• context 達 token 門檻自動「濃縮+重置對話線」（autocompact 模式，省 quota）
+• context 兩段式自動管理：400k 寫 summary 存檔、700k 濃縮+重置對話線（1M 視窗）
 • `!cd <專案>` 切走時自動把舊專案進度寫入專案筆記
 • 每次回應自動注入「該專案的 summary + 專案筆記」當 context
 • `!state` 可看兩帳號 5h/7d 用量（cswap）
