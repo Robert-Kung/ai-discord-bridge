@@ -60,6 +60,12 @@ AUTO_FLUSH_THRESHOLD = int(os.environ.get("AUTO_FLUSH_THRESHOLD", "20"))
 # Set either to 0 to disable that stage.
 FLUSH_TOKEN_THRESHOLD = int(os.environ.get("FLUSH_TOKEN_THRESHOLD", "400000"))
 RESET_TOKEN_THRESHOLD = int(os.environ.get("RESET_TOKEN_THRESHOLD", "700000"))
+# emergency hard cap: if the summariser keeps failing near the 1M ceiling, force
+# a reset (losing context) rather than let the session grow until calls error out
+HARD_RESET_TOKEN_THRESHOLD = int(os.environ.get("HARD_RESET_TOKEN_THRESHOLD", "900000"))
+if FLUSH_TOKEN_THRESHOLD and RESET_TOKEN_THRESHOLD and RESET_TOKEN_THRESHOLD < FLUSH_TOKEN_THRESHOLD:
+    log.warning("RESET_TOKEN_THRESHOLD < FLUSH; disabling checkpoint stage to avoid nonsense ordering")
+    FLUSH_TOKEN_THRESHOLD = 0
 PLAN_REACTION_TIMEOUT = int(os.environ.get("PLAN_REACTION_TIMEOUT", "300"))
 CSWAP_USAGE_FILE = STATE_DIR / "cswap-usage.json"  # written by host cron, read here
 
@@ -499,29 +505,65 @@ async def do_flush(channel_id: int, *, manual: bool = False,
     return f"📝 已寫入 summary：`{path.name}` ({len(reply)} chars)"
 
 
+async def flush_session_then_reset(channel, bot_name: str, cwd: str) -> bool:
+    """Summarise the bot's OWN session (resume-based — a real autocompact) into
+    the (channel, cwd) summary, then clear the session. Returns True on success.
+    Unlike do_flush (which reads the side channel buffer), this captures
+    session-only context: tool output, files read, discussion rolled off the
+    300-deque. The caller must hold bot_locks[bot_name] (B review #3 race)."""
+    sid = load_session(bot_name, cwd)
+    if not sid:
+        return False
+    prompt = (
+        "把我們目前為止在這個 channel 的完整對話濃縮成「交接筆記」，供你重置後接回。"
+        "保留：(1) 已拍板決策與結論 (2) 進行中任務 / open questions "
+        "(3) 關鍵檔案路徑 / 暫存檔位置 (4) 已建立的工作狀態。不要逐字複述，600 字內。"
+    )
+    reply, ok = await call_claude(bot_name, prompt, mode="plan", use_session=True, cwd=cwd)
+    if not ok:
+        return False
+    save_summary(channel.id, reply, cwd)
+    clear_session(bot_name, cwd)
+    return True
+
+
 async def maybe_token_flush(channel, bot_name: str, cwd: str) -> None:
     """Two-stage token-based memory management for the 1M context window:
-      • ≥ RESET_TOKEN_THRESHOLD (700k): fresh summary + reset session (autocompact
-        analog; summary auto-prepends next call so state survives).
-      • ≥ FLUSH_TOKEN_THRESHOLD (400k): one summary checkpoint, KEEP session.
-    Both summarise from the channel buffer; if it's empty (e.g. after a restart)
-    do_flush returns non-📝 and we skip — never reset without a fresh summary."""
+      • ≥ RESET_TOKEN_THRESHOLD (700k): summarise the SESSION itself + reset it
+        (real autocompact; summary auto-prepends next call so state survives).
+        Held under bot_locks to avoid a concurrent message resuming the cleared
+        session. Past HARD_RESET cap, force a reset even if the summary fails.
+      • ≥ FLUSH_TOKEN_THRESHOLD (400k): one buffer summary checkpoint, KEEP the
+        session (crash-safe early backup; cheap, no resume of the big session)."""
     ctx = session_ctx_tokens.get((bot_name, cwd), 0)
     where = "~" if cwd == DEFAULT_CWD else Path(cwd).name
     key = (bot_name, cwd)
 
     if RESET_TOKEN_THRESHOLD and ctx >= RESET_TOKEN_THRESHOLD:
-        result = await do_flush(channel.id, manual=False)
-        if not result.startswith("📝"):
-            log.warning("[%s] token-reset at ~%dk skipped: %s", bot_name, ctx // 1000, result)
+        async with bot_locks[bot_name]:
+            done = await flush_session_then_reset(channel, bot_name, cwd)
+            if done:
+                session_ctx_tokens[key] = 0
+                token_checkpointed.pop(key, None)
+        if done:
+            await channel.send(
+                f"🧠 Bot-{bot_name} 在 `{where}` context 達 ~{ctx // 1000}k"
+                f"（≥ {RESET_TOKEN_THRESHOLD // 1000}k）→ 從 session 濃縮交接筆記 + 重置對話線，下次自動帶回。"
+            )
             return
-        clear_session(bot_name, cwd)
-        session_ctx_tokens[key] = 0
-        token_checkpointed.pop(key, None)
-        await channel.send(
-            f"🧠 Bot-{bot_name} 在 `{where}` context 達 ~{ctx // 1000}k"
-            f"（≥ {RESET_TOKEN_THRESHOLD // 1000}k）→ 濃縮 summary + 重置對話線，下次自動帶回。"
-        )
+        # summary failed — only force a reset past the hard cap (escape hatch)
+        if HARD_RESET_TOKEN_THRESHOLD and ctx >= HARD_RESET_TOKEN_THRESHOLD:
+            async with bot_locks[bot_name]:
+                clear_session(bot_name, cwd)
+                session_ctx_tokens[key] = 0
+                token_checkpointed.pop(key, None)
+            log.error("[%s] HARD reset at ~%dk: summary failed, context dropped", bot_name, ctx // 1000)
+            await channel.send(
+                f"⚠️ Bot-{bot_name} context ~{ctx // 1000}k 超過硬上限 "
+                f"{HARD_RESET_TOKEN_THRESHOLD // 1000}k 但濃縮失敗 → 強制重置（無 summary，可能丟脈絡）。"
+            )
+        else:
+            log.warning("[%s] reset at ~%dk: session summary failed, will retry", bot_name, ctx // 1000)
         return
 
     if FLUSH_TOKEN_THRESHOLD and ctx >= FLUSH_TOKEN_THRESHOLD and not token_checkpointed.get(key):
