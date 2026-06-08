@@ -763,13 +763,20 @@ async def cmd_cd(channel, args: str) -> str:
     if not args.strip():
         cur = get_channel_cwd(channel.id)
         names = "\n".join(f"  • {p.name}" for p in PROJECT_DIRS)
+        root = " ←目前" if cur == DEFAULT_CWD else ""
         return (
             f"**目前 cwd**：`{cur}`\n"
-            f"**可切換的專案**（`!cd <名稱>`）：\n{names}"
+            f"**可切換的專案**（`!cd <名稱>`）：\n{names}\n"
+            f"  • `~` 回根目錄（`{DEFAULT_CWD}`）{root}"
         )
-    resolved, msg = resolve_project_cwd(args)
-    if resolved is None:
-        return msg
+    # back-to-root: ~ / / / root / home → DEFAULT_CWD (not in the git whitelist,
+    # so resolve_project_cwd would reject it — handle as an explicit special case).
+    if args.strip() in {"~", "/", "root", "home", DEFAULT_CWD}:
+        resolved = DEFAULT_CWD
+    else:
+        resolved, msg = resolve_project_cwd(args)
+        if resolved is None:
+            return msg
     # flush-before-switch: snapshot the OLD project's transcript BEFORE we mutate
     # state, then update notes in the background (B review a — fix snapshot order).
     old_cwd = get_channel_cwd(channel.id)
