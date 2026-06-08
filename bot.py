@@ -49,6 +49,15 @@ CHANNEL_ID = int(os.environ["DISCORD_CHANNEL_ID"])
 ALLOWED_USER_IDS = {
     int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").split(",") if x.strip()
 }
+# fail-closed: an empty whitelist used to short-circuit every auth check
+# (`if ALLOWED_USER_IDS and ...`), meaning anyone in the channel could drive the
+# bots — including bypass mode. Refuse to start instead of running wide open.
+if not ALLOWED_USER_IDS:
+    raise SystemExit(
+        "ALLOWED_USER_IDS is empty — refusing to start (fail-closed). "
+        "Set at least one Discord user id in .env; an empty list would let "
+        "anyone in the channel drive the bots, including bypass-mode execution."
+    )
 MAX_BOT_TURNS = int(os.environ.get("MAX_BOT_TURNS", "6"))
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "300"))
 AUTO_FLUSH_THRESHOLD = int(os.environ.get("AUTO_FLUSH_THRESHOLD", "20"))
@@ -135,6 +144,16 @@ MODE_ALIASES = {
 }
 
 DEFAULT_CHANNEL_MODE = "plan"  # safe default; bypass requires opt-in
+
+# A2b: paths holding each account's OAuth credentials / settings. The bridge
+# itself reads summaries/notes from .claude-shared in Python (not via the claude
+# tool), and CLAUDE.md @import is config-load not a Read-tool call, so denying
+# the Read tool on these dirs doesn't break legitimate work.
+CREDENTIAL_DENY_TOOLS = [
+    "Read(//home/user/.claude/**)",
+    "Read(//home/user/.claude-b/**)",
+    "Read(//home/user/.claude-shared/**)",
+]
 
 
 # ── Channel state file persistence ──────────────────────────────────────
@@ -281,6 +300,7 @@ def buffer_append(message: discord.Message) -> None:
     log_q.append({
         "id": message.id,
         "author": message.author.display_name,
+        "author_id": message.author.id,  # for trust filtering (A2a injection isolation)
         "bot": message.author.bot,
         "content": message.content,
         "ts": message.created_at.isoformat(),
@@ -301,6 +321,7 @@ def record_bot_reply(channel_id: int, bot_name: str, content: str,
     channel_msg_log[channel_id].append({
         "id": None,
         "author": f"Bot-{bot_name}",
+        "author_id": None,
         "bot": True,
         "content": content,
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -308,11 +329,20 @@ def record_bot_reply(channel_id: int, bot_name: str, content: str,
     })
 
 
+def _is_trusted(m: dict) -> bool:
+    """A2a injection isolation: only whitelisted humans and our own bots may
+    influence what a bot sees (context) or what gets summarised (flush). A
+    random channel member's text is dropped so it can't smuggle instructions
+    into a call that a whitelisted user later triggers (indirect prompt
+    injection via bystander message)."""
+    return bool(m.get("bot")) or m.get("author_id") in ALLOWED_USER_IDS
+
+
 def format_buffer_transcript(channel_id: int, cwd: str | None = None,
                              limit: int = 80) -> str:
     """Render buffered messages. If cwd given, only lines tagged with that cwd
     (the flush boundary — a !flush for project X never mixes in project Y)."""
-    items = list(channel_msg_log[channel_id])
+    items = [m for m in channel_msg_log[channel_id] if _is_trusted(m)]
     if cwd is not None:
         items = [m for m in items if m.get("cwd", DEFAULT_CWD) == cwd]
     items = items[-limit:]
@@ -328,7 +358,7 @@ def build_context_prefix(channel_id: int, limit: int = 15) -> str:
     Marks bot-origin lines as untrusted (injection isolation): the other
     bot's text is reference context, NOT instructions to obey.
     """
-    items = list(channel_msg_log[channel_id])[-limit:]
+    items = [m for m in channel_msg_log[channel_id] if _is_trusted(m)][-limit:]
     if not items:
         return ""
     lines = []
@@ -370,7 +400,15 @@ async def call_claude(
             args += ["--append-system-prompt-file", str(combined)]
     if extra_args:
         args += extra_args
-    args.append(prompt)
+    # A2b: deny the Read tool on the mounted config dirs in EVERY mode (not just
+    # bypass — Read is allowed even in plan mode, so credentials could otherwise
+    # be read out and echoed into a reply). Defence-in-depth, not airtight: a
+    # bypass-mode user can still shell out to read them, so bypass stays
+    # whitelist-only (see ALLOWED_USER_IDS fail-closed guard).
+    # MUST be last: --disallowedTools is variadic and greedily consumes following
+    # args — keeping it at the tail (and feeding the prompt via stdin) stops it
+    # from swallowing the prompt.
+    args += ["--disallowedTools", *CREDENTIAL_DENY_TOOLS]
 
     env = {**os.environ, "CLAUDE_CONFIG_DIR": cfg["config_dir"]}
     log.info("[%s] call mode=%s session=%s cwd=%s prompt_len=%d",
@@ -380,11 +418,13 @@ async def call_claude(
     async with cwd_locks[cwd]:
         proc = await asyncio.create_subprocess_exec(
             *args, env=env, cwd=cwd,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=CLAUDE_TIMEOUT)
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(input=prompt.encode()), timeout=CLAUDE_TIMEOUT)
         except asyncio.TimeoutError:
             log.error("[%s] timeout — killing pid %s", bot_name, proc.pid)
             proc.kill()
@@ -799,7 +839,7 @@ async def cmd_mode(channel, args: str, author_id: int) -> str:
     target = args.strip().lower()
     if target not in VALID_MODES:
         return f"❓ 用法：`!mode plan|edit|bypass`（目前 valid: {sorted(VALID_MODES)}）"
-    if target == "bypass" and ALLOWED_USER_IDS and author_id not in ALLOWED_USER_IDS:
+    if target == "bypass" and author_id not in ALLOWED_USER_IDS:
         return "🛡 `bypass` 需要 whitelist 權限"
     state = load_channel_state(channel.id)
     state["mode"] = target
@@ -910,7 +950,7 @@ def make_client(bot_name: str) -> discord.Client:
             if cmd is not None:
                 name, args = cmd
                 # Only mentioned-or-whitelisted users can run commands
-                if ALLOWED_USER_IDS and message.author.id not in ALLOWED_USER_IDS:
+                if message.author.id not in ALLOWED_USER_IDS:
                     return
                 if name == "help":
                     await message.channel.send(HELP_TEXT)
@@ -956,7 +996,7 @@ def make_client(bot_name: str) -> discord.Client:
                     log.info("[%s] turn budget exhausted (%d)", bot_name, bot_turns_since_human)
                     return
             else:
-                if ALLOWED_USER_IDS and message.author.id not in ALLOWED_USER_IDS:
+                if message.author.id not in ALLOWED_USER_IDS:
                     return
                 bot_turns_since_human = 0
             bot_turns_since_human += 1
@@ -969,7 +1009,7 @@ def make_client(bot_name: str) -> discord.Client:
         else:
             effective_mode = load_channel_state(message.channel.id).get("mode", DEFAULT_CHANNEL_MODE)
 
-        if effective_mode == "bypass" and once_mode == "bypass" and ALLOWED_USER_IDS and message.author.id not in ALLOWED_USER_IDS:
+        if effective_mode == "bypass" and once_mode == "bypass" and message.author.id not in ALLOWED_USER_IDS:
             await message.channel.send("🛡 `!once bypass` 需要 whitelist")
             return
 
@@ -1019,7 +1059,7 @@ def make_client(bot_name: str) -> discord.Client:
     async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         if payload.message_id not in pending_actions:
             return
-        if ALLOWED_USER_IDS and payload.user_id not in ALLOWED_USER_IDS:
+        if payload.user_id not in ALLOWED_USER_IDS:
             return
         if payload.user_id in bot_user_ids.values():
             return  # ignore bot's own reactions
