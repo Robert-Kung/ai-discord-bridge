@@ -18,7 +18,7 @@ OUT = Path.home() / ".claude-shared" / "discord-state" / "cswap-usage.json"
 # cron has a minimal PATH; resolve cswap explicitly (it lives in ~/.local/bin)
 CSWAP = shutil.which("cswap") or str(Path.home() / ".local" / "bin" / "cswap")
 
-# account header:    "  1: you@example.com [Cht] (active)"
+# account header:    "  1: you@example.com [Org] (active)"
 HEADER = re.compile(r"^\s*(\d+):\s+(\S+).*?(\(active\))?\s*$")
 # quota line:        " ├ 5h:  35%   resets 20:10         in 4h 30m"
 QUOTA = re.compile(r"(5h|7d):\s+(\d+)%\s+resets\s+(.+?)\s+in\s+(.+?)\s*$")
