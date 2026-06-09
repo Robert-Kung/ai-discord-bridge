@@ -41,23 +41,9 @@ STATE_DIR = SHARED_DIR / "discord-state"
 SUMMARIES_DIR = SHARED_DIR / "discord-summaries"
 # 專案層記憶：放 rw 的 .claude-shared 下、但不在容器內 ro 掛載的 memory/ → bot 可寫
 PROJECT_NOTES_DIR = SHARED_DIR / "discord-project-notes"
-STATE_DIR.mkdir(parents=True, exist_ok=True)
-SUMMARIES_DIR.mkdir(parents=True, exist_ok=True)
-PROJECT_NOTES_DIR.mkdir(parents=True, exist_ok=True)
+CSWAP_USAGE_FILE = STATE_DIR / "cswap-usage.json"  # written by host cron, read here
 
-CHANNEL_ID = int(os.environ["DISCORD_CHANNEL_ID"])
-ALLOWED_USER_IDS = {
-    int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").split(",") if x.strip()
-}
-# fail-closed: an empty whitelist used to short-circuit every auth check
-# (`if ALLOWED_USER_IDS and ...`), meaning anyone in the channel could drive the
-# bots — including bypass mode. Refuse to start instead of running wide open.
-if not ALLOWED_USER_IDS:
-    raise SystemExit(
-        "ALLOWED_USER_IDS is empty — refusing to start (fail-closed). "
-        "Set at least one Discord user id in .env; an empty list would let "
-        "anyone in the channel drive the bots, including bypass-mode execution."
-    )
+# Thresholds keep env defaults at import (no crash; referenced by HELP_TEXT etc.)
 MAX_BOT_TURNS = int(os.environ.get("MAX_BOT_TURNS", "6"))
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "300"))
 AUTO_FLUSH_THRESHOLD = int(os.environ.get("AUTO_FLUSH_THRESHOLD", "20"))
@@ -76,7 +62,10 @@ if FLUSH_TOKEN_THRESHOLD and RESET_TOKEN_THRESHOLD and RESET_TOKEN_THRESHOLD < F
     log.warning("RESET_TOKEN_THRESHOLD < FLUSH; disabling checkpoint stage to avoid nonsense ordering")
     FLUSH_TOKEN_THRESHOLD = 0
 PLAN_REACTION_TIMEOUT = int(os.environ.get("PLAN_REACTION_TIMEOUT", "300"))
-CSWAP_USAGE_FILE = STATE_DIR / "cswap-usage.json"  # written by host cron, read here
+
+# Static (env-free) bot identity → config dir. Lets bot_locks etc. exist at
+# import time without reading any secrets.
+BOT_CONFIG_DIRS = {"A": "/home/user/.claude", "B": "/home/user/.claude-b"}
 
 # Auth mode (dual-mode skeleton):
 #  • USE_API_KEY unset/false (default) → subscription mode: each bot authenticates
@@ -85,20 +74,15 @@ CSWAP_USAGE_FILE = STATE_DIR / "cswap-usage.json"  # written by host cron, read 
 #    claude -p bills the Developer Platform instead of the subscription pool.
 # NOTE: precedence (env key wins over mounted OAuth) is assumed, not yet verified
 # against a live key — see SECURITY.md / SPEC §9.
-USE_API_KEY = os.environ.get("USE_API_KEY", "").strip().lower() in ("1", "true", "yes", "on")
-BOTS: dict[str, dict] = {
-    "A": {"token": os.environ["DISCORD_BOT_A_TOKEN"], "config_dir": "/home/user/.claude",
-          "api_key": os.environ.get("ANTHROPIC_API_KEY_A")},
-    "B": {"token": os.environ["DISCORD_BOT_B_TOKEN"], "config_dir": "/home/user/.claude-b",
-          "api_key": os.environ.get("ANTHROPIC_API_KEY_B")},
-}
-if USE_API_KEY:
-    _missing = [n for n, c in BOTS.items() if not c["api_key"]]
-    if _missing:
-        raise SystemExit(
-            f"USE_API_KEY is set but ANTHROPIC_API_KEY_{'/'.join(_missing)} is empty. "
-            "Provide a per-bot key, or unset USE_API_KEY to use subscription auth."
-        )
+#
+# Env-derived config lives in these module globals, populated by load_config() at
+# startup (and by tests after monkeypatching os.environ). Keeping import
+# side-effect-free is what makes bot.py unit-testable.
+CHANNEL_ID: int | None = None
+ALLOWED_USER_IDS: set[int] = set()
+USE_API_KEY: bool = False
+BOTS: dict[str, dict] = {}
+
 # Env vars the claude subprocess must never inherit (B review of the dual-mode):
 #  • Discord tokens — full control of the bot accounts; claude never needs them.
 #  • The whole auth/billing-routing family — stripped UNCONDITIONALLY so that
@@ -115,8 +99,63 @@ _SUBPROCESS_ENV_DENY = {
     "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
 }
 
+
+def load_config() -> None:
+    """Read env into the module globals and ensure state dirs exist. Called once
+    at startup; tests call it after monkeypatching os.environ. Ends by validating."""
+    global CHANNEL_ID, ALLOWED_USER_IDS, USE_API_KEY, BOTS
+    CHANNEL_ID = int(os.environ["DISCORD_CHANNEL_ID"])
+    ALLOWED_USER_IDS = {
+        int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").split(",") if x.strip()
+    }
+    USE_API_KEY = os.environ.get("USE_API_KEY", "").strip().lower() in ("1", "true", "yes", "on")
+    BOTS = {
+        n: {"token": os.environ[f"DISCORD_BOT_{n}_TOKEN"],
+            "config_dir": BOT_CONFIG_DIRS[n],
+            "api_key": os.environ.get(f"ANTHROPIC_API_KEY_{n}")}
+        for n in BOT_CONFIG_DIRS
+    }
+    for d in (STATE_DIR, SUMMARIES_DIR, PROJECT_NOTES_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+    validate_config()
+
+
+def validate_config() -> None:
+    """Fail-closed checks — raise SystemExit rather than run wide open. Split out
+    so the security guarantees are unit-testable (pytest.raises(SystemExit))."""
+    # An empty whitelist used to short-circuit every auth check → anyone in the
+    # channel could drive the bots, including bypass-mode execution.
+    if not ALLOWED_USER_IDS:
+        raise SystemExit(
+            "ALLOWED_USER_IDS is empty — refusing to start (fail-closed). "
+            "Set at least one Discord user id in .env; an empty list would let "
+            "anyone in the channel drive the bots, including bypass-mode execution."
+        )
+    if USE_API_KEY:
+        missing = [n for n, c in BOTS.items() if not c.get("api_key")]
+        if missing:
+            raise SystemExit(
+                f"USE_API_KEY is set but ANTHROPIC_API_KEY_{'/'.join(missing)} is empty. "
+                "Provide a per-bot key, or unset USE_API_KEY to use subscription auth."
+            )
+
+
+def build_subprocess_env(cfg: dict, base_env: "dict | None" = None) -> dict:
+    """Env for a `claude -p` subprocess: strip the secret/auth-routing family
+    (so a bypass `printenv` can't read tokens, cross-bot keys, or billing
+    overrides), set this bot's CLAUDE_CONFIG_DIR, and — API-key mode only —
+    inject ONLY this bot's own key. Pure: pass base_env in tests instead of
+    monkeypatching os.environ."""
+    src = os.environ if base_env is None else base_env
+    env = {k: v for k, v in src.items() if k not in _SUBPROCESS_ENV_DENY}
+    env["CLAUDE_CONFIG_DIR"] = cfg["config_dir"]
+    if USE_API_KEY and cfg.get("api_key"):
+        env["ANTHROPIC_API_KEY"] = cfg["api_key"]
+    return env
+
+
 # ── State (in-memory + per-bot lock) ────────────────────────────────────
-bot_locks: dict[str, asyncio.Lock] = {n: asyncio.Lock() for n in BOTS}
+bot_locks: dict[str, asyncio.Lock] = {n: asyncio.Lock() for n in BOT_CONFIG_DIRS}
 turn_lock = asyncio.Lock()
 discuss_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 cwd_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)  # keyed by resolved cwd
@@ -449,17 +488,7 @@ async def call_claude(
     # from swallowing the prompt.
     args += ["--disallowedTools", *CREDENTIAL_DENY_TOOLS]
 
-    # Strip the Discord bot tokens (and any stray ANTHROPIC_API_KEY) from the
-    # subprocess env: claude never needs the tokens, and leaving them in means a
-    # bypass-mode `printenv` (no shell-out, no file to read) would surface full
-    # control of the bot accounts.
-    env = {k: v for k, v in os.environ.items() if k not in _SUBPROCESS_ENV_DENY}
-    env["CLAUDE_CONFIG_DIR"] = cfg["config_dir"]
-    if USE_API_KEY and cfg.get("api_key"):
-        # API-key mode: bill the Developer Platform. NOTE the key is now in the
-        # subprocess env → readable via a bypass-mode printenv; use a spend-capped
-        # key (see SECURITY.md §6). Subscription mode keeps no key here at all.
-        env["ANTHROPIC_API_KEY"] = cfg["api_key"]
+    env = build_subprocess_env(cfg)
     log.info("[%s] call mode=%s session=%s cwd=%s prompt_len=%d",
              bot_name, api_mode, use_session, cwd, len(prompt))
 
@@ -1161,6 +1190,7 @@ STARTUP_ANNOUNCEMENT = """🚀 **Bridge v3 上線**
 # ── Main ────────────────────────────────────────────────────────────────
 async def main():
     global clients
+    load_config()  # read env into globals + ensure dirs + fail-closed validation
     for name in BOTS:
         clients[name] = make_client(name)
     log.info("starting bridge v3: channel=%d allowed=%s max_turns=%d auto_flush=%d",

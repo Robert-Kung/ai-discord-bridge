@@ -63,7 +63,7 @@ docker compose logs -f
 
 ## Verify your deployment (smoke test)
 
-There's no automated test suite — confirm a fork is wired correctly by hand:
+Unit tests (`pip install -r requirements-dev.txt && pytest`) cover the security-critical logic — fail-closed auth, `!cd` path/escape guard, trust filtering, subprocess env scrubbing — and run in CI. They don't touch live Discord/Claude, so confirm end-to-end wiring by hand:
 
 1. `docker compose config` — the compose file parses and mount paths resolve.
 2. **Fail-closed auth**: start with `ALLOWED_USER_IDS` empty → the container must exit immediately (`refusing to start`). Set it back to your id.
@@ -108,7 +108,7 @@ The `memory/` subdirectory is mounted **read-only** to prevent write races betwe
 1. **Single channel** — MVP hardcodes one channel ID. Multi-channel routing is on the backlog.
 2. **OAuth refresh race** — bot and host may race on token refresh. Rare in practice; accepted for MVP.
 3. **No attachments**, no thread/reply nesting, no slash commands — future backlog.
-4. **No test suite** — quality via manual Discord testing.
+4. **Limited tests** — unit tests cover the security-critical pure logic (auth, path/trust guards, env scrub) and run in CI; there are no integration tests against live Discord/Claude (manual smoke test for that).
 
 ## No Support
 

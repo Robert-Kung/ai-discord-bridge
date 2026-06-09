@@ -95,6 +95,10 @@ ai-discord-bridge/
 ├── SECURITY.md / SECURITY.zh.md 威脅模型（英 / 中）
 ├── LICENSE                      MIT
 ├── RELEASE_PLAN.md              內部公開化計畫（gitignore，不 ship）
+├── requirements-dev.txt         測試相依（discord.py + pytest）
+├── pytest.ini                   pytest 設定
+├── tests/                       L1/L2/L3 單元測（安全關鍵純邏輯 + fail-closed + env 去敏）
+├── .github/workflows/test.yml   極簡 CI：pip install + pytest
 └── scripts/
     ├── archive-old-jsonl.sh     cron 週清 >30 天 session jsonl
     └── refresh-cswap-usage.py   host cron：寫兩帳號 5h/7d 用量 JSON 給 !state 讀
@@ -330,6 +334,7 @@ crontab -e
 5. **subprocess env 去敏（B review #2）**：claude 子行程改 deny-list 掉 `DISCORD_BOT_A/B_TOKEN`（claude 本不需要）→ `bypass` 的 `printenv` 撈不到 bot token。
 6. **`SECURITY.md` / `SECURITY.zh.md`（威脅模型）**：9 節，含隔離邊界、授權 fail-closed、權限模式表、注入隔離、憑證防護**與極限**、殘留風險、forker 加固清單。刻意寫明每層防護的極限（bypass 可繞 A2b、CLAUDE.md @import 不受 deny 管、裸跑失隔離、mount≠network）。
 7. **雙認證模式骨架（`USE_API_KEY` + per-bot `ANTHROPIC_API_KEY_{A,B}`）**：訂閱模式（預設）與 API key 模式並存（見 §9）。code + 文件已就緒，且訂閱模式不受影響。⚠️ **API 計費優先序未實證**——需一把真 key 驗 console 用量後才算完成。動機：API key 走 Developer Platform 程式化用途本就合規（解 ToS）。
+8. **testability 最小重構 + pytest（B review 規劃）**：top-level 的 env 讀取/驗證搬進 `load_config()`/`validate_config()`、env 組裝抽 `build_subprocess_env()` → import 無副作用、可單元測。`tests/` 覆蓋 L1（`resolve_project_cwd` 逃逸/symlink/git guard、`_is_trusted` 第三方 bot、指令解析、`_cwd_slug`）、L2（fail-closed：白名單空 / `USE_API_KEY` 缺 key）、L3（`build_subprocess_env` cross-bot key 不外漏）共 41 case。極簡 GitHub Actions CI 跑 `pytest`。(c) 抽 `bridge_core.py` module / L4 dispatch / L5 async-mock 仍在 backlog。
 
 ### Backlog（未來 PR）
 - **雙認證模式驗證里程碑**（拿到可測 API key 後一起做）：

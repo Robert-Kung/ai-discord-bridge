@@ -84,7 +84,7 @@ docker compose logs -f
 
 ## 驗證你的部署（smoke test）
 
-沒有自動測試套件——用手動確認 fork 接對了：
+單元測試（`pip install -r requirements-dev.txt && pytest`）涵蓋安全關鍵邏輯——fail-closed 授權、`!cd` 路徑/逃逸防護、信任過濾、subprocess env 去敏——並在 CI 跑。它們不碰真 Discord/Claude，所以端到端接線用手動確認：
 
 1. `docker compose config`——compose 檔可解析、mount 路徑解得開。
 2. **fail-closed 授權**：把 `ALLOWED_USER_IDS` 清空啟動 → 容器須立刻退出（`refusing to start`）。再設回你的 id。
@@ -131,7 +131,7 @@ A↔B 輪數計數器在 `MAX_BOT_TURNS`（預設 6）硬停。
 1. **單頻道**——MVP 寫死單一頻道 ID，多頻道路由在 backlog。
 2. **OAuth refresh 競態**——bot 與 host 可能在 token refresh 上競態。實務罕見；MVP 接受。
 3. **無附檔**、無 thread/reply 巢狀、無 slash command——皆未來 backlog。
-4. **無測試套件**——靠手動 Discord 測試把關。
+4. **測試有限**——單元測涵蓋安全關鍵純邏輯（授權、路徑/信任防護、env 去敏）並在 CI 跑;無對真 Discord/Claude 的整合測（那部分靠手動 smoke test）。
 
 ## 無支援
 

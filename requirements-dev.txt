@@ -1,0 +1,4 @@
+# Dev/test deps. discord.py is the runtime dep (also pinned in the Dockerfile);
+# tests import bot.py, which imports discord, so it's needed to run pytest.
+discord.py==2.4.0
+pytest>=8,<9
