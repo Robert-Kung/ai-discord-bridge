@@ -99,10 +99,21 @@ if USE_API_KEY:
             f"USE_API_KEY is set but ANTHROPIC_API_KEY_{'/'.join(_missing)} is empty. "
             "Provide a per-bot key, or unset USE_API_KEY to use subscription auth."
         )
-# secrets the claude subprocess must never inherit. ANTHROPIC_API_KEY is stripped
-# unconditionally so a stray host-level key can't silently flip a subscription-mode
-# bot onto API billing; API-key mode re-injects the per-bot key explicitly below.
-_SUBPROCESS_ENV_DENY = {"DISCORD_BOT_A_TOKEN", "DISCORD_BOT_B_TOKEN", "ANTHROPIC_API_KEY"}
+# Env vars the claude subprocess must never inherit (B review of the dual-mode):
+#  • Discord tokens — full control of the bot accounts; claude never needs them.
+#  • The whole auth/billing-routing family — stripped UNCONDITIONALLY so that
+#    (a) one bot can't see the other's per-bot key (ANTHROPIC_API_KEY_{A,B}),
+#    (b) a stray host value can't silently re-route or re-bill a subscription-mode
+#        call (ANTHROPIC_API_KEY / _AUTH_TOKEN / _BASE_URL, CLAUDE_CODE_USE_*).
+# API-key mode re-injects ONLY the canonical per-bot ANTHROPIC_API_KEY below.
+# (Principled fix — allow-list the subprocess env — is deferred to the verify
+#  milestone; see SPEC §11 backlog.)
+_SUBPROCESS_ENV_DENY = {
+    "DISCORD_BOT_A_TOKEN", "DISCORD_BOT_B_TOKEN",
+    "ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_A", "ANTHROPIC_API_KEY_B",
+    "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+}
 
 # ── State (in-memory + per-bot lock) ────────────────────────────────────
 bot_locks: dict[str, asyncio.Lock] = {n: asyncio.Lock() for n in BOTS}
