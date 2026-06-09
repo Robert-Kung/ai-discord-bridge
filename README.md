@@ -1,77 +1,119 @@
 # ai-discord-bridge
 
-把 Discord 接成 dual-account Claude Code 的聊天室。
+> 中文版本： [README.zh.md](README.zh.md) ｜ Design spec： [SPEC.md](SPEC.md) ｜ Threat model： [SECURITY.md](SECURITY.md)
 
-**架構**：兩個 Discord bot user（Bot-A、Bot-B）跑在同一個 Docker 容器內，分別對應 host 的 `~/.claude/`（帳號 A）與 `~/.claude-b/`（帳號 B）。被 @-mention 時呼叫 `claude -p --resume <sid>`，使用 Pro 帳號額度（非 Anthropic API）。
+Self-hosted dual-AI Discord companion — a working personal-scale reference implementation of a four-layer memory model and debate orchestration pattern for Claude Code.
 
----
+> **Status**: Personal experiment / MVP. Single-channel, no test suite, no support SLA. Fork it, adapt it — don't file issues expecting maintenance.
 
-## 你需要先在 Discord 那邊做的事
+> ⚠️ **Security**: this tool lets whitelisted Discord users run code as your host user inside the directories you mount (`bypass` mode = arbitrary execution). **Read [SECURITY.md](SECURITY.md) ([中文](SECURITY.zh.md)) before deploying** — the threat model and hardening checklist are not optional reading for this kind of project.
 
-1. 建一個 Discord server（或用既有的），開一個 channel `#ai-chat`
-2. 到 https://discord.com/developers/applications 建立**兩個** application：`Claude-A`、`Claude-B`
-3. 每個 application：
-   - Bot 分頁 → Add Bot → 複製 **Token**
-   - Privileged Gateway Intents → 打開 `MESSAGE CONTENT INTENT`
-   - OAuth2 → URL Generator → scopes 勾 `bot`，permissions 勾 `Send Messages` + `Read Message History`
-   - 用產生的 URL 把 bot 邀請進你的 server
-4. 在 Discord client 開「開發者模式」（Settings → Advanced）
-5. 右鍵 `#ai-chat` channel → 複製頻道 ID
-6. 右鍵自己的 user → 複製 user ID
+It's a **control plane over Claude Code**: two Discord bots (Bot-A, Bot-B) run in one Docker container; an `@`-mention becomes a `claude -p --resume <sid>` call with channel context, four-layer memory, and per-channel permission modes layered on top. Useful as a reference for **dual-agent orchestration, memory layering, and a Discord control plane** — not as a turnkey product. Each bot is bound to its own Claude Code config dir (`~/.claude/`, `~/.claude-b/`); auth/billing options are covered under [Auth modes](#auth-modes) below.
 
----
+## Architecture Highlights
 
-## 設定
+- **Four-layer memory**: per-session `.jsonl` → per-(channel, cwd) mid-term summary → per-cwd project notes → global long-term profiles (read-only in container)
+- **Flush-before-compaction**: triggered on `!flush`, message threshold, and `!cd` project switch — preserves decisions before Claude's context window auto-compacts
+- **Dual-agent debate**: `!discuss <topic>` — A and B take turns on a shared rolling transcript with an independent turn budget that doesn't starve normal @-mentions
+- **Permission layers**: `plan` / `edit` / `bypass` modes per channel; `bypass` requires explicit whitelist; fail-closed auth + prompt-injection isolation + credential-read deny (see [SECURITY.md](SECURITY.md))
+
+## Prerequisites
+
+- Two Claude Code accounts (Pro or Max), logged in to `~/.claude/` and `~/.claude-b/` on the host
+- Two Discord bot tokens (one per account)
+
+<a id="auth-modes"></a>
+### Auth modes
+
+- **API-key mode** (`USE_API_KEY=true` + per-bot `ANTHROPIC_API_KEY_A`/`_B`) — **the intended path for public/forker use.** It bills the Developer Platform, which is the cleaner ToS footing for an automated bot. ⚠️ Its billing routing is **not yet verified against a live key** (see [SPEC.md](SPEC.md) §9) — verify with a **spend-capped** key before relying on it, and note the key lives in the subprocess env ([SECURITY.md](SECURITY.md) §6).
+- **Subscription mode** (default, mounted `~/.claude{,-b}` credentials) — kept for the author's personal/local setup. Running an automated bot on subscription credentials is a grayer ToS area, so treat this as a *compatibility default, not a recommendation*. In this mode `claude -p` consumes **Agent SDK credits** (a pre-paid pool: Pro $20 / Max 5× $100 / Max 20× $200; hard-stops when exhausted). Set `MAX_BOT_TURNS` conservatively to control spend.
+
+## Discord Setup
+
+1. Create a server (or use an existing one) with a `#ai-chat` channel
+2. Go to [discord.com/developers/applications](https://discord.com/developers/applications) and create **two** applications: `Claude-A` and `Claude-B`
+3. For each application:
+   - Bot tab → Add Bot → copy the **Token**
+   - Privileged Gateway Intents → enable `MESSAGE CONTENT INTENT`
+   - OAuth2 → URL Generator → scopes: `bot`, permissions: `Send Messages` + `Read Message History`
+   - Use the generated URL to invite the bot to your server
+4. Enable Developer Mode in Discord (Settings → Advanced)
+5. Right-click `#ai-chat` → copy Channel ID
+6. Right-click your user → copy User ID
+
+## Configuration
 
 ```bash
 cp .env.example .env
-# 編輯 .env，填入：
+# Fill in:
 #   DISCORD_BOT_A_TOKEN
 #   DISCORD_BOT_B_TOKEN
 #   DISCORD_CHANNEL_ID
-#   ALLOWED_USER_IDS（你的 user id）
+#   ALLOWED_USER_IDS   (your Discord user ID)
 ```
 
----
+Copy `docker-compose.example.yml` to `docker-compose.yml` and edit the volume mounts to point to your actual project directories.
 
-## 啟動
+## Start
 
 ```bash
 docker compose up -d --build
 docker compose logs -f
 ```
 
----
+## Verify your deployment (smoke test)
 
-## 使用
+There's no automated test suite — confirm a fork is wired correctly by hand:
 
-在 `#ai-chat` 內：
-- `@Bot-A 幫我看這個 RAG 設計` → 只有 A 會回
-- `@Bot-A @Bot-B 兩位都聊聊` → A、B 都會回
-- A 回覆裡 `@Bot-B` → B 會看到並回應（互辯）
-- A、B 互答總輪數累計 `MAX_BOT_TURNS`（預設 6）後停止；你再講話會重置
+1. `docker compose config` — the compose file parses and mount paths resolve.
+2. **Fail-closed auth**: start with `ALLOWED_USER_IDS` empty → the container must exit immediately (`refusing to start`). Set it back to your id.
+3. **Bots online**: `docker compose logs` shows both A and B `logged in as ...`.
+4. **From a whitelisted account** in the channel: `!help`, `!state`, `!mode plan`, `!cd <your-project>`, then `@Bot-A hello` → A replies.
+5. **API-key mode** (if you enable it): set `USE_API_KEY=true` with the keys empty → the container must refuse to start.
 
----
+## Usage
 
-## 路徑說明（為什麼 bind mount 用同路徑）
+In `#ai-chat`:
 
-Host 的 `~/.claude/skills` 是 symlink 指向 `~/.claude-shared/skills/`，且 `CLAUDE.md` 用 `@/home/user/.claude-shared/CLAUDE.md` 絕對路徑 import。容器內必須掛到**同樣絕對路徑** `/home/user/.claude{,-b,-shared}`，否則 symlink 和 import 都會斷。
+| Input | Effect |
+|-------|--------|
+| `@Bot-A <message>` | Only A replies |
+| `@Bot-A @Bot-B <message>` | Both reply |
+| A mentions `@Bot-B` in reply | B responds (debate mode) |
+| You send any message | Resets A↔B turn counter |
 
-`memory/` 子目錄掛 read-only：避免 bot 跟 host 互動 session 同時寫共用記憶造成競態。Bot 觀察學到的東西在 MVP 不持久化（若 claude 嘗試寫 memory，FS 會回 EACCES，container 內看到 error log 但不致命）。
+**Commands** (prefix with `!`, handled by Bot-A to avoid double-triggering):
 
----
+| Command | Effect |
+|---------|--------|
+| `!cd /path/to/project` | Switch working directory; flushes previous project context first |
+| `!flush` | Manual context flush — saves mid-term summary + project notes |
+| `!discuss <topic>` | Structured A↔B debate with shared rolling transcript |
+| `!mode plan\|edit\|bypass` | Set permission mode for this channel |
+| `!reset a\|b` | Clear one bot's session (summary preserved) |
+| `!state` | Show channel state, buffer stats, summary status |
 
-## 已知殘留風險（MVP 接受）
+> Full command table (with session semantics + permission columns) is in [SPEC.md](SPEC.md) §5.
 
-1. **OAuth credential refresh race**：bot 跟 host 同時 refresh token 可能互相失效。token refresh 不頻繁，撞期機率低，先觀察。
-2. **單頻道**：MVP 寫死單一頻道，多頻道路由未來再加。
-3. **無附檔支援**、無 thread / reply 巢狀、無 slash command — 都是後續 backlog。
+A↔B turn counter hard-stops at `MAX_BOT_TURNS` (default 6).
 
----
+## Why the Same Absolute Paths in Bind Mounts
 
-## 檔案
+`~/.claude/skills` is a symlink to `~/.claude-shared/skills/`, and `CLAUDE.md` uses `@/home/user/.claude-shared/CLAUDE.md` (absolute path import). The container must mount to the **same absolute paths** `/home/user/.claude{,-b,-shared}` — otherwise symlinks and `@import` directives break silently.
 
-- `bot.py` — 主程式（兩個 discord.Client + claude 呼叫）
-- `Dockerfile` — python:3.12-slim + Node 20 + claude-code CLI + discord.py
-- `docker-compose.yml` — bind mount + restart 策略
-- `.env.example` — 環境變數樣板
+The `memory/` subdirectory is mounted **read-only** to prevent write races between the bot container and interactive host sessions.
+
+## Known Limitations
+
+1. **Single channel** — MVP hardcodes one channel ID. Multi-channel routing is on the backlog.
+2. **OAuth refresh race** — bot and host may race on token refresh. Rare in practice; accepted for MVP.
+3. **No attachments**, no thread/reply nesting, no slash commands — future backlog.
+4. **No test suite** — quality via manual Discord testing.
+
+## No Support
+
+This is a personal daily-use project, not a maintained library. PRs are welcome but I can't guarantee reviews or timely responses. If something breaks for you, the entire implementation is in `bot.py`.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

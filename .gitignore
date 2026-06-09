@@ -1,5 +1,10 @@
 .env
+# Real compose holds your private project list + absolute paths — keep it local.
+# Public template is docker-compose.example.yml.
+docker-compose.yml
 __pycache__/
 *.pyc
 .venv/
 .DS_Store
+# Internal planning doc — real name + A↔B debate notes; never publish.
+RELEASE_PLAN.md

@@ -1,0 +1,28 @@
+# Copy this file to docker-compose.yml and fill in YOUR project paths.
+#   cp docker-compose.example.yml docker-compose.yml
+# The real docker-compose.yml is gitignored so your private project list and
+# absolute paths never get committed.
+services:
+  ai-discord-bridge:
+    build: .
+    container_name: ai-discord-bridge
+    restart: unless-stopped
+    env_file: .env
+    user: "1000:1000"
+    environment:
+      HOME: /home/user
+      # cwd whitelist: !cd only accepts these paths (each must contain .git).
+      # MUST match the project bind mounts below. Comma-separated, absolute paths.
+      PROJECT_DIRS: >-
+        /home/user/your-project-a,/home/user/your-project-b
+    volumes:
+      # Claude config (mapped to identical paths so symlinks + @import keep working)
+      - /home/user/.claude:/home/user/.claude
+      - /home/user/.claude-b:/home/user/.claude-b
+      - /home/user/.claude-shared:/home/user/.claude-shared
+      - /home/user/.claude-shared/memory:/home/user/.claude-shared/memory:ro
+      # Project dirs: mount ONLY the projects you want the bots to reach.
+      # Everything else in $HOME (.ssh, .gnupg, Documents, ...) stays invisible
+      # in the container = mount-level isolation; even bypass mode can't touch it.
+      - /home/user/your-project-a:/home/user/your-project-a
+      - /home/user/your-project-b:/home/user/your-project-b
