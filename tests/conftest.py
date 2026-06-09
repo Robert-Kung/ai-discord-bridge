@@ -26,9 +26,9 @@ _AUTH_ENV = ("USE_API_KEY", "ANTHROPIC_API_KEY_A", "ANTHROPIC_API_KEY_B",
 @pytest.fixture(autouse=True)
 def _restore_globals():
     """load_config()/validate_config() mutate module globals; snapshot & restore
-    so tests don't leak state into each other."""
-    saved = {k: getattr(bot, k) for k in
-             ("CHANNEL_ID", "ALLOWED_USER_IDS", "USE_API_KEY", "BOTS")}
+    so tests don't leak state into each other. Driven by bot._CONFIG_GLOBALS so a
+    new config global can't silently fall out of the restore set."""
+    saved = {k: getattr(bot, k) for k in bot._CONFIG_GLOBALS}
     yield
     for k, v in saved.items():
         setattr(bot, k, v)

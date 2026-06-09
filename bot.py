@@ -100,10 +100,16 @@ _SUBPROCESS_ENV_DENY = {
 }
 
 
+# The env-derived globals load_config() owns — single source of truth so tests
+# can snapshot/restore them without a hand-maintained list drifting out of sync.
+_CONFIG_GLOBALS = ("CHANNEL_ID", "ALLOWED_USER_IDS", "USE_API_KEY", "BOTS", "PROJECT_DIRS")
+
+
 def load_config() -> None:
-    """Read env into the module globals and ensure state dirs exist. Called once
-    at startup; tests call it after monkeypatching os.environ. Ends by validating."""
-    global CHANNEL_ID, ALLOWED_USER_IDS, USE_API_KEY, BOTS
+    """Read every env-derived global (the _CONFIG_GLOBALS) and ensure state dirs
+    exist. Called once at startup; tests call it after monkeypatching os.environ.
+    Ends by validating (fail-closed)."""
+    global CHANNEL_ID, ALLOWED_USER_IDS, USE_API_KEY, BOTS, PROJECT_DIRS
     CHANNEL_ID = int(os.environ["DISCORD_CHANNEL_ID"])
     ALLOWED_USER_IDS = {
         int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").split(",") if x.strip()
@@ -115,6 +121,10 @@ def load_config() -> None:
             "api_key": os.environ.get(f"ANTHROPIC_API_KEY_{n}")}
         for n in BOT_CONFIG_DIRS
     }
+    PROJECT_DIRS = [
+        Path(p.strip()).resolve()
+        for p in os.environ.get("PROJECT_DIRS", "").split(",") if p.strip()
+    ]
     for d in (STATE_DIR, SUMMARIES_DIR, PROJECT_NOTES_DIR):
         d.mkdir(parents=True, exist_ok=True)
     validate_config()
@@ -171,13 +181,11 @@ pending_actions: dict[int, asyncio.Future] = {}
 bot_user_ids: dict[str, int] = {}
 clients: dict[str, discord.Client] = {}
 
-# Project cwd whitelist（resolved 絕對路徑）
+# Project cwd whitelist (resolved abs paths) — populated by load_config() from
+# the PROJECT_DIRS env var, kept lazy like the rest of config so import stays
+# side-effect-free and the parse path is unit-testable.
 DEFAULT_CWD = "/home/user"
-PROJECT_DIRS: list[Path] = [
-    Path(p.strip()).resolve()
-    for p in os.environ.get("PROJECT_DIRS", "").split(",")
-    if p.strip()
-]
+PROJECT_DIRS: list[Path] = []
 
 
 def resolve_project_cwd(raw: str) -> tuple[str | None, str]:

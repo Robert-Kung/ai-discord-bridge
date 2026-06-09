@@ -13,6 +13,7 @@ RUN apt-get update \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+# Keep this version in sync with requirements-dev.txt (tests import the same dep).
 RUN pip install --no-cache-dir discord.py==2.4.0
 
 WORKDIR /app

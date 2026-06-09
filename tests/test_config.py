@@ -64,3 +64,30 @@ def test_subscription_mode_missing_keys_ok(set_env, tmp_state):
     set_env(USE_API_KEY="false")
     bot.load_config()
     assert bot.USE_API_KEY is False
+
+
+def test_project_dirs_parsed_and_resolved_from_env(set_env, tmp_state, tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    set_env(PROJECT_DIRS=f"{a} , {b}")  # whitespace around entries tolerated
+    bot.load_config()
+    assert a.resolve() in bot.PROJECT_DIRS
+    assert b.resolve() in bot.PROJECT_DIRS
+
+
+def test_project_dirs_empty_when_unset(set_env, tmp_state, monkeypatch):
+    set_env()
+    monkeypatch.delenv("PROJECT_DIRS", raising=False)
+    bot.load_config()
+    assert bot.PROJECT_DIRS == []
+
+
+def test_import_is_side_effect_free():
+    # The refactor's core guarantee: importing bot.py reads no env. Before
+    # load_config() runs, every config global holds its fail-closed default.
+    assert bot.CHANNEL_ID is None
+    assert bot.ALLOWED_USER_IDS == set()
+    assert bot.USE_API_KEY is False
+    assert bot.BOTS == {}
+    assert bot.PROJECT_DIRS == []
