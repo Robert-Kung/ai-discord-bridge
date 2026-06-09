@@ -78,12 +78,31 @@ if FLUSH_TOKEN_THRESHOLD and RESET_TOKEN_THRESHOLD and RESET_TOKEN_THRESHOLD < F
 PLAN_REACTION_TIMEOUT = int(os.environ.get("PLAN_REACTION_TIMEOUT", "300"))
 CSWAP_USAGE_FILE = STATE_DIR / "cswap-usage.json"  # written by host cron, read here
 
+# Auth mode (dual-mode skeleton):
+#  • USE_API_KEY unset/false (default) → subscription mode: each bot authenticates
+#    via the OAuth credentials in its CLAUDE_CONFIG_DIR (original behaviour).
+#  • USE_API_KEY true → API-key mode: inject per-bot ANTHROPIC_API_KEY_{A,B} so
+#    claude -p bills the Developer Platform instead of the subscription pool.
+# NOTE: precedence (env key wins over mounted OAuth) is assumed, not yet verified
+# against a live key — see SECURITY.md / SPEC §9.
+USE_API_KEY = os.environ.get("USE_API_KEY", "").strip().lower() in ("1", "true", "yes", "on")
 BOTS: dict[str, dict] = {
-    "A": {"token": os.environ["DISCORD_BOT_A_TOKEN"], "config_dir": "/home/user/.claude"},
-    "B": {"token": os.environ["DISCORD_BOT_B_TOKEN"], "config_dir": "/home/user/.claude-b"},
+    "A": {"token": os.environ["DISCORD_BOT_A_TOKEN"], "config_dir": "/home/user/.claude",
+          "api_key": os.environ.get("ANTHROPIC_API_KEY_A")},
+    "B": {"token": os.environ["DISCORD_BOT_B_TOKEN"], "config_dir": "/home/user/.claude-b",
+          "api_key": os.environ.get("ANTHROPIC_API_KEY_B")},
 }
-# secrets the claude subprocess must never inherit (it doesn't need them)
-_SUBPROCESS_ENV_DENY = {"DISCORD_BOT_A_TOKEN", "DISCORD_BOT_B_TOKEN"}
+if USE_API_KEY:
+    _missing = [n for n, c in BOTS.items() if not c["api_key"]]
+    if _missing:
+        raise SystemExit(
+            f"USE_API_KEY is set but ANTHROPIC_API_KEY_{'/'.join(_missing)} is empty. "
+            "Provide a per-bot key, or unset USE_API_KEY to use subscription auth."
+        )
+# secrets the claude subprocess must never inherit. ANTHROPIC_API_KEY is stripped
+# unconditionally so a stray host-level key can't silently flip a subscription-mode
+# bot onto API billing; API-key mode re-injects the per-bot key explicitly below.
+_SUBPROCESS_ENV_DENY = {"DISCORD_BOT_A_TOKEN", "DISCORD_BOT_B_TOKEN", "ANTHROPIC_API_KEY"}
 
 # ── State (in-memory + per-bot lock) ────────────────────────────────────
 bot_locks: dict[str, asyncio.Lock] = {n: asyncio.Lock() for n in BOTS}
@@ -419,11 +438,17 @@ async def call_claude(
     # from swallowing the prompt.
     args += ["--disallowedTools", *CREDENTIAL_DENY_TOOLS]
 
-    # Strip the Discord bot tokens from the subprocess env: claude never needs
-    # them, and leaving them in means a bypass-mode `printenv` (no shell-out
-    # needed, no file to read) would surface full control of the bot accounts.
+    # Strip the Discord bot tokens (and any stray ANTHROPIC_API_KEY) from the
+    # subprocess env: claude never needs the tokens, and leaving them in means a
+    # bypass-mode `printenv` (no shell-out, no file to read) would surface full
+    # control of the bot accounts.
     env = {k: v for k, v in os.environ.items() if k not in _SUBPROCESS_ENV_DENY}
     env["CLAUDE_CONFIG_DIR"] = cfg["config_dir"]
+    if USE_API_KEY and cfg.get("api_key"):
+        # API-key mode: bill the Developer Platform. NOTE the key is now in the
+        # subprocess env → readable via a bypass-mode printenv; use a spend-capped
+        # key (see SECURITY.md §6). Subscription mode keeps no key here at all.
+        env["ANTHROPIC_API_KEY"] = cfg["api_key"]
     log.info("[%s] call mode=%s session=%s cwd=%s prompt_len=%d",
              bot_name, api_mode, use_session, cwd, len(prompt))
 
