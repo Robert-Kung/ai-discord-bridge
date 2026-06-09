@@ -82,6 +82,8 @@ BOTS: dict[str, dict] = {
     "A": {"token": os.environ["DISCORD_BOT_A_TOKEN"], "config_dir": "/home/user/.claude"},
     "B": {"token": os.environ["DISCORD_BOT_B_TOKEN"], "config_dir": "/home/user/.claude-b"},
 }
+# secrets the claude subprocess must never inherit (it doesn't need them)
+_SUBPROCESS_ENV_DENY = {"DISCORD_BOT_A_TOKEN", "DISCORD_BOT_B_TOKEN"}
 
 # ── State (in-memory + per-bot lock) ────────────────────────────────────
 bot_locks: dict[str, asyncio.Lock] = {n: asyncio.Lock() for n in BOTS}
@@ -330,12 +332,19 @@ def record_bot_reply(channel_id: int, bot_name: str, content: str,
 
 
 def _is_trusted(m: dict) -> bool:
-    """A2a injection isolation: only whitelisted humans and our own bots may
+    """A2a injection isolation: only whitelisted humans and our OWN A/B bots may
     influence what a bot sees (context) or what gets summarised (flush). A
-    random channel member's text is dropped so it can't smuggle instructions
-    into a call that a whitelisted user later triggers (indirect prompt
-    injection via bystander message)."""
-    return bool(m.get("bot")) or m.get("author_id") in ALLOWED_USER_IDS
+    random channel member's text — or any THIRD-PARTY bot/webhook (GitHub, RSS,
+    translators…) — is dropped so it can't smuggle instructions into a call that
+    a whitelisted user later triggers (indirect prompt injection via bystander).
+
+    Note `m["bot"]` alone is NOT enough: it's true for every Discord bot, so we
+    match the author id against our own bots (recorded replies carry author_id
+    None and are ours by construction)."""
+    aid = m.get("author_id")
+    if aid is None:
+        return bool(m.get("bot"))  # our own recorded reply
+    return aid in ALLOWED_USER_IDS or aid in set(bot_user_ids.values())
 
 
 def format_buffer_transcript(channel_id: int, cwd: str | None = None,
@@ -410,7 +419,11 @@ async def call_claude(
     # from swallowing the prompt.
     args += ["--disallowedTools", *CREDENTIAL_DENY_TOOLS]
 
-    env = {**os.environ, "CLAUDE_CONFIG_DIR": cfg["config_dir"]}
+    # Strip the Discord bot tokens from the subprocess env: claude never needs
+    # them, and leaving them in means a bypass-mode `printenv` (no shell-out
+    # needed, no file to read) would surface full control of the bot accounts.
+    env = {k: v for k, v in os.environ.items() if k not in _SUBPROCESS_ENV_DENY}
+    env["CLAUDE_CONFIG_DIR"] = cfg["config_dir"]
     log.info("[%s] call mode=%s session=%s cwd=%s prompt_len=%d",
              bot_name, api_mode, use_session, cwd, len(prompt))
 
@@ -987,7 +1000,11 @@ def make_client(bot_name: str) -> discord.Client:
         if not mentioned:
             return
 
-        is_bot_msg = message.author.bot
+        # ONLY our own A/B bots get the no-whitelist debate path. A generic
+        # `message.author.bot` would trust ANY third-party bot/webhook in the
+        # channel — letting it both inject context and (under a bypass-default
+        # channel) trigger calls without being whitelisted. Scope to our ids.
+        is_bot_msg = message.author.id in bot_user_ids.values()
 
         # Turn budget under turn_lock
         async with turn_lock:
