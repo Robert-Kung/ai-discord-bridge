@@ -9,3 +9,6 @@ __pycache__/
 .DS_Store
 # Internal planning doc — real name + A↔B debate notes; never publish.
 RELEASE_PLAN.md
+# Internal security/remediation planning — host infra topology, IPs, project
+# list, A↔B notes. Same reason as RELEASE_PLAN.md: never publish.
+docs/
