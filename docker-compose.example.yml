@@ -2,6 +2,12 @@
 #   cp docker-compose.example.yml docker-compose.yml
 # The real docker-compose.yml is gitignored so your private project list and
 # absolute paths never get committed.
+#
+# Before first run, create the dedicated minimal bot config dirs on the host
+# (see SECURITY.md "Bot config dir setup"): ~/.claude-bot-a and ~/.claude-bot-b,
+# each holding ONLY a minimal CLAUDE.md (no personal data, no @import of any
+# shared CLAUDE.md). The bots authenticate via the single credential file
+# bind-mounted below — no re-login, same subscription billing.
 services:
   ai-discord-bridge:
     build: .
@@ -16,13 +22,37 @@ services:
       PROJECT_DIRS: >-
         /home/user/your-project-a,/home/user/your-project-b
     volumes:
-      # Claude config (mapped to identical paths so symlinks + @import keep working)
-      - /home/user/.claude:/home/user/.claude
-      - /home/user/.claude-b:/home/user/.claude-b
-      - /home/user/.claude-shared:/home/user/.claude-shared
-      - /home/user/.claude-shared/memory:/home/user/.claude-shared/memory:ro
-      # Project dirs: mount ONLY the projects you want the bots to reach.
+      # ── Bot identity: dedicated MINIMAL config dirs (D4) ──────────────────
+      # These carry no operator personal data and do NOT @import a shared
+      # CLAUDE.md. The operator's own ~/.claude / ~/.claude-b account dirs are
+      # deliberately NOT mounted — the execution path must not reach them.
+      - /home/user/.claude-bot-a:/home/user/.claude-bot-a
+      - /home/user/.claude-bot-b:/home/user/.claude-bot-b
+      # ⚠️ LIVE OAUTH CREDENTIALS — the highest-value secret in this deployment.
+      # Single-file bind-mount each account's credential file into its bot dir
+      # (no re-login, same billing). These files ARE reachable by the execution
+      # path: the bot runs `claude -p`, which can shell out — there is no OS
+      # sandbox in this container (see SECURITY.md). Tool-layer `permissions.deny`
+      # (settings.json) blocks the obvious read paths, but deny-by-name is not
+      # airtight. Mount only the single file, never the whole account dir.
+      - /home/user/.claude/.credentials.json:/home/user/.claude-bot-a/.credentials.json:ro
+      - /home/user/.claude-b/.credentials.json:/home/user/.claude-bot-b/.credentials.json:ro
+      # Server-side security settings (deny family), passed via --settings.
+      - ./settings.json:/home/user/.claude-bridge-settings.json:ro
+      # ── Shared bridge state: EXPLICIT allow-list only ────────────────────
+      # NOT the whole ~/.claude-shared — that holds the operator PII / infra /
+      # internal-plan trove (memory/, the shared CLAUDE.md, sibling logs). Mount
+      # only the bot's own operational state + the plan landing zone.
+      - /home/user/.claude-shared/discord-state:/home/user/.claude-shared/discord-state
+      - /home/user/.claude-shared/discord-summaries:/home/user/.claude-shared/discord-summaries
+      - /home/user/.claude-shared/discord-project-notes:/home/user/.claude-shared/discord-project-notes
+      - /home/user/.claude-shared/plans:/home/user/.claude-shared/plans
+      # The thin summary INDEX only — a single file, never the memory/ dir, so a
+      # newly added memory/ sibling (infrastructure.md, user_profile.md, …) does
+      # not silently become reachable.
+      - /home/user/.claude-shared/memory/project_plan.md:/home/user/.claude-shared/memory/project_plan.md:ro
+      # ── Project dirs: mount ONLY the projects the bots may reach ──────────
       # Everything else in $HOME (.ssh, .gnupg, Documents, ...) stays invisible
-      # in the container = mount-level isolation; even bypass mode can't touch it.
+      # in the container = mount-level isolation.
       - /home/user/your-project-a:/home/user/your-project-a
       - /home/user/your-project-b:/home/user/your-project-b
