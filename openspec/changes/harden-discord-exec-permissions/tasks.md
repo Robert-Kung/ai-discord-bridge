@@ -50,9 +50,9 @@
 
 ## 5. M4 — Optional per-command approver
 
-- [ ] 5.1 Implement a small MCP permission server exposing an approver tool that posts a command to Discord and returns `{allowed, reason}` on reaction
-- [ ] 5.2 Wire optional `--permission-prompt-tool` into the chokepoint, enabled by an opt-in setting. **(preflight)** The approver tier MUST use `--permission-mode default` (acceptEdits bypasses the approver — verified); it is a new tier distinct from `edit`. Auto-allow policy = `command-allowlist.md`; default-deny → Discord ✅/❌ (timeout/malformed/down = deny)
-- [ ] 5.3 Test: with the tier enabled a dangerous command executes only after an allow decision and is skipped on deny; with it disabled the allow-list/deny/sandbox still apply (spec: execution-permissions)
+- [x] 5.1 `mcp_approver.py` — standalone MCP stdio approver (no deps) + pure `approver_policy.py` (shared, no discord import) + `approver-allowlist.json`. Auto-allows allow-listed tools/commands, escalates the rest to the bridge over a unix socket → `request_discord_approval` posts to Discord (✅/❌, whitelist-gated via the existing reaction handler). Fail-closed on no-socket/timeout/malformed.
+- [x] 5.2 Wired into the chokepoint: opt-in `ENABLE_APPROVER_TIER`; new `approve` mode → `build_claude_args` adds `--permission-prompt-tool mcp__approver__approve --mcp-config … --strict-mcp-config` and forces `--permission-mode default` (acceptEdits bypasses the approver — verified); `--settings` deny family still applied. Default-closed (`approve_allowed`, downgrade-to-plan, cmd_mode gate).
+- [x] 5.3 Tested: `test_approver.py` (20 tests) — policy allow/escalate incl. compound-segment safety; MCP `evaluate` allow/deny incl. fail-closed (no socket / socket drop); full JSON-RPC protocol over a real subprocess; with approver off `--settings` (deny/sandbox) still applied. Plus a live e2e probe (deny propagated, file not created — see `m4-approver-preflight.md`) (spec: execution-permissions)
 
 ## 6. Wrap-up
 

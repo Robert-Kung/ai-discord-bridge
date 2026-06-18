@@ -43,6 +43,17 @@ the task's assumption — it must run under `default` mode, not `acceptEdits`.**
     **timeout / malformed / server-down → `deny`** (fail closed).
 - Reuse the existing `on_raw_reaction_add` whitelist gate for approvals.
 
+## End-to-end verification of the shipped implementation (2026-06-18)
+The real `mcp_approver.py` + `approver-allowlist.json` were run against live claude in the
+`approve`-tier args (`--permission-mode default --settings … --permission-prompt-tool
+mcp__approver__approve --mcp-config … --strict-mcp-config`), with a fake bridge socket
+standing in for `request_discord_approval`:
+- A state-changing `touch …` escalated through the real approver → the fake socket returned
+  `{"allowed": false}` → claude **blocked** it (the reason `e2e: denied by fake human`
+  propagated into `permission_denials`; the file was not created). The escalation→deny chain
+  holds end-to-end.
+- `whoami` / `git status` auto-ran without reaching the approver (the read-only auto-allow
+  noted above) — confirming deny-family must remain the backstop for "safe"-classified commands.
+
 ## Probe artifacts
-`/tmp/mcp_probe/server.py` (minimal approver), `cfg.json`, `requests.log`. The server is a
-throwaway probe, not the M4 implementation.
+`/tmp/mcp_probe/` (the throwaway protocol probe). The shipped server is `mcp_approver.py`.

@@ -17,6 +17,6 @@ RUN apt-get update \
 RUN pip install --no-cache-dir discord.py==2.4.0
 
 WORKDIR /app
-COPY bot.py /app/bot.py
+COPY bot.py approver_policy.py mcp_approver.py approver-allowlist.json settings.json /app/
 
 CMD ["python3", "/app/bot.py"]

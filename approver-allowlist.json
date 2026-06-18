@@ -1,0 +1,24 @@
+{
+  "_comment": "Auto-allow policy for the M4 MCP approver (task 0.3). Bash commands whose every segment matches a prefix here run without a Discord approval; everything else is escalated to Discord (default-deny on timeout). Keep minimal; expand deliberately. See openspec/.../command-allowlist.md.",
+  "auto_allow_tools": [
+    "Read", "Edit", "Write", "MultiEdit", "NotebookEdit",
+    "Glob", "Grep", "LS", "TodoWrite"
+  ],
+  "bash_prefixes": [
+    "pytest",
+    "python -m pytest",
+    ".venv/bin/python -m pytest",
+    "python -m py_compile",
+    "npm test",
+    "npm run test",
+    "npm run build",
+    "npm run lint",
+    "npx tsc",
+    "npx eslint",
+    "git status",
+    "git diff",
+    "git log",
+    "git show",
+    "git branch"
+  ]
+}
