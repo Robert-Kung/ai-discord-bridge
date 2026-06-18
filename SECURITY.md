@@ -212,6 +212,15 @@ fails validation. If the canary does not trip the deny, the bot fails closed.
   Discord (timeout/error = deny, fail-closed). Note claude auto-classifies some read-only
   commands as "safe" and runs them without consulting the approver; the deny family is the
   backstop for those. Prefer `approve` over `bypass` for untrusted-ish work.
+- **`approve` tier — write-then-run residual.** The approver auto-allows `Edit`/`Write`
+  (the bot must edit project files) and auto-allows allow-listed runners like `pytest` /
+  `npm test` / `npm run build`. With no OS sandbox and writable project mounts, those are
+  not independently safe: an auto-allowed write can drop a malicious `conftest.py` /
+  `package.json` script that a subsequently auto-allowed `pytest` / `npm` run then
+  executes — without a fresh approval. Treat the allow-list as "convenience for trusted
+  work," not a containment boundary against an adversarial agent; for genuinely untrusted
+  input, tighten the allow-list (drop the build/test runners) or gate `Write`/`Edit` to
+  escalate too.
 - **No OS sandbox (accepted).** bubblewrap cannot start in the container (§2), so
   the credential file, env, and network are protected only at the tool layer
   (name-based deny), which a determined execution-tier shell can evade. Keep

@@ -97,6 +97,22 @@ APPROVER_ALLOWLIST_PATH = os.environ.get("APPROVER_ALLOWLIST", str(_HERE / "appr
 APPROVER_SOCKET_PATH = os.environ.get("APPROVER_SOCKET_PATH", "/tmp/ai-discord-bridge-approver.sock")
 APPROVER_MCP_CONFIG_PATH = "/tmp/ai-discord-bridge-approver-mcp.json"  # written at startup
 
+
+def approver_socket_timeout() -> int:
+    """The approver's socket read timeout (passed to mcp_approver.py via the mcp-config
+    env). Must be LONGER than the human reaction window so the approver doesn't give up
+    before the human decides."""
+    return PLAN_REACTION_TIMEOUT + 15
+
+
+def approve_call_timeout() -> int:
+    """The `claude -p` subprocess timeout for the approve tier — must outlive the whole
+    approval round-trip so claude isn't killed mid-approval. Nesting (construction-
+    guaranteed): PLAN_REACTION_TIMEOUT < approver_socket_timeout() < approve_call_timeout().
+    Bounds ONE approval; a multi-command session with very slow human latency may still hit
+    it and fail safe (no-op) — the approve tier suits few-command tasks."""
+    return CLAUDE_TIMEOUT + PLAN_REACTION_TIMEOUT + 60
+
 # Auth mode (dual-mode skeleton):
 #  • USE_API_KEY unset/false (default) → subscription mode: each bot authenticates
 #    via the OAuth credentials in its CLAUDE_CONFIG_DIR (original behaviour).
@@ -670,13 +686,17 @@ async def _call_claude(
     log.info("[%s] call mode=%s session=%s cwd=%s prompt_len=%d",
              bot_name, api_mode, use_session, cwd, len(prompt))
 
+    # Approve tier blocks on a human ✅, so its subprocess must outlive the reaction
+    # window (else claude is killed before a slow approval lands → approved command lost).
+    call_timeout = approve_call_timeout() if approver else CLAUDE_TIMEOUT
+
     # Serialize calls sharing the same cwd (A/B same project → no concurrent writes)
     async with cwd_locks[cwd]:
         rc, stdout, stderr = await _run_claude_subprocess(
-            args, env, cwd=cwd, prompt=prompt, timeout=CLAUDE_TIMEOUT)
+            args, env, cwd=cwd, prompt=prompt, timeout=call_timeout)
 
     if rc is None:
-        return (f"⏱️ 響應超時（{CLAUDE_TIMEOUT}s）", False)
+        return (f"⏱️ 響應超時（{call_timeout}s）", False)
     if rc != 0:
         err = stderr.decode("utf-8", errors="replace")[:500]
         log.error("[%s] exit=%d stderr=%s", bot_name, rc, err)
@@ -1055,8 +1075,13 @@ async def request_discord_approval(command: str, tool_name: str = "Bash") -> boo
     channel = clients["A"].get_channel(CHANNEL_ID) if clients.get("A") else None
     if channel is None:
         return False
+    _MAX = 1500
+    shown = command[:_MAX]
+    trunc = "" if len(command) <= _MAX else (
+        f"\n⚠️ **指令過長，已截斷 {len(command) - _MAX} 字元——未顯示部分可能藏惡意內容；"
+        "不確定就按 ❌**")
     msg = await channel.send(
-        f"🔐 **[逐指令核可] {tool_name} 要執行：**\n```\n{command[:1500]}\n```\n"
+        f"🔐 **[逐指令核可] {tool_name} 要執行：**\n```\n{shown}\n```{trunc}\n"
         f"✅ 允許 / ❌ 拒絕（{PLAN_REACTION_TIMEOUT}s，逾時＝拒絕）"
     )
     await msg.add_reaction("✅")
@@ -1102,7 +1127,9 @@ async def start_approval_server() -> None:
         "command": sys.executable,
         "args": [APPROVER_SCRIPT],
         "env": {"APPROVER_SOCKET": APPROVER_SOCKET_PATH,
-                "APPROVER_ALLOWLIST": APPROVER_ALLOWLIST_PATH},
+                "APPROVER_ALLOWLIST": APPROVER_ALLOWLIST_PATH,
+                # nest the timeouts (see approve_call_timeout): socket wait > human window
+                "APPROVER_SOCKET_TIMEOUT": str(approver_socket_timeout())},
     }}}
     Path(APPROVER_MCP_CONFIG_PATH).write_text(json.dumps(cfg))
     try:
