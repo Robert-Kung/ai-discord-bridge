@@ -2,7 +2,7 @@
 
 - [x] 0.1 **Design gate (OV2)** — DONE, see `preflight-findings.md`. claude **2.1.179**. Empirical verdict: headless `-p` **defaults to allow** for Bash; **`--allowedTools` is additive, NOT restrictive** (non-allow-listed `whoami` runs anyway); **`permissions.deny` enforces deterministically**. D1 revised: containment = `permissions.deny` + plan-default; restrictive allow-list deferred to M4 approver.
 - [x] 0.2 **Hard gate (OV5)** — DONE, see `preflight-findings.md`. bwrap sandbox **cannot start in the container** (bwrap absent + unprivileged userns EPERM under Docker seccomp/caps). Fallback chosen (operator, option A): **accept "no OS layer"**, `sandbox.enabled:false`, document residual risk in SECURITY.md. No silent degrade.
-- [x] 0.3 Allow-list collection **deferred to M4** (operator decision: the restrictive allow-list lives in the M4 MCP approver, not M1). For M0–M3 the controlling set is the **deny** family, not an allow set; the concrete allow-list is gathered when M4 is built.
+- [x] 0.3 Allow-list **collected** (2026-06-18) → `command-allowlist.md` (pytest / read-only git / build+lint; operator "pytest etc." + suggested defaults). It is the M4 approver's auto-allow policy (the restrictive allow-list gate 0.1 showed `--allowedTools` can't enforce). M4 preflight done → `m4-approver-preflight.md`: approver enforces deny, schema captured, but **must run under `--permission-mode default` (NOT acceptEdits, which bypasses it)**.
 
 ## 1. M0 — Template + identity (zero DC interruption)
 
@@ -51,7 +51,7 @@
 ## 5. M4 — Optional per-command approver
 
 - [ ] 5.1 Implement a small MCP permission server exposing an approver tool that posts a command to Discord and returns `{allowed, reason}` on reaction
-- [ ] 5.2 Wire optional `--permission-prompt-tool` into the chokepoint, enabled by an opt-in setting
+- [ ] 5.2 Wire optional `--permission-prompt-tool` into the chokepoint, enabled by an opt-in setting. **(preflight)** The approver tier MUST use `--permission-mode default` (acceptEdits bypasses the approver — verified); it is a new tier distinct from `edit`. Auto-allow policy = `command-allowlist.md`; default-deny → Discord ✅/❌ (timeout/malformed/down = deny)
 - [ ] 5.3 Test: with the tier enabled a dangerous command executes only after an allow decision and is skipped on deny; with it disabled the allow-list/deny/sandbox still apply (spec: execution-permissions)
 
 ## 6. Wrap-up
