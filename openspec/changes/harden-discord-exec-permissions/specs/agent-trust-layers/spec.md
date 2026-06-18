@@ -33,9 +33,13 @@ Because the conversation layer runs in read/plan mode and cannot write files via
 - **WHEN** the agent itself must write a full plan document to disk
 - **THEN** the invocation is on the execution layer's `edit` tier, not the default plan mode
 
-#### Scenario: Index updates use append/rotate, not free-form overwrite
-- **WHEN** the bot updates the `project_plan.md` summary index
-- **THEN** it goes through the harness append/rotate path (snapshotting the prior version), not a free-form subprocess overwrite that could clobber the file
+#### Scenario: The operator index cannot be clobbered by the execution path
+- **WHEN** the execution path is considered against the `project_plan.md` summary index
+- **THEN** that file is mounted read-only into the container, so the execution path cannot overwrite it at all (a stronger guarantee than an in-process helper); maintaining the index is an operator-side concern
+
+#### Scenario: Harness state files rotate a snapshot on write
+- **WHEN** the harness writes the channel summary or project notes it persists
+- **THEN** the prior version is rotated to a timestamped snapshot, so a flush never silently clobbers accumulated state
 
 ### Requirement: Inter-agent discussion uses Discord mention, not the operator CLI
 The bot↔bot conversation layer SHALL exchange messages over Discord `@`-mention. It SHALL NOT invoke the operator's `sibling` CLI, which is unavailable headless / inside the container and is a CLI-only operator tool.

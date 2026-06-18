@@ -1,19 +1,25 @@
 ## ADDED Requirements
 
-### Requirement: Allow-listed command execution replaces full bypass
-The execution path SHALL run with `--permission-mode acceptEdits` plus an explicit `--allowedTools` command allow-list. Commands not on the allow-list SHALL NOT execute. Full `bypassPermissions` SHALL NOT be the default execution mode.
+### Requirement: Execution mode is acceptEdits contained by the deny family (NOT an allow-list)
+> Revised after preflight gate 0.1 (see `preflight-findings.md`): in headless `claude -p`
+> (claude 2.1.179) `--allowedTools` is additive, NOT restrictive — a non-listed command
+> runs anyway. A restrictive allow-list is therefore impossible at the flag layer here and
+> is deferred to the per-command approver tier. Containment of the execution path comes
+> from the `permissions.deny` family, not an allow-list.
 
-#### Scenario: Allow-listed command runs
-- **WHEN** the agent invokes a command present on the allow-list (e.g. a test or git command)
-- **THEN** the command executes without a permission prompt
+The execution path SHALL run with `--permission-mode acceptEdits` and SHALL NOT pass an `--allowedTools` execution list (it does not restrict). Containment of what executes SHALL come from the enforced `permissions.deny` family. Full `bypassPermissions` SHALL NOT be the default execution mode. A restrictive per-command allow-list SHALL be provided only by the optional approver tier (below).
 
-#### Scenario: Non-allow-listed command is blocked
-- **WHEN** the agent attempts a command not on the allow-list
-- **THEN** the command does not execute
+#### Scenario: Execution runs under acceptEdits without an allow-list flag
+- **WHEN** the human-driven execution path invokes the agent
+- **THEN** the invocation uses `--permission-mode acceptEdits` and emits no `--allowedTools` flag
 
-#### Scenario: Compound command is not auto-approved by a single rule
-- **WHEN** the agent submits a compound command joining an allow-listed command with a non-allow-listed one (via `&&`, `|`, `;`, etc.)
-- **THEN** the non-allow-listed segment does not execute
+#### Scenario: A denied command does not execute under the execution mode
+- **WHEN** the agent attempts a command covered by the `permissions.deny` family (credential read, `env`/`printenv`, `curl`/`wget`) under `acceptEdits`
+- **THEN** the command is denied and does not execute
+
+#### Scenario: Restrictive command confinement is the approver tier's job
+- **WHEN** true "only these commands may run" confinement is required
+- **THEN** it is provided by the optional `--permission-prompt-tool` approver, not by `--allowedTools`
 
 ### Requirement: Enforced deny rules survive any mode
 A server-side `settings.json` SHALL be passed via `--settings` on every execution call, containing a `permissions.deny` set that blocks credential reads (`~/.claude` config dirs), environment dumping (`env`, `printenv`), arbitrary network fetch (`curl`, `wget`, `WebFetch`). These deny rules SHALL be enforced even when an invocation runs in bypass mode.
@@ -30,16 +36,21 @@ A server-side `settings.json` SHALL be passed via `--settings` on every executio
 - **WHEN** an invocation runs in the opt-in full-bypass tier
 - **THEN** the deny rules still block credential reads, env dumps, and arbitrary network fetch
 
-### Requirement: OS sandbox isolates execution
-The execution call SHALL enable the Claude Code OS sandbox configured to deny reads of credential files and restrict network. The sandbox SHALL be configured to fail closed: it SHALL NOT silently degrade to unsandboxed execution if it cannot start, and commands SHALL NOT escape the sandbox on failure.
+### Requirement: OS sandbox is explicitly disabled, residual documented (no silent degrade)
+> Revised after preflight gate 0.2 (see `preflight-findings.md`): Claude Code's bubblewrap
+> sandbox cannot start in the container (bubblewrap absent + unprivileged user namespaces
+> blocked by Docker's default seccomp/caps), so enabling it with `failIfUnavailable: true`
+> would make the bot fail every call. Operator decision: accept "no OS layer."
 
-#### Scenario: Sandbox blocks credential read at OS level
-- **WHEN** the agent attempts to read a credential file path listed in the sandbox deny-read set
-- **THEN** the OS sandbox blocks the read independently of the tool-level deny rules
+The server-side `settings.json` SHALL set `sandbox.enabled: false` explicitly — there SHALL NOT be an ambiguous "enabled but silently absent" state. With no OS layer, the credential files, environment, and network SHALL be protected at the tool layer by the `permissions.deny` family, and the resulting residual risk (name-based deny is evadable by a determined shell) SHALL be documented in `SECURITY.md`.
 
-#### Scenario: Sandbox unavailable fails closed
-- **WHEN** the sandbox cannot be initialized
-- **THEN** the execution call fails rather than running unsandboxed
+#### Scenario: Sandbox is explicitly off, not silently degraded
+- **WHEN** `settings.json` is inspected
+- **THEN** `sandbox.enabled` is `false` (an explicit, reviewable state), not absent or implicitly disabled
+
+#### Scenario: Residual risk of the absent OS layer is disclosed
+- **WHEN** an operator reads `SECURITY.md`
+- **THEN** it states there is no OS sandbox and that tool-layer deny is name-based and evadable, so execution tiers must be limited to trusted users
 
 ### Requirement: Full bypass is an opt-in tier, default closed
 Full `bypassPermissions` execution SHALL be reachable only when an operator explicitly opts in, and SHALL be off by default. The default channel mode SHALL remain a safe read/plan mode.

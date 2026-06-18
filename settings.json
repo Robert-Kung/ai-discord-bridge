@@ -10,7 +10,9 @@
       "Bash(env:*)",
       "Bash(printenv)",
       "Bash(printenv:*)",
+      "Bash(curl)",
       "Bash(curl:*)",
+      "Bash(wget)",
       "Bash(wget:*)",
       "WebFetch"
     ]
