@@ -272,7 +272,30 @@ fails validation. If the canary does not trip the deny, the bot fails closed.
 
 ---
 
-## 9. Reporting
+## 9. Bot config dir setup
+
+Before first run, create the two dedicated minimal config dirs the bots authenticate
+under (they are bind-mounted by `docker-compose.yml`):
+
+```sh
+for n in a b; do
+  mkdir -p ~/.claude-bot-$n
+  cp /path/to/repo/bot-config/CLAUDE.md ~/.claude-bot-$n/CLAUDE.md   # minimal, no PII, no @import
+  printf '{}' > ~/.claude-bot-$n/settings.json
+  : > ~/.claude-bot-$n/.credentials.json                            # EMPTY placeholder — see note
+done
+```
+
+**The `.credentials.json` in each bot dir MUST be an empty regular file, NOT a symlink to
+your real credential file.** The container bind-mounts your real credential file *over* this
+placeholder path. If it is a symlink (e.g. `→ ~/.claude/.credentials.json`), Docker resolves
+through it and ends up creating `/home/user/.claude/` inside the container as the mount point
+— re-exposing the operator account-dir path the isolation (§2) is meant to remove. With a
+plain placeholder, the real credential lands cleanly in the bot dir and `~/.claude` / `~/.claude-b`
+do not exist in the container at all. (Bare-running `bot.py` on the host is unsupported; the
+credential only resolves inside the container via the bind mount.)
+
+## 10. Reporting
 
 This is a personal, no-support project (see the README). If you find a security
 issue, opening an issue is welcome, but there is no guaranteed response time. The
