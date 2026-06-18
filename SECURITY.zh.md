@@ -225,7 +225,27 @@ bot 就 fail closed。
 
 ---
 
-## 9. 回報
+## 9. Bot config dir 設定
+
+首次執行前，先建好兩個 bot 認證用的專用精簡 config dir（由 `docker-compose.yml` 掛載）：
+
+```sh
+for n in a b; do
+  mkdir -p ~/.claude-bot-$n
+  cp /path/to/repo/bot-config/CLAUDE.md ~/.claude-bot-$n/CLAUDE.md   # 精簡、無 PII、不 @import
+  printf '{}' > ~/.claude-bot-$n/settings.json
+  : > ~/.claude-bot-$n/.credentials.json                            # 空的 placeholder——見下方
+done
+```
+
+**每個 bot dir 裡的 `.credentials.json` 必須是空的「一般檔案」，不可以是指向你真實憑證的
+symlink。** 容器會把你的真實憑證檔 bind-mount 蓋在這個 placeholder 路徑上。若它是 symlink
+（例如 `→ ~/.claude/.credentials.json`），Docker 會順著 symlink 解析，最後在容器內把
+`/home/user/.claude/` 建出來當 mount point——等於把 §2 想移除的操作者帳號目錄路徑又露出來。
+用一般 placeholder 檔，真實憑證就乾淨地落在 bot dir，且 `~/.claude` / `~/.claude-b` 在容器內
+根本不存在。（在 host 上裸跑 `bot.py` 不在支援範圍；憑證只在容器內透過 bind mount 解析。）
+
+## 10. 回報
 
 這是個人、無支援的專案（見 README）。若你發現安全問題，歡迎開 issue，但不保證回應
 時間。整個實作都在 `bot.py`——請自行 fork 與修補。
