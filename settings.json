@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(//home/user/.claude/**)",
+      "Read(//home/user/.claude-b/**)",
+      "Read(//home/user/.claude-bot-a/**)",
+      "Read(//home/user/.claude-bot-b/**)",
+      "Read(//home/user/**/.credentials.json)",
+      "Bash(env)",
+      "Bash(env:*)",
+      "Bash(printenv)",
+      "Bash(printenv:*)",
+      "Bash(curl)",
+      "Bash(curl:*)",
+      "Bash(wget)",
+      "Bash(wget:*)",
+      "WebFetch"
+    ]
+  },
+  "sandbox": {
+    "enabled": false
+  }
+}

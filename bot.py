@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import time
 from collections import defaultdict, deque
 from pathlib import Path
@@ -65,7 +66,52 @@ PLAN_REACTION_TIMEOUT = int(os.environ.get("PLAN_REACTION_TIMEOUT", "300"))
 
 # Static (env-free) bot identity → config dir. Lets bot_locks etc. exist at
 # import time without reading any secrets.
-BOT_CONFIG_DIRS = {"A": "/home/user/.claude", "B": "/home/user/.claude-b"}
+#
+# Dedicated MINIMAL config dirs (D4): the bots do NOT run under the operator's own
+# ~/.claude / ~/.claude-b account dirs. ~/.claude-bot-{a,b} carry a minimal CLAUDE.md
+# with no operator personal data and no @import of any shared CLAUDE.md; the live
+# OAuth credential file is bind-mounted in single-file (no re-login, same billing),
+# so the execution path can authenticate without the whole account dir being reachable.
+BOT_CONFIG_DIRS = {"A": "/home/user/.claude-bot-a", "B": "/home/user/.claude-bot-b"}
+
+# Repo-tracked server-side security settings (permissions.deny family; sandbox
+# explicitly disabled — see settings.json + SECURITY.md). Passed via --settings on
+# EVERY claude -p call so the deny rules are version-pinned and reviewable in-repo,
+# not dependent on per-dir settings state. In the container this path is the
+# bind-mounted ./settings.json (see docker-compose); for host-direct runs it falls
+# back to the repo copy next to bot.py.
+BRIDGE_SETTINGS_PATH = os.environ.get(
+    "BRIDGE_SETTINGS_PATH",
+    "/home/user/.claude-bridge-settings.json"
+    if Path("/home/user/.claude-bridge-settings.json").exists()
+    else str(Path(__file__).resolve().parent / "settings.json"),
+)
+
+# M4 — optional per-command MCP approver tier (off by default). The bridge spawns
+# mcp_approver.py via --permission-prompt-tool so claude asks it (in default mode only —
+# acceptEdits/bypass auto-accept and skip it) before each non-allow-listed Bash command;
+# the approver escalates over APPROVER_SOCKET_PATH to request_discord_approval(). Fail-closed.
+_HERE = Path(__file__).resolve().parent
+APPROVER_SCRIPT = str(_HERE / "mcp_approver.py")
+APPROVER_ALLOWLIST_PATH = os.environ.get("APPROVER_ALLOWLIST", str(_HERE / "approver-allowlist.json"))
+APPROVER_SOCKET_PATH = os.environ.get("APPROVER_SOCKET_PATH", "/tmp/ai-discord-bridge-approver.sock")
+APPROVER_MCP_CONFIG_PATH = "/tmp/ai-discord-bridge-approver-mcp.json"  # written at startup
+
+
+def approver_socket_timeout() -> int:
+    """The approver's socket read timeout (passed to mcp_approver.py via the mcp-config
+    env). Must be LONGER than the human reaction window so the approver doesn't give up
+    before the human decides."""
+    return PLAN_REACTION_TIMEOUT + 15
+
+
+def approve_call_timeout() -> int:
+    """The `claude -p` subprocess timeout for the approve tier — must outlive the whole
+    approval round-trip so claude isn't killed mid-approval. Nesting (construction-
+    guaranteed): PLAN_REACTION_TIMEOUT < approver_socket_timeout() < approve_call_timeout().
+    Bounds ONE approval; a multi-command session with very slow human latency may still hit
+    it and fail safe (no-op) — the approve tier suits few-command tasks."""
+    return CLAUDE_TIMEOUT + PLAN_REACTION_TIMEOUT + 60
 
 # Auth mode (dual-mode skeleton):
 #  • USE_API_KEY unset/false (default) → subscription mode: each bot authenticates
@@ -102,7 +148,8 @@ _SUBPROCESS_ENV_DENY = {
 
 # The env-derived globals load_config() owns — single source of truth so tests
 # can snapshot/restore them without a hand-maintained list drifting out of sync.
-_CONFIG_GLOBALS = ("CHANNEL_ID", "ALLOWED_USER_IDS", "USE_API_KEY", "BOTS", "PROJECT_DIRS")
+_CONFIG_GLOBALS = ("CHANNEL_ID", "ALLOWED_USER_IDS", "USE_API_KEY", "BOTS",
+                   "PROJECT_DIRS", "BYPASS_TIER_ENABLED", "APPROVER_TIER_ENABLED")
 
 
 def load_config() -> None:
@@ -110,11 +157,14 @@ def load_config() -> None:
     exist. Called once at startup; tests call it after monkeypatching os.environ.
     Ends by validating (fail-closed)."""
     global CHANNEL_ID, ALLOWED_USER_IDS, USE_API_KEY, BOTS, PROJECT_DIRS
+    global BYPASS_TIER_ENABLED, APPROVER_TIER_ENABLED
     CHANNEL_ID = int(os.environ["DISCORD_CHANNEL_ID"])
     ALLOWED_USER_IDS = {
         int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").split(",") if x.strip()
     }
     USE_API_KEY = os.environ.get("USE_API_KEY", "").strip().lower() in ("1", "true", "yes", "on")
+    BYPASS_TIER_ENABLED = os.environ.get("ENABLE_BYPASS_TIER", "").strip().lower() in ("1", "true", "yes", "on")
+    APPROVER_TIER_ENABLED = os.environ.get("ENABLE_APPROVER_TIER", "").strip().lower() in ("1", "true", "yes", "on")
     BOTS = {
         n: {"token": os.environ[f"DISCORD_BOT_{n}_TOKEN"],
             "config_dir": BOT_CONFIG_DIRS[n],
@@ -213,26 +263,42 @@ def resolve_project_cwd(raw: str) -> tuple[str | None, str]:
         return None, f"🛡 `{resolved}` 不是 git 專案（缺 .git）"
     return str(resolved), "ok"
 
-VALID_MODES = {"plan", "edit", "bypass"}
+VALID_MODES = {"plan", "edit", "bypass", "approve"}
+# "approve" is the M4 per-command tier: it runs claude in `default` permission mode
+# (the only mode the --permission-prompt-tool is consulted in — acceptEdits/bypass skip
+# it, verified) behind the MCP approver. Mapped to "default" for the CLI.
 MODE_ALIASES = {
     "plan": "plan",
     "edit": "acceptEdits",
     "acceptedits": "acceptEdits",
     "bypass": "bypassPermissions",
     "bypasspermissions": "bypassPermissions",
+    "approve": "default",
 }
 
 DEFAULT_CHANNEL_MODE = "plan"  # safe default; bypass requires opt-in
 
-# A2b: paths holding each account's OAuth credentials / settings. The bridge
-# itself reads summaries/notes from .claude-shared in Python (not via the claude
-# tool), and CLAUDE.md @import is config-load not a Read-tool call, so denying
-# the Read tool on these dirs doesn't break legitimate work.
-CREDENTIAL_DENY_TOOLS = [
-    "Read(//home/user/.claude/**)",
-    "Read(//home/user/.claude-b/**)",
-    "Read(//home/user/.claude-shared/**)",
-]
+# Credential-read / env / network denial now lives ENTIRELY in the repo-tracked
+# settings.json (permissions.deny), passed via --settings on every call (D2,
+# Issue 5). The prior CREDENTIAL_DENY_TOOLS / --disallowedTools mechanism is
+# removed: deny is the single source, it is version-pinned + reviewable in-repo,
+# and the old blanket Read(//home/user/.claude-shared/**) wrongly blocked the
+# project_plan.md index read the bot now legitimately needs (Issue 2).
+
+# OV4 — bypass-UX transition. Full bypassPermissions is an opt-in tier, OFF by
+# default; reachable only when the operator sets ENABLE_BYPASS_TIER. While the
+# tier is enabled, the existing plan-then-execute / !yolo flow remains its gate,
+# until the M4 MCP approver replaces it. When disabled, bypass is structurally
+# unreachable (cmd_mode / !once refuse it; a stored bypass mode downgrades to the
+# safe default) — no dead code, no ambiguous lifecycle.
+BYPASS_TIER_ENABLED: bool = False
+
+# M4 — per-command MCP approver tier (env ENABLE_APPROVER_TIER), OFF by default. When on,
+# the `approve` mode runs claude in `default` permission mode behind the MCP approver, so
+# every non-allow-listed Bash command needs a human ✅ on Discord (allow-list auto-passes,
+# timeout/error = deny). The only headless mechanism that confines execution to a command
+# set (gate 0.1); `edit`/`bypass` cannot.
+APPROVER_TIER_ENABLED: bool = False
 
 
 # ── Channel state file persistence ──────────────────────────────────────
@@ -352,6 +418,20 @@ def save_project_notes(cwd: str, content: str) -> Path:
     return notes
 
 
+# ── Conversation-layer persistence (D6 — harness writes, mode-independent) ──────
+# Plan/decision output is persisted by THIS process (the harness) via save_summary /
+# save_project_notes (below), never by a plan-mode agent subprocess — plan mode cannot
+# write files, and the conversation layer only ever uses converse() (plan). Both
+# writers rotate the prior version to a timestamped snapshot, so a flush can never
+# silently clobber accumulated state (the "no free-form overwrite" guarantee).
+#
+# The thin project_plan.md index is mounted READ-ONLY into the container (see
+# docker-compose): the execution path can read it as context but structurally cannot
+# overwrite it — a stronger guarantee than any in-process helper. Updating that index
+# is an operator-side concern, not the bot's. A full plan document the agent itself
+# must author requires the edit tier; it is never produced from the default plan path.
+
+
 def build_combined_system_prompt(channel_id: int, cwd: str, bot_name: str) -> Path | None:
     """Merge 中期 summary + 專案 notes into ONE file for --append-system-prompt-file
     (the flag only takes one file). temp file is keyed by (channel, bot) so A/B
@@ -461,69 +541,166 @@ def build_context_prefix(channel_id: int, limit: int = 15) -> str:
 
 
 # ── Claude CLI wrapper ──────────────────────────────────────────────────
-async def call_claude(
+def build_claude_args(
+    api_mode: str,
+    *,
+    session_id: str | None = None,
+    system_prompt_file: str | None = None,
+    approver_mcp_config: str | None = None,
+) -> list[str]:
+    """Assemble the `claude -p` argv — the single place argv is constructed (the
+    chokepoint's pure arg builder, so the order is unit-testable; D3 / Issue 4).
+
+    Fixed order: fixed flags, then value flags (`--settings`, `--permission-mode`,
+    `--resume`, `--append-system-prompt-file`) each taking exactly one argument.
+    No variadic flag is emitted — `--allowedTools` is intentionally absent (gate
+    0.1: it does not restrict in headless `-p`; the restrictive allow-list is the
+    M4 approver) and the old `--disallowedTools` credential family is gone (deny
+    now lives in `--settings`). With no variadic flag nothing can swallow a
+    following arg, and the prompt is always fed via stdin (never argv).
+
+    When `approver_mcp_config` is given (M4 approver tier), the per-command MCP
+    approver is wired in. `--strict-mcp-config` ensures ONLY this approver MCP is
+    loaded (no ambient MCP servers can shadow it)."""
+    args = ["claude", "-p", "--output-format", "json",
+            "--settings", BRIDGE_SETTINGS_PATH,
+            "--permission-mode", api_mode]
+    if session_id:
+        args += ["--resume", session_id]
+    if system_prompt_file:
+        args += ["--append-system-prompt-file", system_prompt_file]
+    if approver_mcp_config:
+        args += ["--permission-prompt-tool", "mcp__approver__approve",
+                 "--mcp-config", approver_mcp_config, "--strict-mcp-config"]
+    return args
+
+
+# ── Settings canary (OV1) ─────────────────────────────────────────────────
+# claude SILENTLY IGNORES a --settings file that fails validation (e.g. schema
+# drift on a Claude Code upgrade) — the whole permissions.deny family would
+# evaporate while the bot keeps running acceptEdits. The canary proves deny is
+# actually in force by attempting a must-be-denied action and confirming refusal;
+# if the deny does not fire, the bot fails closed.
+_CANARY_PROMPT = ("Run the shell command: printenv  — then stop. "
+                  "Report only whether it ran or was blocked.")
+
+
+def canary_passed(result_json: dict) -> bool:
+    """True iff the must-be-denied canary action was actually denied (so the
+    --settings deny family loaded). A Bash deny appears in permission_denials; an
+    empty list means the deny did NOT fire → settings silently dropped → fail
+    closed."""
+    denials = result_json.get("permission_denials") or []
+    return any(d.get("tool_name") == "Bash" for d in denials)
+
+
+async def _run_claude_subprocess(
+    args: list[str], env: dict, *, cwd: str, prompt: str, timeout: int,
+) -> tuple[int | None, bytes, bytes]:
+    """The SINGLE place a `claude -p` subprocess is launched (D3 / spec: single
+    execution chokepoint). It performs NO argument construction — `args` come from
+    `build_claude_args`, the sole assembler — and the prompt is always passed via
+    stdin. Returns (returncode, stdout, stderr); returncode is None on timeout
+    (the process is killed)."""
+    proc = await asyncio.create_subprocess_exec(
+        *args, env=env, cwd=cwd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input=prompt.encode()), timeout=timeout)
+    except asyncio.TimeoutError:
+        log.error("claude subprocess timeout — killing pid %s", proc.pid)
+        proc.kill()
+        try:
+            await proc.communicate()
+        except Exception:
+            pass
+        return (None, b"", b"")
+    return (proc.returncode, stdout, stderr)
+
+
+async def run_settings_canary(bot_name: str = "B") -> bool:
+    """Live pre-flight: run a tiny `claude -p` that attempts a denied command and
+    confirm the deny fired. Returns True only if it is safe to proceed; any failure
+    to run / parse is treated as unsafe (fail closed)."""
+    cfg = BOTS[bot_name]
+    args = build_claude_args("default")
+    env = build_subprocess_env(cfg)
+    try:
+        rc, stdout, _ = await _run_claude_subprocess(
+            args, env, cwd=DEFAULT_CWD, prompt=_CANARY_PROMPT, timeout=CLAUDE_TIMEOUT)
+    except OSError as e:
+        log.error("settings canary could not run (%s) — failing closed", e)
+        return False
+    if rc is None or rc != 0:
+        log.error("settings canary rc=%s — failing closed", rc)
+        return False
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        log.error("settings canary produced unparseable output — failing closed")
+        return False
+    if not canary_passed(data):
+        log.error("settings canary NOT denied — the --settings deny family is not "
+                  "in force (silently dropped?). Failing closed.")
+        return False
+    return True
+
+
+# The permission/exec CHOKEPOINT (D3). Every agent invocation funnels through here;
+# it is the only caller of build_claude_args + _run_claude_subprocess. It is private
+# (leading underscore) and takes an explicit `mode`. Layers do NOT call it directly —
+# they go through the two narrow entries below (converse / execute), so the
+# conversation layer is structurally unable to request write/execute capability.
+async def _call_claude(
     bot_name: str,
     prompt: str,
     *,
-    mode: str = "plan",
+    mode: str,
     use_session: bool = True,
     prepend_summary_from_channel: int | None = None,
-    extra_args: list[str] | None = None,
     cwd: str = DEFAULT_CWD,
 ) -> tuple[str, bool]:
     """Run `claude -p` for the given bot. Returns (reply_text, ok)."""
     cfg = BOTS[bot_name]
     api_mode = MODE_ALIASES.get(mode, mode)
+    approver = mode == "approve"  # per-command MCP approval tier (runs in `default` mode)
 
-    args = ["claude", "-p", "--output-format", "json", "--permission-mode", api_mode]
-    if use_session:
-        sid = load_session(bot_name, cwd)
-        if sid:
-            args += ["--resume", sid]
+    sid = load_session(bot_name, cwd) if use_session else None
+    system_prompt_file = None
     if prepend_summary_from_channel is not None:
         combined = build_combined_system_prompt(prepend_summary_from_channel, cwd, bot_name)
         if combined:
-            args += ["--append-system-prompt-file", str(combined)]
-    if extra_args:
-        args += extra_args
-    # A2b: deny the Read tool on the mounted config dirs in EVERY mode (not just
-    # bypass — Read is allowed even in plan mode, so credentials could otherwise
-    # be read out and echoed into a reply). Defence-in-depth, not airtight: a
-    # bypass-mode user can still shell out to read them, so bypass stays
-    # whitelist-only (see ALLOWED_USER_IDS fail-closed guard).
-    # MUST be last: --disallowedTools is variadic and greedily consumes following
-    # args — keeping it at the tail (and feeding the prompt via stdin) stops it
-    # from swallowing the prompt.
-    args += ["--disallowedTools", *CREDENTIAL_DENY_TOOLS]
+            system_prompt_file = str(combined)
+    args = build_claude_args(
+        api_mode, session_id=sid, system_prompt_file=system_prompt_file,
+        approver_mcp_config=APPROVER_MCP_CONFIG_PATH if approver else None)
 
     env = build_subprocess_env(cfg)
+    if approver:
+        # tell the spawned mcp_approver.py where to reach the bridge's approval socket
+        env["APPROVER_SOCKET"] = APPROVER_SOCKET_PATH
     log.info("[%s] call mode=%s session=%s cwd=%s prompt_len=%d",
              bot_name, api_mode, use_session, cwd, len(prompt))
 
+    # Approve tier blocks on a human ✅, so its subprocess must outlive the reaction
+    # window (else claude is killed before a slow approval lands → approved command lost).
+    call_timeout = approve_call_timeout() if approver else CLAUDE_TIMEOUT
+
     # Serialize calls sharing the same cwd (A/B same project → no concurrent writes)
     async with cwd_locks[cwd]:
-        proc = await asyncio.create_subprocess_exec(
-            *args, env=env, cwd=cwd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=prompt.encode()), timeout=CLAUDE_TIMEOUT)
-        except asyncio.TimeoutError:
-            log.error("[%s] timeout — killing pid %s", bot_name, proc.pid)
-            proc.kill()
-            try:
-                await proc.communicate()
-            except Exception:
-                pass
-            return (f"⏱️ 響應超時（{CLAUDE_TIMEOUT}s）", False)
+        rc, stdout, stderr = await _run_claude_subprocess(
+            args, env, cwd=cwd, prompt=prompt, timeout=call_timeout)
 
-    if proc.returncode != 0:
+    if rc is None:
+        return (f"⏱️ 響應超時（{call_timeout}s）", False)
+    if rc != 0:
         err = stderr.decode("utf-8", errors="replace")[:500]
-        log.error("[%s] exit=%d stderr=%s", bot_name, proc.returncode, err)
-        return (f"❌ Claude 呼叫失敗 (exit {proc.returncode})：```{err}```", False)
+        log.error("[%s] exit=%d stderr=%s", bot_name, rc, err)
+        return (f"❌ Claude 呼叫失敗 (exit {rc})：```{err}```", False)
 
     try:
         data = json.loads(stdout)
@@ -549,6 +726,65 @@ async def call_claude(
             session_ctx_tokens[(bot_name, cwd)] = ctx
             log.info("[%s] context now ~%dk tokens (cwd=%s)", bot_name, ctx // 1000, cwd)
     return (reply, True)
+
+
+# ── Two trust layers — the only public entries to the chokepoint (D3) ────────
+# Modes are NOT a free caller parameter. The conversation layer calls converse()
+# which hard-codes plan/read and exposes no mode arg, so it is structurally
+# incapable of emitting acceptEdits/bypassPermissions or an execution allow-list.
+# Only execute() — the human-driven, post-authorization path — may request the
+# write/execute tiers.
+_EXEC_MODES = {"edit", "acceptEdits", "bypass", "bypassPermissions", "approve"}
+
+
+async def converse(
+    bot_name: str,
+    prompt: str,
+    *,
+    use_session: bool = True,
+    prepend_summary_from_channel: int | None = None,
+    cwd: str = DEFAULT_CWD,
+) -> tuple[str, bool]:
+    """Conversation-layer entry (A↔B debate, summaries, memory). HARD-CODES the
+    read/plan mode; has no `mode` parameter, so it cannot escalate for any input.
+    Plan/decision output is persisted by the harness, never by this subprocess."""
+    return await _call_claude(
+        bot_name, prompt, mode="plan", use_session=use_session,
+        prepend_summary_from_channel=prepend_summary_from_channel, cwd=cwd,
+    )
+
+
+def exec_layer_for(is_bot_msg: bool, effective_mode: str) -> str:
+    """Routing decision for the standard call (D3 layer split): return 'execute'
+    ONLY for a human-driven execution-tier request (`edit`, or the M4 `approve`
+    tier); every other case — any bot-origin mention (the conversation layer) or
+    plan — routes to 'converse'. Pure, so the structural guarantee is
+    unit-testable. (Bypass is handled on its own plan-then-execute path and is
+    default-closed; it never reaches here.)"""
+    if not is_bot_msg and effective_mode in ("edit", "approve"):
+        return "execute"
+    return "converse"
+
+
+async def execute(
+    bot_name: str,
+    prompt: str,
+    *,
+    mode: str,
+    use_session: bool = True,
+    prepend_summary_from_channel: int | None = None,
+    cwd: str = DEFAULT_CWD,
+) -> tuple[str, bool]:
+    """Execution-layer entry (human-driven). The ONLY path that may request a
+    write/execute tier, and only after the caller has passed the user/channel
+    authorization checks. Refuses any non-execution mode (a plan call must go
+    through converse(), keeping the two layers cleanly separated)."""
+    if mode not in _EXEC_MODES:
+        raise ValueError(f"execute() requires an execution mode, got {mode!r}")
+    return await _call_claude(
+        bot_name, prompt, mode=mode, use_session=use_session,
+        prepend_summary_from_channel=prepend_summary_from_channel, cwd=cwd,
+    )
 
 
 # ── Flush: 中期 summary + 專案 notes（單次呼叫雙段輸出）──────────────────
@@ -602,8 +838,8 @@ async def do_flush(channel_id: int, *, manual: bool = False,
             "不要逐字複述，500 字內。\n\n--- 對話原文 ---\n" + transcript
         )
 
-    reply, ok = await call_claude(
-        "B", prompt, mode="plan", use_session=False,
+    reply, ok = await converse(
+        "B", prompt, use_session=False,
         prepend_summary_from_channel=None, cwd=DEFAULT_CWD,
     )
     if not ok:
@@ -645,7 +881,7 @@ async def flush_session_then_reset(channel, bot_name: str, cwd: str) -> bool:
         "保留：(1) 已拍板決策與結論 (2) 進行中任務 / open questions "
         "(3) 關鍵檔案路徑 / 暫存檔位置 (4) 已建立的工作狀態。不要逐字複述，600 字內。"
     )
-    reply, ok = await call_claude(bot_name, prompt, mode="plan", use_session=True, cwd=cwd)
+    reply, ok = await converse(bot_name, prompt, use_session=True, cwd=cwd)
     if not ok:
         return False
     save_summary(channel.id, reply, cwd)
@@ -735,8 +971,8 @@ async def run_discuss(channel: discord.TextChannel, topic: str) -> None:
             )
             async with bot_locks[bot_name]:
                 async with channel.typing():
-                    reply, ok = await call_claude(
-                        bot_name, prompt, mode="plan", use_session=False,
+                    reply, ok = await converse(
+                        bot_name, prompt, use_session=False,
                         prepend_summary_from_channel=channel.id,
                     )
             if not ok:
@@ -758,8 +994,8 @@ async def run_discuss(channel: discord.TextChannel, topic: str) -> None:
             "(2) 雙方核心論點 (3) 共識/結論 (4) 仍未解決的分歧。300 字內。\n\n"
             f"主題：{topic}\n\n{debate_text}"
         )
-        summary, ok = await call_claude(
-            "B", flush_prompt, mode="plan", use_session=False,
+        summary, ok = await converse(
+            "B", flush_prompt, use_session=False,
         )
         if ok:
             path = save_summary(channel.id, summary, cwd)
@@ -778,7 +1014,7 @@ async def run_plan_then_execute(
     if skip_plan:
         async with bot_locks[bot_name]:
             async with channel.typing():
-                reply, _ = await call_claude(
+                reply, _ = await execute(
                     bot_name, prompt, mode="bypass",
                     prepend_summary_from_channel=channel.id, cwd=cwd,
                 )
@@ -790,8 +1026,8 @@ async def run_plan_then_execute(
     # Phase 1: plan
     async with bot_locks[bot_name]:
         async with channel.typing():
-            plan_reply, ok = await call_claude(
-                bot_name, prompt, mode="plan",
+            plan_reply, ok = await converse(
+                bot_name, prompt,
                 prepend_summary_from_channel=channel.id, cwd=cwd,
             )
     if not ok:
@@ -821,13 +1057,88 @@ async def run_plan_then_execute(
     # Phase 2: execute
     async with bot_locks[bot_name]:
         async with channel.typing():
-            exec_reply, _ = await call_claude(
+            exec_reply, _ = await execute(
                 bot_name, prompt, mode="bypass",
                 prepend_summary_from_channel=channel.id, cwd=cwd,
             )
     record_bot_reply(channel.id, bot_name, exec_reply[:1000], cwd=cwd)
     for c in chunk_message(f"🚀 **[mode=bypass · executed]**\n{exec_reply}"):
         await channel.send(c)
+
+
+# ── M4 per-command approver: Discord round-trip + IPC socket ─────────────
+async def request_discord_approval(command: str, tool_name: str = "Bash") -> bool:
+    """Post a single command to the bridge channel with ✅/❌ and await a whitelisted
+    human's decision. Returns True only on an explicit ✅; timeout / no channel → False
+    (fail-closed). Reuses the existing pending_actions + on_raw_reaction_add machinery,
+    so only ALLOWED_USER_IDS reactions count."""
+    channel = clients["A"].get_channel(CHANNEL_ID) if clients.get("A") else None
+    if channel is None:
+        return False
+    _MAX = 1500
+    shown = command[:_MAX]
+    trunc = "" if len(command) <= _MAX else (
+        f"\n⚠️ **指令過長，已截斷 {len(command) - _MAX} 字元——未顯示部分可能藏惡意內容；"
+        "不確定就按 ❌**")
+    msg = await channel.send(
+        f"🔐 **[逐指令核可] {tool_name} 要執行：**\n```\n{shown}\n```{trunc}\n"
+        f"✅ 允許 / ❌ 拒絕（{PLAN_REACTION_TIMEOUT}s，逾時＝拒絕）"
+    )
+    await msg.add_reaction("✅")
+    await msg.add_reaction("❌")
+    fut: asyncio.Future = asyncio.get_event_loop().create_future()
+    pending_actions[msg.id] = fut
+    try:
+        decision = await asyncio.wait_for(fut, timeout=PLAN_REACTION_TIMEOUT)
+    except asyncio.TimeoutError:
+        pending_actions.pop(msg.id, None)
+        await channel.send("⏱️ 逐指令核可逾時 → 拒絕")
+        return False
+    return decision == "confirm"
+
+
+async def _handle_approval_request(reader: asyncio.StreamReader,
+                                   writer: asyncio.StreamWriter) -> None:
+    """Unix-socket handler: a spawned mcp_approver.py asks us to approve one command.
+    Any error → deny (fail-closed)."""
+    allowed = False
+    try:
+        line = await asyncio.wait_for(reader.readline(), timeout=10)
+        req = json.loads(line.decode("utf-8", "replace"))
+        allowed = await request_discord_approval(
+            req.get("command", ""), req.get("tool_name", "Bash"))
+    except Exception as e:
+        log.warning("approval request failed (%s) — denying", e)
+        allowed = False
+    try:
+        writer.write((json.dumps({"allowed": allowed}) + "\n").encode())
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        writer.close()
+
+
+async def start_approval_server() -> None:
+    """Bind the approval unix socket (M4). The per-call mcp_approver.py connects here to
+    escalate non-allow-listed commands. Also (re)writes the --mcp-config the chokepoint
+    points claude at, so the command/args match this interpreter + script."""
+    cfg = {"mcpServers": {"approver": {
+        "command": sys.executable,
+        "args": [APPROVER_SCRIPT],
+        "env": {"APPROVER_SOCKET": APPROVER_SOCKET_PATH,
+                "APPROVER_ALLOWLIST": APPROVER_ALLOWLIST_PATH,
+                # nest the timeouts (see approve_call_timeout): socket wait > human window
+                "APPROVER_SOCKET_TIMEOUT": str(approver_socket_timeout())},
+    }}}
+    Path(APPROVER_MCP_CONFIG_PATH).write_text(json.dumps(cfg))
+    try:
+        os.unlink(APPROVER_SOCKET_PATH)
+    except FileNotFoundError:
+        pass
+    await asyncio.start_unix_server(_handle_approval_request, path=APPROVER_SOCKET_PATH)
+    log.info("approver tier ON: approval socket=%s mcp-config=%s",
+             APPROVER_SOCKET_PATH, APPROVER_MCP_CONFIG_PATH)
 
 
 # ── Utility ─────────────────────────────────────────────────────────────
@@ -869,7 +1180,7 @@ def extract_yolo_flag(content: str) -> tuple[str, bool]:
 
 # ── Command handlers ────────────────────────────────────────────────────
 HELP_TEXT = """**Bridge 指令參考**
-`!mode plan|edit|bypass` — 設 channel 預設模式（bypass 需 whitelist）
+`!mode plan|edit|bypass|approve` — 設 channel 預設模式（bypass/approve 需 whitelist + opt-in tier）
 `!once <mode>` — 單一訊息使用該模式（末尾加，不獨佔一行）
 `!yolo` — bypass 跳過 plan-then-execute（單訊息）
 `!discuss <topic>` — A↔B 強制輪流辯論
@@ -880,8 +1191,10 @@ HELP_TEXT = """**Bridge 指令參考**
 `!help` — 顯示這份說明
 
 **模式說明**
-`plan` 只讀規劃；`edit` 可寫檔但 bash 仍要過 bypass；`bypass` 全自動，預設會 plan-then-execute 等你 ✅
-要實際改專案 code：先 `!cd <專案>` 再 `!mode edit`
+`plan` 只讀規劃；`edit` 可寫檔/執行（受 settings.json deny 規則約束）。
+`approve` 逐指令核可：非白名單指令會丟 Discord 等你 ✅ 才跑（需 `ENABLE_APPROVER_TIER`）。
+`bypass` 全自動 plan-then-execute 等你 ✅（需 `ENABLE_BYPASS_TIER`，預設關閉）。
+要實際改專案 code：先 `!cd <專案>` 再 `!mode edit`（或 `approve` 走逐指令核可）
 """
 
 
@@ -921,12 +1234,45 @@ async def cmd_cd(channel, args: str) -> str:
     return f"📂 cwd → `{resolved}`（此 channel 後續 @ 都在這裡工作）{extra}"
 
 
+def bypass_allowed(author_id: int) -> bool:
+    """Full bypass is reachable only when the opt-in tier is enabled AND the user is
+    whitelisted (OV4 / 3.2). Default-closed: tier off → never reachable, by anyone."""
+    return BYPASS_TIER_ENABLED and author_id in ALLOWED_USER_IDS
+
+
+def approve_allowed(author_id: int) -> bool:
+    """The M4 per-command approve tier is reachable only when ENABLE_APPROVER_TIER is on
+    AND the user is whitelisted. Default-closed, same shape as bypass_allowed."""
+    return APPROVER_TIER_ENABLED and author_id in ALLOWED_USER_IDS
+
+
+def _tier_allowed(mode: str, author_id: int) -> bool:
+    """Whether an opt-in execution tier is currently reachable for this user. plan/edit
+    are always permitted here (edit's whitelist is enforced upstream); bypass/approve are
+    the default-closed opt-in tiers."""
+    if mode == "bypass":
+        return bypass_allowed(author_id)
+    if mode == "approve":
+        return approve_allowed(author_id)
+    return True
+
+
 async def cmd_mode(channel, args: str, author_id: int) -> str:
     target = args.strip().lower()
     if target not in VALID_MODES:
-        return f"❓ 用法：`!mode plan|edit|bypass`（目前 valid: {sorted(VALID_MODES)}）"
-    if target == "bypass" and author_id not in ALLOWED_USER_IDS:
-        return "🛡 `bypass` 需要 whitelist 權限"
+        return f"❓ 用法：`!mode plan|edit|bypass|approve`（目前 valid: {sorted(VALID_MODES)}）"
+    if target == "bypass":
+        if not BYPASS_TIER_ENABLED:
+            return ("🛡 `bypass` tier 未啟用（預設關閉）。需操作者設 `ENABLE_BYPASS_TIER=1` "
+                    "才能開啟；在那之前請用 `edit`（可寫檔/執行，受 deny 規則約束）。")
+        if author_id not in ALLOWED_USER_IDS:
+            return "🛡 `bypass` 需要 whitelist 權限"
+    if target == "approve":
+        if not APPROVER_TIER_ENABLED:
+            return ("🛡 `approve` tier 未啟用（預設關閉）。需操作者設 `ENABLE_APPROVER_TIER=1` "
+                    "才能開啟——每條非白名單指令會丟 Discord 等你 ✅ 才執行。")
+        if author_id not in ALLOWED_USER_IDS:
+            return "🛡 `approve` 需要 whitelist 權限"
     state = load_channel_state(channel.id)
     state["mode"] = target
     save_channel_state(channel.id, state)
@@ -1099,9 +1445,17 @@ def make_client(bot_name: str) -> discord.Client:
         else:
             effective_mode = load_channel_state(message.channel.id).get("mode", DEFAULT_CHANNEL_MODE)
 
-        if effective_mode == "bypass" and once_mode == "bypass" and message.author.id not in ALLOWED_USER_IDS:
-            await message.channel.send("🛡 `!once bypass` 需要 whitelist")
-            return
+        # Default-closed opt-in tiers (OV4 / 3.2 / 3.4): any path to bypass or the M4
+        # approve tier — a !once override OR a channel mode stored while the tier was once
+        # enabled — is downgraded to the safe default unless that tier is enabled AND the
+        # requester is whitelisted. The opt-in tiers are structurally unreachable otherwise.
+        if effective_mode in ("bypass", "approve") and not _tier_allowed(effective_mode, message.author.id):
+            if once_mode in ("bypass", "approve"):
+                await message.channel.send(
+                    f"🛡 `!once {once_mode}` 不可用（該 tier 未啟用或你不在 whitelist）。"
+                    "已改用安全的 `plan` 模式。"
+                )
+            effective_mode = DEFAULT_CHANNEL_MODE
 
         # Inject recent channel context so the bot sees cross-bot exchanges
         # and the user's original question — not just this single message.
@@ -1122,20 +1476,33 @@ def make_client(bot_name: str) -> discord.Client:
         # Snapshot cwd at call start (mid-call !cd changes don't affect this turn)
         cwd = get_channel_cwd(message.channel.id)
 
-        # bypass mode → plan-then-execute (unless !yolo)
-        if effective_mode == "bypass":
+        # bypass mode → plan-then-execute (unless !yolo). A bot-origin mention is the
+        # conversation layer and must never drive execution: it is already downgraded
+        # off bypass above (bots are never in ALLOWED_USER_IDS, so bypass_allowed is
+        # False), but we also gate explicitly here so the structural guarantee does not
+        # rely on that whitelist invariant alone (defense-in-depth, D3).
+        if effective_mode == "bypass" and not is_bot_msg:
             await run_plan_then_execute(message.channel, bot_name, prompt, skip_plan=yolo, cwd=cwd)
             # token-flush AFTER the whole flow (never mid plan→execute, which resumes)
             await maybe_token_flush(message.channel, bot_name, cwd)
             return
 
-        # Standard call
+        # Standard call. Layer split (D3): a bot-origin mention is the conversation
+        # layer → always converse() (plan, cannot escalate), regardless of channel
+        # mode. Only a human-driven edit-tier request reaches execute(), and only
+        # after the whitelist check above (non-whitelisted humans already returned).
         async with bot_locks[bot_name]:
             async with message.channel.typing():
-                reply, _ok = await call_claude(
-                    bot_name, prompt, mode=effective_mode,
-                    prepend_summary_from_channel=message.channel.id, cwd=cwd,
-                )
+                if exec_layer_for(is_bot_msg, effective_mode) == "execute":
+                    reply, _ok = await execute(
+                        bot_name, prompt, mode=effective_mode,
+                        prepend_summary_from_channel=message.channel.id, cwd=cwd,
+                    )
+                else:
+                    reply, _ok = await converse(
+                        bot_name, prompt,
+                        prepend_summary_from_channel=message.channel.id, cwd=cwd,
+                    )
         record_bot_reply(message.channel.id, bot_name, reply, cwd=cwd)
         cwd_tag = "" if cwd == DEFAULT_CWD else f"[{Path(cwd).name}] "
         prefix = ""
@@ -1199,10 +1566,38 @@ STARTUP_ANNOUNCEMENT = """🚀 **Bridge v3 上線**
 async def main():
     global clients
     load_config()  # read env into globals + ensure dirs + fail-closed validation
+    # OV1 — prove the --settings deny family is actually in force before serving.
+    # claude silently ignores a settings file that fails validation, so a startup
+    # canary is the only way to know deny/sandbox didn't evaporate. Fail closed.
+    skip_canary = os.environ.get("BRIDGE_SKIP_CANARY", "").strip().lower() in ("1", "true", "yes", "on")
+    # The skip is offline-dev only. Refuse it when the high-risk execution tier is on:
+    # serving bypass with the deny family unverified is the exact thing OV1 prevents.
+    if skip_canary and BYPASS_TIER_ENABLED:
+        raise SystemExit(
+            "BRIDGE_SKIP_CANARY and ENABLE_BYPASS_TIER are both set — refusing to start. "
+            "The canary is the only proof the deny family loaded; skipping it while the "
+            "full-bypass tier is enabled would serve execution with unverified deny rules."
+        )
+    if skip_canary:
+        log.warning("BRIDGE_SKIP_CANARY set — starting WITHOUT proving the deny family "
+                    "loaded. Offline-dev only; never use this in a real deployment.")
+    if not skip_canary:
+        if not await run_settings_canary():
+            raise SystemExit(
+                "settings canary failed — the --settings permissions.deny family is "
+                "not in force (file unloadable / schema drift / claude unavailable). "
+                "Refusing to start so the bot never runs with silently-dropped deny "
+                "rules. Set BRIDGE_SKIP_CANARY=1 only for offline dev."
+            )
+        log.info("settings canary passed: --settings deny family is in force")
     for name in BOTS:
         clients[name] = make_client(name)
-    log.info("starting bridge v3: channel=%d allowed=%s max_turns=%d auto_flush=%d",
-             CHANNEL_ID, sorted(ALLOWED_USER_IDS), MAX_BOT_TURNS, AUTO_FLUSH_THRESHOLD)
+    if APPROVER_TIER_ENABLED:
+        await start_approval_server()  # M4 per-command approval socket
+    log.info("starting bridge v3: channel=%d allowed=%s max_turns=%d auto_flush=%d "
+             "bypass_tier=%s approver_tier=%s",
+             CHANNEL_ID, sorted(ALLOWED_USER_IDS), MAX_BOT_TURNS, AUTO_FLUSH_THRESHOLD,
+             BYPASS_TIER_ENABLED, APPROVER_TIER_ENABLED)
     await asyncio.gather(*(clients[n].start(BOTS[n]["token"]) for n in BOTS))
 
 

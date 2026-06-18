@@ -18,10 +18,12 @@ before you deploy, and treat the defaults as the floor, not the ceiling.
 When the container is running, an `@`-mention in the configured channel turns
 into a `claude -p` subprocess on your host, with:
 
-- **Your Claude Code credentials** (`~/.claude`, `~/.claude-b`) mounted in.
+- **Your Claude Code OAuth credentials**, single-file bind-mounted into a
+  dedicated minimal config dir per bot (`~/.claude-bot-{a,b}`) — see §2/§6.
 - **The project directories you bind-mount** — read/write.
 - **A permission mode** (`plan` / `edit` / `bypass`) that decides how much that
-  subprocess can do without asking.
+  subprocess can do without asking. `plan` is the default; **`bypass` is an
+  opt-in tier that is off unless you set `ENABLE_BYPASS_TIER`** (see §3/§4).
 
 Everything below is about bounding *who* can trigger that and *what* it can reach.
 
@@ -30,26 +32,44 @@ Everything below is about bounding *who* can trigger that and *what* it can reac
 ## 2. Isolation boundary (what the bots CANNOT see)
 
 The container mounts **only** the paths listed in `docker-compose.yml` — the
-config dirs plus the specific project directories you choose. Everything else in
-`$HOME` (`.ssh`, `.gnupg`, `Documents`, unrelated repos, …) **does not exist
-inside the container**. This is mount-level isolation: even `bypass` mode cannot
-reach a path that was never mounted.
+dedicated bot config dirs plus the specific project directories you choose.
+Everything else in `$HOME` (`.ssh`, `.gnupg`, `Documents`, unrelated repos, …)
+**does not exist inside the container**. This is mount-level isolation: even
+`bypass` mode cannot reach a path that was never mounted.
 
-- `~/.claude-shared/memory/` is mounted **read-only** — the bots can read shared
-  long-term profiles but cannot corrupt them (and cannot race the host).
+- **Bots run under dedicated minimal config dirs** (`~/.claude-bot-{a,b}`), NOT
+  your own `~/.claude` / `~/.claude-b`. Those account dirs are **no longer
+  mounted at all**; only each account's single `.credentials.json` is bind-mounted
+  in (no re-login, same billing). The minimal `CLAUDE.md` carries no operator PII
+  and does **not** `@import` any shared `CLAUDE.md`.
+- **The shared dir is mounted by explicit allow-list, not wholesale.** Only the
+  bot's own state (`discord-state/`, `discord-summaries/`, `discord-project-notes/`),
+  the `plans/` landing zone, and the single thin-index file
+  `memory/project_plan.md` are mounted. The `~/.claude-shared/memory/` directory
+  (the operator PII / infra trove: `infrastructure.md`, `user_profile.md`,
+  `agent_*.md`, …) and the shared `CLAUDE.md` are **not** mounted — a new file
+  added to `memory/` does not silently become reachable.
 - `.env` (tokens) is git-ignored. The two Discord bot tokens are also **stripped
   from the `claude` subprocess environment**, so a `bypass`-mode `printenv`
   cannot surface them. This is not a general env protection — see §6.
 
-**Two boundary caveats — do not skip:**
+**Boundary caveats — do not skip:**
 
+- **There is no OS sandbox in the container.** Claude Code's bubblewrap sandbox
+  cannot start here (bubblewrap is not installed and Docker's default
+  seccomp/caps block unprivileged user namespaces for the run-as user), so
+  `settings.json` sets `sandbox.enabled: false` explicitly rather than degrade
+  silently. Containment therefore rests on the tool-layer deny family (§6),
+  plan-as-default, the whitelist, and mount isolation — **not** an OS jail. Restoring
+  it requires runtime changes (see `openspec/.../preflight-findings.md`).
 - **This isolation only holds when you deploy via the bundled container.** The
-  config paths are hard-coded to `/home/user/...`, but if a fork bare-runs
-  `bot.py` on the host, the mount boundary disappears and `bypass` reaches your
-  entire `$HOME`. The "`claude -p` subprocess on your host" in §1 is *inside the
-  container* in the supported deployment.
-- **Mount isolation is not network isolation.** `bypass` can `curl`/POST mounted
-  data to anywhere; restricting the filesystem does not restrict egress.
+  config paths are hard-coded to `/home/user/...`; if a fork bare-runs `bot.py`
+  on the host, the mount boundary disappears and `bypass` reaches your entire
+  `$HOME`.
+- **Mount isolation is not network isolation.** `bypass`/`edit` can `curl`/POST
+  mounted data to anywhere; restricting the filesystem does not restrict egress
+  (the deny family blocks `curl`/`wget`/`WebFetch` by name, which a determined
+  shell can still evade — see §6).
 
 **Corollary:** the security of a fork depends on the mount list. Mount only the
 projects you are willing to let channel users read and modify.
@@ -66,12 +86,16 @@ the bots, so this fails closed by design.
 
 Set it to your own Discord user id(s). Treat adding an id as "granting a shell."
 
-### `bypass` is whitelist-only
-`bypass` (and `!once bypass`, `!yolo`) can only be enabled by whitelisted users.
-A non-whitelisted channel member cannot switch the channel into `bypass` or
-trigger an execution. This applies to **third-party bots/webhooks too**: only
-the bridge's own A/B bots get the human-free debate path; any other bot's
-mention falls through to the whitelist check and is ignored.
+### `bypass` is an opt-in tier, default-closed
+Full `bypass` is **off unless the operator sets `ENABLE_BYPASS_TIER`**. While the
+tier is disabled, `!mode bypass` / `!once bypass` / `!yolo` are refused and any
+stored bypass mode downgrades to the safe `plan` default — bypass is structurally
+unreachable, by anyone. While the tier is *enabled*, it is additionally
+**whitelist-only** (`bypass_allowed` = tier-on AND whitelisted), and the
+plan-then-execute ✅ flow remains its gate until the per-command approver (M4)
+replaces it. This whitelist gate applies to **third-party bots/webhooks too**:
+only the bridge's own A/B bots get the human-free debate path (always in `plan`);
+any other bot's mention falls through to the whitelist check and is ignored.
 
 ### Use a private channel
 The bot listens on a single `DISCORD_CHANNEL_ID`. Put it in a channel only
@@ -84,20 +108,30 @@ membership is defense-in-depth.
 
 | Mode | Flag | Can write files? | Can run commands? | Can **read** files? |
 |------|------|:---:|:---:|:---:|
-| `plan` (default) | `--permission-mode plan` | ❌ | ❌ | ✅ |
-| `edit` | `acceptEdits` | ✅ | ❌ | ✅ |
-| `bypass` | `bypassPermissions` | ✅ | ✅ (arbitrary) | ✅ |
+| `plan` (default) | `--permission-mode plan` | ❌ | read-only only | ✅ |
+| `edit` | `acceptEdits` | ✅ | ✅ (deny family blocked) | ✅ |
+| `approve` (opt-in, off by default) | `default` + MCP approver | ✅ | allow-list auto, rest need a human ✅ | ✅ |
+| `bypass` (opt-in, off by default) | `bypassPermissions` | ✅ | ✅ (deny family blocked) | ✅ |
 
-**The most important row is the last column.** The `Read` tool is available in
-*every* mode, including `plan`. A reply is text the model produces — so any mode
-can, in principle, read a file the process can access and quote it back into
-Discord. Writing and command execution are what `edit`/`bypass` add.
+**Two things to internalize about this version of Claude Code (empirically
+verified — see `openspec/.../preflight-findings.md`):**
 
-`bypass` means **arbitrary command execution as your host user, inside the
-mounted directories.** It can `curl` data out, delete files in mounted projects,
-or read anything reachable. The `plan-then-execute` flow (bot posts a plan,
-waits for your ✅, then runs) is a speed-bump for honest mistakes — it is **not**
-a security boundary against a malicious request.
+1. **In headless `claude -p`, `--allowedTools` does NOT restrict.** A non-listed
+   command runs anyway. So there is **no allow-list containment** here; `edit`
+   and `bypass` both run commands freely *except* what the `permissions.deny`
+   family (§6) blocks. A true per-command allow-list arrives with the M4 approver.
+   `edit` and `bypass` therefore differ mostly in posture/intent, not in a hard
+   capability boundary — both are execution and both are gated upstream.
+2. **The `Read` tool is available in every mode, including `plan`** — but the deny
+   family (§6) blocks the credential paths in all modes. `plan` cannot write or run
+   state-changing commands; it is the safe default.
+
+Every call is launched with `--settings settings.json` carrying the deny family,
+and a **startup canary** proves that file actually loaded (claude silently ignores
+a settings file that fails validation) — if the deny does not fire, the bot
+**fails closed and refuses to start**. The `plan-then-execute` ✅ flow is a
+speed-bump for honest mistakes, **not** a security boundary against a malicious
+request.
 
 ---
 
@@ -122,30 +156,36 @@ the context prefix.
 
 ## 6. Credential-read protection — and its limits
 
-Every `claude -p` call is launched with a deny rule on the `Read` tool scoped to
-the mounted config dirs:
+Every `claude -p` call is launched with `--settings settings.json` (repo-tracked,
+version-pinned, reviewable). Its `permissions.deny` family is the **single source**
+of credential/env/network denial — there is no longer a `--disallowedTools` flag in
+`bot.py`. It denies:
 
+```jsonc
+"Read(//home/user/.claude/**)", "Read(//home/user/.claude-b/**)",
+"Read(//home/user/.claude-bot-a/**)", "Read(//home/user/.claude-bot-b/**)",
+"Read(//home/user/**/.credentials.json)",      // credential reads, all modes
+"Bash(env)", "Bash(env:*)", "Bash(printenv)", "Bash(printenv:*)",  // env dump
+"Bash(curl:*)", "Bash(wget:*)", "WebFetch"     // arbitrary network fetch
 ```
---disallowedTools "Read(//home/user/.claude/**)" "Read(//home/user/.claude-b/**)" "Read(//home/user/.claude-shared/**)"
-```
 
-This hard-blocks the `Read` tool from `.credentials.json` and settings **in all
-modes** (verified at the permission layer: the tool returns *"File is in a
-directory that is denied by your permission settings."*). It stops the casual
-and injection-driven "read the credential file and paste it" path even in
-`plan` mode.
+Deny rules **win in every mode, including bypass** (deny always overrides), and
+were verified live: a `Bash` deny shows up in `permission_denials`; a `Read` deny
+returns *"File is in a directory that is denied by your permission settings."* A
+**startup canary** (attempt a denied command, confirm it is refused) proves the
+file actually loaded — because claude *silently ignores* a settings file that
+fails validation. If the canary does not trip the deny, the bot fails closed.
 
-**Limits — read these:**
+**Limits — read these (the honest residual after the preflight gates):**
 
-- It only constrains the `Read` *tool*. In `bypass` mode the model can still
-  shell out (`cat`, `grep`, `base64`) to read the same files. Pattern-based deny
-  is defense-in-depth, **not** a containment boundary against a `bypass` user.
-  The real control for that is §3 — keep `bypass` to people you fully trust.
-- The operator's `CLAUDE.md` (and anything it `@import`s) is loaded into the
-  model as configuration, **not** via the `Read` tool, so this deny does not
-  cover it. If your `CLAUDE.md` contains personal data (emails, infra topology),
-  a whitelisted user can elicit it. Consider pointing the bots at a dedicated
-  `CLAUDE_CONFIG_DIR` with a minimal `CLAUDE.md` for a multi-operator fork.
+- **Deny is by command/tool name, and there is no OS sandbox** (§2). A determined
+  shell in `edit`/`bypass` can still reach credentials/env/network by evading the
+  name match — `/usr/bin/cu*rl`, `python -c`, `cat /proc/self/environ`, reading a
+  cred file by an unlisted path. Name-based deny is defense-in-depth, **not** a
+  containment boundary against a hostile execution-tier user. The real control is
+  §3 — keep `edit`/`bypass` to people you fully trust — plus the dedicated minimal
+  config dir (§2) which keeps the operator's *account* dir and PII out of reach.
+  The per-command human approver (M4) is the planned hard boundary.
 - The deny covers files, not the process environment. The two Discord tokens are
   stripped from the subprocess env (§2), but any *other* environment variable
   present is still visible to a `bypass`-mode `printenv`. Keep host secrets out
@@ -164,10 +204,28 @@ and injection-driven "read the credential file and paste it" path even in
 
 ## 7. Residual risks (accepted for an MVP)
 
-- **`bypass` is unbounded by design.** It is full trust of the whitelisted user.
-  There is no per-command allow-list.
-- **`CLAUDE.md` content reaches replies** (see §6) — your global config is in
-  every call's context.
+- **`edit`/`bypass` have no per-command allow-list.** Gate 0.1 showed `--allowedTools`
+  does not restrict in headless `claude -p`, so in these tiers execution is bounded only
+  by the deny family + trust. The **`approve` tier** is the restrictive boundary: it runs
+  in `default` permission mode behind an MCP approver that auto-allows an operator
+  allow-list (`approver-allowlist.json`) and routes everything else to a human ✅ on
+  Discord (timeout/error = deny, fail-closed). Note claude auto-classifies some read-only
+  commands as "safe" and runs them without consulting the approver; the deny family is the
+  backstop for those. Prefer `approve` over `bypass` for untrusted-ish work.
+- **`approve` tier — write-then-run residual.** The approver auto-allows `Edit`/`Write`
+  (the bot must edit project files) and auto-allows allow-listed runners like `pytest` /
+  `npm test` / `npm run build`. With no OS sandbox and writable project mounts, those are
+  not independently safe: an auto-allowed write can drop a malicious `conftest.py` /
+  `package.json` script that a subsequently auto-allowed `pytest` / `npm` run then
+  executes — without a fresh approval. Treat the allow-list as "convenience for trusted
+  work," not a containment boundary against an adversarial agent; for genuinely untrusted
+  input, tighten the allow-list (drop the build/test runners) or gate `Write`/`Edit` to
+  escalate too.
+- **No OS sandbox (accepted).** bubblewrap cannot start in the container (§2), so
+  the credential file, env, and network are protected only at the tool layer
+  (name-based deny), which a determined execution-tier shell can evade. Keep
+  `edit`/`bypass` to fully-trusted users; restoring the OS layer needs runtime
+  changes (see `preflight-findings.md`).
 - **OAuth refresh race:** the container and an interactive host session may race
   on token refresh. Rare; accepted.
 - **In-memory state is lost on restart:** pending plan confirmations, the message
@@ -191,11 +249,17 @@ and injection-driven "read the credential file and paste it" path even in
 - [ ] Set `ALLOWED_USER_IDS` to your own id(s) only.
 - [ ] Mount **only** the projects you accept the bots reading/modifying.
 - [ ] Keep the channel private; restrict who can post.
-- [ ] Leave the default mode at `plan`; switch to `edit`/`bypass` per task, not
-      as a channel default.
-- [ ] Only grant `bypass` to people you'd give a shell on the host.
-- [ ] If multiple operators, give the bots a minimal dedicated `CLAUDE.md`
-      rather than your personal global one.
+- [ ] Leave the default mode at `plan`; switch to `edit` per task, not as a
+      channel default.
+- [ ] Leave `ENABLE_BYPASS_TIER` **unset** unless you truly need full bypass; it
+      is off (structurally unreachable) by default. Only enable it — and only
+      grant it to people you'd give a shell on the host — for trusted, supervised
+      sessions.
+- [ ] Keep the bots on their dedicated `~/.claude-bot-{a,b}` dirs with a minimal
+      `CLAUDE.md` (no PII, no `@import` of a shared `CLAUDE.md`); never point them
+      at your personal account dir.
+- [ ] Keep `memory/project_plan.md` a thin summary+links index — it is the one
+      memory file mounted into the container; put no secrets/infra in it.
 - [ ] Deploy via the bundled container — do **not** bare-run `bot.py` on a host
       you don't fully control (you'd lose the mount isolation in §2).
 - [ ] Keep no unrelated secrets in the bridge's environment (a `bypass` user can
