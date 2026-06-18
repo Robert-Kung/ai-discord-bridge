@@ -89,32 +89,47 @@ def test_routing_human_edit_executes_others_converse():
 
 
 def test_unwhitelisted_user_gate_precedes_routing():
-    # on_message returns for a non-whitelisted human BEFORE routing, so the only way
-    # to reach execute() is whitelist-passed + edit. Assert the guard exists in source.
-    assert "if message.author.id not in ALLOWED_USER_IDS:" in SRC
+    # The whitelist `return` for a non-whitelisted human must come BEFORE the
+    # routing/execute call site — presence alone is not enough (a guard placed after
+    # execute() would still "exist" but protect nothing). Assert relative position.
+    guard = SRC.index("if message.author.id not in ALLOWED_USER_IDS:")
+    # both execution dispatch points in on_message — the standard-call routing and the
+    # bypass dispatch — must come AFTER the whitelist return (each appears once).
+    routing = SRC.index("exec_layer_for(is_bot_msg, effective_mode)")
+    bypass_dispatch = SRC.index("run_plan_then_execute(message.channel")
+    assert guard < routing, "auth guard must precede standard-call routing"
+    assert guard < bypass_dispatch, "auth guard must precede bypass dispatch"
 
 
 # ── 4.7 — conversation output persisted by the harness, not the subprocess ──
 def test_harness_persistence_is_plain_write(tmp_path, monkeypatch):
-    monkeypatch.setattr(bot, "PLANS_DIR", tmp_path / "plans")
-    monkeypatch.setattr(bot, "PROJECT_PLAN_INDEX", tmp_path / "memory" / "project_plan.md")
-    # full plan → plans/ (mode-independent harness write)
-    p = bot.save_plan("my-feature", "# Plan\nbody")
-    assert p.exists() and p.read_text() == "# Plan\nbody"
+    # The live harness writers are save_summary / save_project_notes — plain Python
+    # writes, independent of any subprocess permission mode (the conversation layer
+    # runs plan and cannot write files via the agent). Exercise the project-notes path.
+    monkeypatch.setattr(bot, "PROJECT_NOTES_DIR", tmp_path / "notes")
+    p = bot.save_project_notes("/home/user/proj", "# Notes\nbody")
+    assert p.exists() and p.read_text() == "# Notes\nbody"
 
 
-def test_plan_index_append_rotate_snapshots_prior(tmp_path, monkeypatch):
-    monkeypatch.setattr(bot, "PLANS_DIR", tmp_path / "plans")
-    idx = tmp_path / "memory" / "project_plan.md"
-    idx.parent.mkdir(parents=True)
-    idx.write_text("# Index\n- old entry\n")
-    monkeypatch.setattr(bot, "PROJECT_PLAN_INDEX", idx)
-    bot.append_plan_index("- new entry")
-    body = idx.read_text()
-    assert "old entry" in body and "new entry" in body  # append, not overwrite
-    # prior version snapshotted (recoverable) — never a free-form clobber
-    snaps = list((tmp_path / "plans").glob("_project_plan.*.bak.md"))
-    assert snaps and "old entry" in snaps[0].read_text()
+def test_project_notes_write_rotates_prior_snapshot(tmp_path, monkeypatch):
+    # No free-form clobber: a second write snapshots the prior notes.md, so accumulated
+    # state can never be silently overwritten by a flush.
+    monkeypatch.setattr(bot, "PROJECT_NOTES_DIR", tmp_path / "notes")
+    bot.save_project_notes("/home/user/proj", "old body")
+    bot.save_project_notes("/home/user/proj", "new body")
+    d = bot.project_notes_dir("/home/user/proj")
+    assert (d / "notes.md").read_text() == "new body"
+    snaps = [p for p in d.glob("2*.md")]
+    assert snaps and any("old body" in s.read_text() for s in snaps)
+
+
+def test_project_plan_index_is_read_only_to_container():
+    # The clobber guarantee for the operator's index is the :ro mount, not a helper:
+    # the execution path can read project_plan.md as context but cannot overwrite it.
+    import re
+    compose = (REPO / "docker-compose.example.yml").read_text()
+    m = [ln for ln in compose.splitlines() if "memory/project_plan.md" in ln]
+    assert m and all(ln.rstrip().endswith(":ro") for ln in m), "project_plan.md must be mounted :ro"
 
 
 # ── 4.8 — inter-agent discussion uses Discord @-mention, never `sibling` ────

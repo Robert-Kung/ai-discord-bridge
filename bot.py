@@ -378,66 +378,18 @@ def save_project_notes(cwd: str, content: str) -> Path:
     return notes
 
 
-# ── Plan landing zone + thin index (D6 — harness persistence, mode-independent) ──
-# Conversation-layer plan/decision output is persisted by THIS process (the harness),
-# never by a plan-mode agent subprocess (plan mode cannot write files; only the
-# narrow read/plan entry is used there). Full plans land in the shared plans/ dir
-# (mounted, operator CLI reads it); the project_plan.md index is updated only via the
-# append/rotate helper below, which snapshots the prior version so an index update can
-# never silently clobber it.
-PLANS_DIR = SHARED_DIR / "plans"
-PROJECT_PLAN_INDEX = SHARED_DIR / "memory" / "project_plan.md"
-
-
-def save_plan(slug: str, content: str) -> Path:
-    """Persist a full plan document the bridge produced into the shared plans/ zone.
-    Mode-independent (a plain harness write), so it does not depend on the subprocess
-    permission mode. Rotates prior versions of the same slug to timestamped snapshots
-    (keep 3)."""
-    PLANS_DIR.mkdir(parents=True, exist_ok=True)
-    safe = _cwd_slug(slug) or "plan"
-    target = PLANS_DIR / f"{safe}.md"
-    if target.exists():
-        ts = time.strftime("%Y%m%d-%H%M%S")
-        snap = PLANS_DIR / f"{safe}.{ts}.md"
-        n = 1
-        while snap.exists():
-            snap = PLANS_DIR / f"{safe}.{ts}-{n}.md"
-            n += 1
-        target.replace(snap)
-        snaps = sorted(PLANS_DIR.glob(f"{safe}.2*.md"),
-                       key=lambda p: p.stat().st_mtime, reverse=True)
-        for old in snaps[3:]:
-            old.unlink(missing_ok=True)
-    target.write_text(content)
-    return target
-
-
-def append_plan_index(entry: str) -> Path:
-    """Append a one-line summary entry to the thin project_plan.md index via
-    snapshot-then-append (NEVER a free-form overwrite): the prior index is snapshotted
-    first so a buggy/abusive update can be recovered and can't clobber the operator's
-    index. Snapshots go to plans/ (writable + mounted) because the memory/ dir itself
-    is intentionally NOT mounted — only the single project_plan.md file is."""
-    idx = PROJECT_PLAN_INDEX
-    prior = idx.read_text() if idx.exists() else ""
-    if prior:
-        PLANS_DIR.mkdir(parents=True, exist_ok=True)
-        ts = time.strftime("%Y%m%d-%H%M%S")
-        snap = PLANS_DIR / f"_project_plan.{ts}.bak.md"
-        n = 1
-        while snap.exists():
-            snap = PLANS_DIR / f"_project_plan.{ts}-{n}.bak.md"
-            n += 1
-        snap.write_text(prior)
-        snaps = sorted(PLANS_DIR.glob("_project_plan.*.bak.md"),
-                       key=lambda p: p.stat().st_mtime, reverse=True)
-        for old in snaps[3:]:
-            old.unlink(missing_ok=True)
-    idx.parent.mkdir(parents=True, exist_ok=True)
-    new_body = (prior.rstrip() + "\n" + entry.strip() + "\n") if prior.strip() else entry.strip() + "\n"
-    idx.write_text(new_body)
-    return idx
+# ── Conversation-layer persistence (D6 — harness writes, mode-independent) ──────
+# Plan/decision output is persisted by THIS process (the harness) via save_summary /
+# save_project_notes (below), never by a plan-mode agent subprocess — plan mode cannot
+# write files, and the conversation layer only ever uses converse() (plan). Both
+# writers rotate the prior version to a timestamped snapshot, so a flush can never
+# silently clobber accumulated state (the "no free-form overwrite" guarantee).
+#
+# The thin project_plan.md index is mounted READ-ONLY into the container (see
+# docker-compose): the execution path can read it as context but structurally cannot
+# overwrite it — a stronger guarantee than any in-process helper. Updating that index
+# is an operator-side concern, not the bot's. A full plan document the agent itself
+# must author requires the edit tier; it is never produced from the default plan path.
 
 
 def build_combined_system_prompt(channel_id: int, cwd: str, bot_name: str) -> Path | None:
@@ -1365,8 +1317,12 @@ def make_client(bot_name: str) -> discord.Client:
         # Snapshot cwd at call start (mid-call !cd changes don't affect this turn)
         cwd = get_channel_cwd(message.channel.id)
 
-        # bypass mode → plan-then-execute (unless !yolo)
-        if effective_mode == "bypass":
+        # bypass mode → plan-then-execute (unless !yolo). A bot-origin mention is the
+        # conversation layer and must never drive execution: it is already downgraded
+        # off bypass above (bots are never in ALLOWED_USER_IDS, so bypass_allowed is
+        # False), but we also gate explicitly here so the structural guarantee does not
+        # rely on that whitelist invariant alone (defense-in-depth, D3).
+        if effective_mode == "bypass" and not is_bot_msg:
             await run_plan_then_execute(message.channel, bot_name, prompt, skip_plan=yolo, cwd=cwd)
             # token-flush AFTER the whole flow (never mid plan→execute, which resumes)
             await maybe_token_flush(message.channel, bot_name, cwd)
@@ -1454,7 +1410,19 @@ async def main():
     # OV1 — prove the --settings deny family is actually in force before serving.
     # claude silently ignores a settings file that fails validation, so a startup
     # canary is the only way to know deny/sandbox didn't evaporate. Fail closed.
-    if os.environ.get("BRIDGE_SKIP_CANARY", "").strip().lower() not in ("1", "true", "yes", "on"):
+    skip_canary = os.environ.get("BRIDGE_SKIP_CANARY", "").strip().lower() in ("1", "true", "yes", "on")
+    # The skip is offline-dev only. Refuse it when the high-risk execution tier is on:
+    # serving bypass with the deny family unverified is the exact thing OV1 prevents.
+    if skip_canary and BYPASS_TIER_ENABLED:
+        raise SystemExit(
+            "BRIDGE_SKIP_CANARY and ENABLE_BYPASS_TIER are both set — refusing to start. "
+            "The canary is the only proof the deny family loaded; skipping it while the "
+            "full-bypass tier is enabled would serve execution with unverified deny rules."
+        )
+    if skip_canary:
+        log.warning("BRIDGE_SKIP_CANARY set — starting WITHOUT proving the deny family "
+                    "loaded. Offline-dev only; never use this in a real deployment.")
+    if not skip_canary:
         if not await run_settings_canary():
             raise SystemExit(
                 "settings canary failed — the --settings permissions.deny family is "
