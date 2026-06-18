@@ -1,13 +1,17 @@
-## ADDED Requirements
+# execution-permissions
+
+## Purpose
+Define the permission model for the human-driven execution path — acceptEdits contained by an enforced deny family, an explicitly-disabled OS sandbox with documented residual, a default-closed full-bypass tier, and an optional per-command human-approval tier.
+
+## Requirements
 
 ### Requirement: Execution mode is acceptEdits contained by the deny family (NOT an allow-list)
+The execution path SHALL run with `--permission-mode acceptEdits` and SHALL NOT pass an `--allowedTools` execution list (it does not restrict). Containment of what executes SHALL come from the enforced `permissions.deny` family. Full `bypassPermissions` SHALL NOT be the default execution mode. A restrictive per-command allow-list SHALL be provided only by the optional approver tier (below).
+
 > Revised after preflight gate 0.1 (see `preflight-findings.md`): in headless `claude -p`
 > (claude 2.1.179) `--allowedTools` is additive, NOT restrictive — a non-listed command
 > runs anyway. A restrictive allow-list is therefore impossible at the flag layer here and
-> is deferred to the per-command approver tier. Containment of the execution path comes
-> from the `permissions.deny` family, not an allow-list.
-
-The execution path SHALL run with `--permission-mode acceptEdits` and SHALL NOT pass an `--allowedTools` execution list (it does not restrict). Containment of what executes SHALL come from the enforced `permissions.deny` family. Full `bypassPermissions` SHALL NOT be the default execution mode. A restrictive per-command allow-list SHALL be provided only by the optional approver tier (below).
+> is deferred to the per-command approver tier. Containment comes from `permissions.deny`.
 
 #### Scenario: Execution runs under acceptEdits without an allow-list flag
 - **WHEN** the human-driven execution path invokes the agent
@@ -37,12 +41,12 @@ A server-side `settings.json` SHALL be passed via `--settings` on every executio
 - **THEN** the deny rules still block credential reads, env dumps, and arbitrary network fetch
 
 ### Requirement: OS sandbox is explicitly disabled, residual documented (no silent degrade)
+The server-side `settings.json` SHALL set `sandbox.enabled: false` explicitly — there SHALL NOT be an ambiguous "enabled but silently absent" state. With no OS layer, the credential files, environment, and network SHALL be protected at the tool layer by the `permissions.deny` family, and the resulting residual risk (name-based deny is evadable by a determined shell) SHALL be documented in `SECURITY.md`.
+
 > Revised after preflight gate 0.2 (see `preflight-findings.md`): Claude Code's bubblewrap
 > sandbox cannot start in the container (bubblewrap absent + unprivileged user namespaces
 > blocked by Docker's default seccomp/caps), so enabling it with `failIfUnavailable: true`
 > would make the bot fail every call. Operator decision: accept "no OS layer."
-
-The server-side `settings.json` SHALL set `sandbox.enabled: false` explicitly — there SHALL NOT be an ambiguous "enabled but silently absent" state. With no OS layer, the credential files, environment, and network SHALL be protected at the tool layer by the `permissions.deny` family, and the resulting residual risk (name-based deny is evadable by a determined shell) SHALL be documented in `SECURITY.md`.
 
 #### Scenario: Sandbox is explicitly off, not silently degraded
 - **WHEN** `settings.json` is inspected
