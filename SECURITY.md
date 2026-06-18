@@ -110,6 +110,7 @@ membership is defense-in-depth.
 |------|------|:---:|:---:|:---:|
 | `plan` (default) | `--permission-mode plan` | ❌ | read-only only | ✅ |
 | `edit` | `acceptEdits` | ✅ | ✅ (deny family blocked) | ✅ |
+| `approve` (opt-in, off by default) | `default` + MCP approver | ✅ | allow-list auto, rest need a human ✅ | ✅ |
 | `bypass` (opt-in, off by default) | `bypassPermissions` | ✅ | ✅ (deny family blocked) | ✅ |
 
 **Two things to internalize about this version of Claude Code (empirically
@@ -203,10 +204,14 @@ fails validation. If the canary does not trip the deny, the bot fails closed.
 
 ## 7. Residual risks (accepted for an MVP)
 
-- **No per-command allow-list yet (deferred to M4).** Gate 0.1 showed
-  `--allowedTools` does not restrict in headless `claude -p`, so `edit`/`bypass`
-  execution is bounded only by the deny family + trust, not an allow-list. The M4
-  MCP approver (per-command human approval) is the planned restrictive boundary.
+- **`edit`/`bypass` have no per-command allow-list.** Gate 0.1 showed `--allowedTools`
+  does not restrict in headless `claude -p`, so in these tiers execution is bounded only
+  by the deny family + trust. The **`approve` tier** is the restrictive boundary: it runs
+  in `default` permission mode behind an MCP approver that auto-allows an operator
+  allow-list (`approver-allowlist.json`) and routes everything else to a human ✅ on
+  Discord (timeout/error = deny, fail-closed). Note claude auto-classifies some read-only
+  commands as "safe" and runs them without consulting the approver; the deny family is the
+  backstop for those. Prefer `approve` over `bypass` for untrusted-ish work.
 - **No OS sandbox (accepted).** bubblewrap cannot start in the container (§2), so
   the credential file, env, and network are protected only at the tool layer
   (name-based deny), which a determined execution-tier shell can evade. Keep
