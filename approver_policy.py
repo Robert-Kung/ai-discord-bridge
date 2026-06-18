@@ -25,6 +25,12 @@ DEFAULT_AUTO_ALLOW_TOOLS = {
 # (`pytest && curl evil` escalates). Split on the shell operators that chain commands.
 _SEGMENT_SPLIT = re.compile(r"&&|\|\||\||;|\n")
 
+# Constructs that smuggle a second command past the segment splitter (command/process
+# substitution, var expansion, redirects). The splitter is a plain regex and cannot see
+# inside these, so any segment containing one is never auto-allowed — it escalates to a
+# human, who sees the literal command. (`pytest "$(curl evil)"` → escalate, not allow.)
+_SUBSTITUTION_METACHARS = ("$(", "`", "${", ">", "<")
+
 
 def load_allowlist(path: str | Path) -> dict:
     """Load the allow-list JSON. Returns {auto_allow_tools:set, bash_prefixes:list}."""
@@ -38,6 +44,10 @@ def load_allowlist(path: str | Path) -> dict:
 def _segment_allowlisted(segment: str, prefixes: list[str]) -> bool:
     seg = segment.strip()
     if not seg:
+        return False
+    # a segment hiding a substitution/redirect is never auto-allowed (the splitter can't
+    # see the smuggled command) — fall through to human approval instead
+    if any(m in seg for m in _SUBSTITUTION_METACHARS):
         return False
     # match a prefix exactly, or as a whole leading token-run followed by a space/args
     return any(seg == p or seg.startswith(p + " ") for p in prefixes)

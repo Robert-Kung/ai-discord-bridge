@@ -177,6 +177,12 @@ bot 就 fail closed。
   （`approver-allowlist.json`），其餘丟 Discord 等人工 ✅（逾時/出錯＝拒絕，fail-closed）。
   注意 claude 會把部分唯讀指令自動歸類為「安全」直接跑、不問 approver；deny family 是
   那些的後盾。要做較不可信的工作，優先用 `approve` 而非 `bypass`。
+- **`approve` tier — write-then-run 殘留。** approver 自動放行 `Edit`/`Write`（bot 本來就要
+  改專案檔）也自動放行 `pytest`/`npm test`/`npm run build` 這些白名單 runner。在沒有 OS
+  sandbox + 專案目錄可寫的情況下，這些不是各自獨立安全的：自動放行的 write 可以丟一個惡意
+  `conftest.py`/`package.json` script，接著自動放行的 `pytest`/`npm` 就把它執行了——不會再
+  要一次核可。把白名單當「可信工作的便利」，不是對抗惡意 agent 的圍堵邊界；真要處理不可信
+  輸入，請收緊白名單（拿掉 build/test runner）或把 `Write`/`Edit` 也改成需核可。
 - **沒有 OS sandbox（接受）。** bubblewrap 在容器起不來（§2），所以憑證檔、env、網路
   只在工具層（名稱式 deny）受保護，堅決的執行層 shell 可繞過。把 `edit`/`bypass` 留給
   完全信任的人；要救回 OS 層需改 runtime（見 `preflight-findings.md`）。
