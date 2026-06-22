@@ -12,3 +12,5 @@ RELEASE_PLAN.md
 # Internal security/remediation planning — host infra topology, IPs, project
 # list, A↔B notes. Same reason as RELEASE_PLAN.md: never publish.
 docs/
+# Local Claude Code tooling (opsx slash-commands/skills) — not part of this project.
+.claude/
