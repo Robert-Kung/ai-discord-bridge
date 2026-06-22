@@ -48,6 +48,11 @@ CSWAP_USAGE_FILE = STATE_DIR / "cswap-usage.json"  # written by host cron, read 
 MAX_BOT_TURNS = int(os.environ.get("MAX_BOT_TURNS", "6"))
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "300"))
 AUTO_FLUSH_THRESHOLD = int(os.environ.get("AUTO_FLUSH_THRESHOLD", "20"))
+# Startup-canary retry backoff (s) for the "claude can't run / not logged in" case.
+# We wait-and-retry IN-PROCESS instead of letting a SystemExit hand docker a tight
+# crash-loop (the OAuth-expiry incident restarted the container 188 times).
+CANARY_RETRY_BASE = int(os.environ.get("CANARY_RETRY_BASE", "15"))
+CANARY_RETRY_MAX = int(os.environ.get("CANARY_RETRY_MAX", "300"))
 # token-based flush — TWO stages, tuned for the opus[1m] 1M context window:
 #  • FLUSH_TOKEN_THRESHOLD (400k): write a summary checkpoint, KEEP the session
 #    (continuity preserved; gives a crash-safe summary on disk early).
@@ -594,6 +599,35 @@ def canary_passed(result_json: dict) -> bool:
     return any(d.get("tool_name") == "Bash" for d in denials)
 
 
+# Canary outcomes. The critical distinction the original gate missed: "claude ran
+# but deny did NOT fire" (a settings misconfig — MUST never serve) is a totally
+# different failure from "claude couldn't run at all" (auth lapse / not-logged-in /
+# transient). The latter means NO execution happened, so there is no security risk
+# in waiting; crashing the container on it just produces a tight restart loop.
+CANARY_OK = "ok"                      # claude ran AND the denied action was denied
+CANARY_DENY_DROPPED = "deny_dropped"  # claude ran but deny did NOT fire → settings dropped
+CANARY_CANNOT_RUN = "cannot_run"      # claude errored / not logged in / unparseable
+
+
+def classify_canary(rc: "int | None", stdout: bytes) -> str:
+    """Pure decision: map a canary subprocess (rc, stdout) to a CANARY_* status.
+    Isolated from I/O so the three branches are unit-testable without a live claude.
+
+    A non-zero rc, an unparseable body, or an `is_error` result (e.g. the
+    "Not logged in" body claude emits with rc=1) all mean claude never reached the
+    tool-permission layer — the canary proves nothing, but nothing executed either,
+    so it is CANNOT_RUN (retryable), NOT a deny-dropped security failure."""
+    if rc is None or rc != 0:
+        return CANARY_CANNOT_RUN
+    try:
+        data = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return CANARY_CANNOT_RUN
+    if data.get("is_error"):
+        return CANARY_CANNOT_RUN
+    return CANARY_OK if canary_passed(data) else CANARY_DENY_DROPPED
+
+
 async def _run_claude_subprocess(
     args: list[str], env: dict, *, cwd: str, prompt: str, timeout: int,
 ) -> tuple[int | None, bytes, bytes]:
@@ -622,10 +656,10 @@ async def _run_claude_subprocess(
     return (proc.returncode, stdout, stderr)
 
 
-async def run_settings_canary(bot_name: str = "B") -> bool:
+async def run_settings_canary(bot_name: str = "B") -> str:
     """Live pre-flight: run a tiny `claude -p` that attempts a denied command and
-    confirm the deny fired. Returns True only if it is safe to proceed; any failure
-    to run / parse is treated as unsafe (fail closed)."""
+    classify the outcome (CANARY_OK / CANARY_DENY_DROPPED / CANARY_CANNOT_RUN).
+    The caller decides what each status means (proceed / refuse / wait-and-retry)."""
     cfg = BOTS[bot_name]
     args = build_claude_args("default")
     env = build_subprocess_env(cfg)
@@ -633,21 +667,9 @@ async def run_settings_canary(bot_name: str = "B") -> bool:
         rc, stdout, _ = await _run_claude_subprocess(
             args, env, cwd=DEFAULT_CWD, prompt=_CANARY_PROMPT, timeout=CLAUDE_TIMEOUT)
     except OSError as e:
-        log.error("settings canary could not run (%s) — failing closed", e)
-        return False
-    if rc is None or rc != 0:
-        log.error("settings canary rc=%s — failing closed", rc)
-        return False
-    try:
-        data = json.loads(stdout)
-    except json.JSONDecodeError:
-        log.error("settings canary produced unparseable output — failing closed")
-        return False
-    if not canary_passed(data):
-        log.error("settings canary NOT denied — the --settings deny family is not "
-                  "in force (silently dropped?). Failing closed.")
-        return False
-    return True
+        log.error("settings canary could not run (%s)", e)
+        return CANARY_CANNOT_RUN
+    return classify_canary(rc, stdout)
 
 
 # The permission/exec CHOKEPOINT (D3). Every agent invocation funnels through here;
@@ -1582,14 +1604,36 @@ async def main():
         log.warning("BRIDGE_SKIP_CANARY set — starting WITHOUT proving the deny family "
                     "loaded. Offline-dev only; never use this in a real deployment.")
     if not skip_canary:
-        if not await run_settings_canary():
-            raise SystemExit(
-                "settings canary failed — the --settings permissions.deny family is "
-                "not in force (file unloadable / schema drift / claude unavailable). "
-                "Refusing to start so the bot never runs with silently-dropped deny "
-                "rules. Set BRIDGE_SKIP_CANARY=1 only for offline dev."
-            )
-        log.info("settings canary passed: --settings deny family is in force")
+        # Three outcomes, three responses:
+        #  • OK            → deny family proven in force; proceed to serve.
+        #  • DENY_DROPPED  → claude ran but the must-be-denied action was NOT denied:
+        #                    settings silently dropped (schema drift / unloadable). This
+        #                    is the real OV1 risk → refuse to start. Retrying won't fix a
+        #                    config bug, so fail hard.
+        #  • CANNOT_RUN    → claude couldn't run (auth lapse / not logged in / transient).
+        #                    Nothing executed, so no security risk in waiting. Do NOT
+        #                    SystemExit — that hands docker a tight crash-loop (the
+        #                    OAuth-expiry incident: 188 restarts). Stay alive and retry
+        #                    with backoff so the bot self-heals once auth recovers.
+        backoff = CANARY_RETRY_BASE
+        while True:
+            status = await run_settings_canary()
+            if status == CANARY_OK:
+                log.info("settings canary passed: --settings deny family is in force")
+                break
+            if status == CANARY_DENY_DROPPED:
+                raise SystemExit(
+                    "settings canary failed — claude ran but the must-be-denied action "
+                    "was NOT denied: the --settings permissions.deny family is not in "
+                    "force (schema drift / unloadable settings). Refusing to start so the "
+                    "bot never serves with silently-dropped deny rules. "
+                    "Set BRIDGE_SKIP_CANARY=1 only for offline dev."
+                )
+            log.error("settings canary could not run — claude is unavailable / not logged "
+                      "in. The bot will NOT serve until auth recovers; retrying in %ds "
+                      "(in-process, no restart loop).", backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, CANARY_RETRY_MAX)
     for name in BOTS:
         clients[name] = make_client(name)
     if APPROVER_TIER_ENABLED:
