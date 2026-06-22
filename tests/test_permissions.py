@@ -94,6 +94,42 @@ def test_canary_passes_only_on_real_bash_denial():
     assert bot.canary_passed({"permission_denials": [{"tool_name": "Read"}]}) is False
 
 
+# ── canary classification — "deny dropped" (refuse) vs "cannot run" (retry) ─────
+# The OAuth-expiry incident (188 container restarts): a not-logged-in canary was
+# treated like a security failure and crash-looped the container. The classifier
+# must keep those two failures apart so only a genuine settings drop fails hard.
+def _ok_body(denied=True):
+    return json.dumps({"is_error": False,
+                       "permission_denials": [{"tool_name": "Bash"}] if denied else []}).encode()
+
+
+def test_classify_ok_when_ran_and_denied():
+    assert bot.classify_canary(0, _ok_body(denied=True)) == bot.CANARY_OK
+
+
+def test_classify_deny_dropped_when_ran_but_not_denied():
+    # claude ran cleanly (rc=0, is_error False) but no Bash denial → settings dropped
+    assert bot.classify_canary(0, _ok_body(denied=False)) == bot.CANARY_DENY_DROPPED
+
+
+def test_classify_cannot_run_on_nonzero_rc():
+    # the "Not logged in" body claude emits comes with rc=1 → retryable, NOT deny-dropped
+    body = json.dumps({"is_error": True, "result": "Not logged in · Please run /login",
+                       "permission_denials": []}).encode()
+    assert bot.classify_canary(1, body) == bot.CANARY_CANNOT_RUN
+
+
+def test_classify_cannot_run_on_is_error_even_with_rc0():
+    # defense: an error body that somehow exits 0 still never reached the perm layer
+    body = json.dumps({"is_error": True, "permission_denials": []}).encode()
+    assert bot.classify_canary(0, body) == bot.CANARY_CANNOT_RUN
+
+
+def test_classify_cannot_run_on_timeout_or_unparseable():
+    assert bot.classify_canary(None, b"") == bot.CANARY_CANNOT_RUN      # timeout (rc None)
+    assert bot.classify_canary(0, b"not json") == bot.CANARY_CANNOT_RUN  # garbage body
+
+
 # ── 3.2 / 3.4 — full bypass is opt-in, default closed ───────────────────────
 def test_bypass_default_closed(monkeypatch):
     monkeypatch.setattr(bot, "ALLOWED_USER_IDS", {111})
