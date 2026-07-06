@@ -1,7 +1,7 @@
 """L3 — build_subprocess_env: the claude subprocess must never inherit the
 secret/auth-routing family (B review), and API-key mode must inject ONLY the
 bot's own key."""
-import bot
+from bridge import config, runner
 
 # A host env that contains every var we care about leaking.
 HOST = {
@@ -23,8 +23,8 @@ _SENSITIVE = set(HOST) - {"PATH", "HOME"}
 
 
 def test_subscription_mode_strips_everything(monkeypatch):
-    monkeypatch.setattr(bot, "USE_API_KEY", False)
-    env = bot.build_subprocess_env(CFG_A, base_env=HOST)
+    monkeypatch.setattr(config, "USE_API_KEY", False)
+    env = runner.build_subprocess_env(CFG_A, base_env=HOST)
     assert env["PATH"] == "/usr/bin" and env["HOME"] == "/home/user"
     assert env["CLAUDE_CONFIG_DIR"] == "/home/user/.claude"
     # NO key / token / billing override survives
@@ -32,8 +32,8 @@ def test_subscription_mode_strips_everything(monkeypatch):
 
 
 def test_api_mode_injects_only_own_key(monkeypatch):
-    monkeypatch.setattr(bot, "USE_API_KEY", True)
-    env = bot.build_subprocess_env(CFG_A, base_env=HOST)
+    monkeypatch.setattr(config, "USE_API_KEY", True)
+    env = runner.build_subprocess_env(CFG_A, base_env=HOST)
     assert env["ANTHROPIC_API_KEY"] == "keyA"          # this bot's own key
     assert "ANTHROPIC_API_KEY_A" not in env             # raw per-bot vars stripped
     assert "ANTHROPIC_API_KEY_B" not in env             # the OTHER bot's key gone
@@ -43,13 +43,13 @@ def test_api_mode_injects_only_own_key(monkeypatch):
 
 def test_discord_tokens_never_present(monkeypatch):
     for mode in (True, False):
-        monkeypatch.setattr(bot, "USE_API_KEY", mode)
-        env = bot.build_subprocess_env(CFG_A, base_env=HOST)
+        monkeypatch.setattr(config, "USE_API_KEY", mode)
+        env = runner.build_subprocess_env(CFG_A, base_env=HOST)
         assert "DISCORD_BOT_A_TOKEN" not in env
         assert "DISCORD_BOT_B_TOKEN" not in env
 
 
 def test_config_dir_set_per_bot(monkeypatch):
-    monkeypatch.setattr(bot, "USE_API_KEY", False)
-    env = bot.build_subprocess_env({"config_dir": "/home/user/.claude-b"}, base_env=HOST)
+    monkeypatch.setattr(config, "USE_API_KEY", False)
+    env = runner.build_subprocess_env({"config_dir": "/home/user/.claude-b"}, base_env=HOST)
     assert env["CLAUDE_CONFIG_DIR"] == "/home/user/.claude-b"

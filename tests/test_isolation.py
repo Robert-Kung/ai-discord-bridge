@@ -11,9 +11,9 @@ with a tiny text parser so CI needs no PyYAML.
 """
 from pathlib import Path
 
-import bot
+from bridge import config
 
-REPO = Path(bot.__file__).resolve().parent
+REPO = Path(config.__file__).resolve().parent.parent
 COMPOSE_EXAMPLE = REPO / "docker-compose.example.yml"
 BOT_CLAUDE_MD = REPO / "bot-config" / "CLAUDE.md"
 
@@ -46,7 +46,7 @@ def _volumes(compose_path: Path) -> list[tuple[str, str, str]]:
 
 # ── 1.7 — dedicated minimal config dir, no operator PII / shared import ──────
 def test_bot_config_dirs_are_not_operator_account_dirs():
-    for n, d in bot.BOT_CONFIG_DIRS.items():
+    for n, d in config.BOT_CONFIG_DIRS.items():
         assert d not in ("/home/user/.claude", "/home/user/.claude-b"), \
             f"bot {n} must not run under the operator primary/secondary account dir"
         assert "claude-bot" in d

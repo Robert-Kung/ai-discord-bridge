@@ -1,13 +1,13 @@
-"""Shared fixtures. bot.py is import-side-effect-free (env is read lazily in
-load_config), so we can import it once here and exercise the pure helpers +
-config loading directly."""
+"""Shared fixtures. The bridge is import-side-effect-free (env is read lazily in
+config.load_config), so we import the modules once here and exercise the pure helpers
++ config loading directly."""
 import sys
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import bot  # noqa: E402
+from bridge import config  # noqa: E402
 
 # Minimal env that makes load_config() succeed.
 MINIMAL_ENV = {
@@ -25,19 +25,19 @@ _AUTH_ENV = ("USE_API_KEY", "ANTHROPIC_API_KEY_A", "ANTHROPIC_API_KEY_B",
 
 @pytest.fixture(autouse=True)
 def _restore_globals():
-    """load_config()/validate_config() mutate module globals; snapshot & restore
-    so tests don't leak state into each other. Driven by bot._CONFIG_GLOBALS so a
-    new config global can't silently fall out of the restore set."""
-    saved = {k: getattr(bot, k) for k in bot._CONFIG_GLOBALS}
+    """load_config()/validate_config() mutate config globals; snapshot & restore so
+    tests don't leak state into each other. Driven by config._CONFIG_GLOBALS so a new
+    config global can't silently fall out of the restore set."""
+    saved = {k: getattr(config, k) for k in config._CONFIG_GLOBALS}
     yield
     for k, v in saved.items():
-        setattr(bot, k, v)
+        setattr(config, k, v)
 
 
 @pytest.fixture
 def set_env(monkeypatch):
-    """Return a setter: set_env(**overrides) writes MINIMAL_ENV + overrides into
-    the environment (value None deletes the var)."""
+    """Return a setter: set_env(**overrides) writes MINIMAL_ENV + overrides into the
+    environment (value None deletes the var)."""
     def _set(**overrides):
         for k in _AUTH_ENV:
             monkeypatch.delenv(k, raising=False)
@@ -52,6 +52,6 @@ def set_env(monkeypatch):
 @pytest.fixture
 def tmp_state(monkeypatch, tmp_path):
     """Redirect the state dirs load_config() mkdirs so tests never touch the real
-    ~/.claude-shared."""
+    ~/.claude-shared. Patched on config — the consuming module reads them as attributes."""
     for name in ("STATE_DIR", "SUMMARIES_DIR", "PROJECT_NOTES_DIR"):
-        monkeypatch.setattr(bot, name, tmp_path / name.lower())
+        monkeypatch.setattr(config, name, tmp_path / name.lower())
