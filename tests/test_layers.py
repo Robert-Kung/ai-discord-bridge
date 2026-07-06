@@ -37,14 +37,18 @@ def _capture_call_claude(monkeypatch):
     return seen
 
 
-# ── exactly one assembler + one launcher, package-wide ──────────────────────
-def test_single_subprocess_launcher_and_arg_assembler():
-    assert _ALL_SRC.count("create_subprocess_exec(") == 1, "subprocess must launch in one place"
+# ── subprocess launch + argv assembly confined to the runner, package-wide ──
+def test_subprocess_launch_and_arg_assembly_confined_to_runner():
+    # One argv assembler (build_claude_args). The `claude -p` subprocess may be launched
+    # in more than one place inside the runner (the json chokepoint + the streaming exec
+    # job), but NEVER outside it, and the argv literal lives only in the assembler.
     assert _ALL_SRC.count("def build_claude_args(") == 1, "argv must be assembled in one place"
-    # the `claude -p` argv literal lives only in build_claude_args
-    assert _ALL_SRC.count('"claude", "-p"') == 1
-    # the one launcher lives in the runner, nowhere else
     assert "create_subprocess_exec(" in RUNNER_SRC
+    for name, src in _SOURCES.items():
+        if name == "runner.py":
+            continue
+        assert "create_subprocess_exec(" not in src, f"{name} launches a claude subprocess"
+        assert '"claude", "-p"' not in src, f"{name} assembles the claude argv"
 
 
 def test_only_runner_references_the_private_chokepoint():

@@ -13,7 +13,9 @@ import asyncio
 import json
 import logging
 import os
+import signal
 from pathlib import Path
+from typing import Callable
 
 from bridge import config, sessions, state
 
@@ -45,15 +47,25 @@ def build_claude_args(
     session_id: str | None = None,
     system_prompt_file: str | None = None,
     approver_mcp_config: str | None = None,
+    stream: bool = False,
 ) -> list[str]:
     """Assemble the `claude -p` argv — the single place argv is constructed.
 
     Fixed order: fixed flags, then value flags (`--settings`, `--permission-mode`,
     `--resume`, `--append-system-prompt-file`) each taking exactly one argument. No
-    variadic flag is emitted; the prompt is always fed via stdin (never argv)."""
-    args = ["claude", "-p", "--output-format", "json",
-            "--settings", config.BRIDGE_SETTINGS_PATH,
-            "--permission-mode", api_mode]
+    variadic flag is emitted; the prompt is always fed via stdin (never argv).
+
+    `stream=True` selects the incremental JSONL surface for background exec jobs:
+    `--output-format stream-json` REQUIRES `--verbose` in `-p` mode (the CLI hard-fails
+    without it), so both are emitted together."""
+    if stream:
+        args = ["claude", "-p", "--output-format", "stream-json", "--verbose",
+                "--settings", config.BRIDGE_SETTINGS_PATH,
+                "--permission-mode", api_mode]
+    else:
+        args = ["claude", "-p", "--output-format", "json",
+                "--settings", config.BRIDGE_SETTINGS_PATH,
+                "--permission-mode", api_mode]
     if session_id:
         args += ["--resume", session_id]
     if system_prompt_file:
@@ -258,3 +270,180 @@ async def execute(
         bot_name, prompt, mode=mode, use_session=use_session,
         system_prompt_file=system_prompt_file, cwd=cwd,
     )
+
+
+# ── Streaming execution (agent-exec-loop M1) ─────────────────────────────────
+# Background exec jobs use the JSONL event stream so the operator watches progress.
+# The parsing helpers below are pure (unit-tested); run_streaming_exec is the single
+# streaming launcher, and reuses the same chokepoint discipline: argv via
+# build_claude_args, prompt via stdin, env via build_subprocess_env.
+
+# Exec-job outcomes returned by run_streaming_exec.
+EXEC_DONE = "done"
+EXEC_TIMEOUT = "timeout"
+EXEC_FAILED = "failed"
+
+
+def parse_stream_event(line: "bytes | str") -> "dict | None":
+    """Tolerantly parse one JSONL line from `--output-format stream-json`. A blank line
+    or an unparseable / non-object line returns None (tolerate parser drift across Claude
+    Code upgrades — ignore, never crash)."""
+    if isinstance(line, bytes):
+        line = line.decode("utf-8", "replace")
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        ev = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return ev if isinstance(ev, dict) else None
+
+
+def is_result_event(event: dict) -> bool:
+    """True for the terminal `result` event (carries reply text + session_id + usage)."""
+    return isinstance(event, dict) and event.get("type") == "result"
+
+
+def stream_trace_line(event: dict) -> "str | None":
+    """A compact one-line trace for a tool-use action in an assistant event, else None.
+    e.g. "Edit: bot.py", "Bash: pytest -q". Used for the rolling status trace."""
+    if not isinstance(event, dict) or event.get("type") != "assistant":
+        return None
+    msg = event.get("message") or {}
+    for item in (msg.get("content") or []):
+        if not isinstance(item, dict) or item.get("type") != "tool_use":
+            continue
+        name = item.get("name", "?")
+        inp = item.get("input") or {}
+        detail = ""
+        if name == "Bash":
+            detail = (inp.get("command", "") or "").strip().splitlines()[0][:60] if inp.get("command") else ""
+        elif name in ("Edit", "Write", "Read", "NotebookEdit"):
+            detail = inp.get("file_path", "") or inp.get("notebook_path", "")
+        elif name in ("Grep", "Glob"):
+            detail = inp.get("pattern", "")
+        return f"{name}: {detail}" if detail else name
+    return None
+
+
+def stream_ctx_tokens(usage: dict) -> int:
+    """Last-iteration context size from a result event's usage (same accounting as the
+    json path: sum input + cache-read + cache-creation of the final iteration)."""
+    if not isinstance(usage, dict):
+        return 0
+    iters = usage.get("iterations")
+    src = iters[-1] if iters else usage
+    return (src.get("input_tokens", 0) + src.get("cache_read_input_tokens", 0)
+            + src.get("cache_creation_input_tokens", 0))
+
+
+async def kill_process_group(proc: "asyncio.subprocess.Process", grace: float = 5.0) -> None:
+    """SIGTERM the process GROUP (grandchildren die too — spawned with start_new_session),
+    wait a grace period, then SIGKILL, then reap. Safe to call on an already-dead proc."""
+    if proc.returncode is not None:
+        return
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, PermissionError):
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=grace)
+        return
+    except asyncio.TimeoutError:
+        pass
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        await proc.wait()
+    except Exception:
+        pass
+
+
+async def run_streaming_exec(
+    bot_name: str,
+    prompt: str,
+    *,
+    mode: str,
+    cwd: str,
+    system_prompt_file: "str | Path | None" = None,
+    on_trace: "Callable[[str], None] | None" = None,
+    on_proc: "Callable[[asyncio.subprocess.Process], None] | None" = None,
+    timeout: "int | None" = None,
+) -> tuple["str | None", str]:
+    """Run an execution-tier task as a streaming subprocess. Returns (reply, outcome)
+    where outcome is EXEC_DONE / EXEC_TIMEOUT / EXEC_FAILED.
+
+    `on_trace(line)` is called (sync, best-effort) for each tool-use action for the live
+    status trace; `on_proc(proc)` is called once the subprocess exists so the caller can
+    register it for cancellation. The subprocess is spawned in its own session so a cancel
+    or timeout kills the whole process group. Serialized per-cwd (never per-bot) so a long
+    job does not stall the bot's conversation calls elsewhere."""
+    if mode not in _EXEC_MODES:
+        raise ValueError(f"run_streaming_exec requires an execution mode, got {mode!r}")
+    timeout = config.EXEC_TIMEOUT if timeout is None else timeout
+    cfg = config.BOTS[bot_name]
+    api_mode = config.MODE_ALIASES.get(mode, mode)
+    sid = sessions.load_session(bot_name, cwd)
+    args = build_claude_args(
+        api_mode, session_id=sid,
+        system_prompt_file=str(system_prompt_file) if system_prompt_file else None,
+        stream=True)
+    env = build_subprocess_env(cfg)
+    log.info("[%s] exec-job start mode=%s cwd=%s prompt_len=%d", bot_name, api_mode, cwd, len(prompt))
+
+    async with state.cwd_locks[cwd]:
+        proc = await asyncio.create_subprocess_exec(
+            *args, env=env, cwd=cwd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        if on_proc:
+            on_proc(proc)
+        try:
+            proc.stdin.write(prompt.encode())
+            await proc.stdin.drain()
+            proc.stdin.close()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+        final: "dict | None" = None
+        try:
+            async with asyncio.timeout(timeout):
+                async for raw in proc.stdout:
+                    event = parse_stream_event(raw)
+                    if event is None:
+                        continue
+                    if is_result_event(event):
+                        final = event
+                    elif on_trace:
+                        line = stream_trace_line(event)
+                        if line:
+                            on_trace(line)
+                await proc.wait()
+        except asyncio.TimeoutError:
+            log.error("[%s] exec-job timeout after %ds — killing process group", bot_name, timeout)
+            await kill_process_group(proc)
+            return (None, EXEC_TIMEOUT)
+
+    if final is None:
+        # cancelled (killed mid-stream) or the process died without a result event
+        return (None, EXEC_FAILED)
+
+    reply = final.get("result") or "(空回覆)"
+    new_sid = final.get("session_id")
+    if new_sid:
+        sessions.save_session(bot_name, new_sid, cwd)
+    ctx = stream_ctx_tokens(final.get("usage") or {})
+    if ctx:
+        state.session_ctx_tokens[(bot_name, cwd)] = ctx
+        log.info("[%s] exec-job context now ~%dk tokens (cwd=%s)", bot_name, ctx // 1000, cwd)
+    return (reply, EXEC_DONE)

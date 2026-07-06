@@ -1,14 +1,15 @@
-## 1. Job registry + streaming + timeouts (milestone 1)
+## 1. Job registry + streaming + timeouts (milestone 1) — DONE
 
-- [ ] 1.1 Job registry: in-memory dict + JSON mirror under `discord-state/jobs/` (load-bearing: restart recovery, not just history); spawn exec subprocess with `start_new_session=True`; cap 1 concurrent exec job per project
-- [ ] 1.2 `!jobs` (list id/status/project/age) and `!cancel <id>` (SIGTERM pgid → grace period → SIGKILL → `await proc.wait()` before cleanup); route the existing timeout path through the same killer
-- [ ] 1.3 Switch exec calls to `--output-format stream-json --verbose` (flag is mandatory — CLI hard-fails without it; pin in a `build_claude_args` test); tolerant JSONL parser (ignore unknown event types)
-- [ ] 1.4 Stream `result` event replicates json-path bookkeeping: `session_id` save + last-iteration token accounting (else token-flush starves)
-- [ ] 1.5 Throttled status updater (≤ ~1 edit / 2 s **per channel**), status message posted as a reply to the originating message, carries job id + `!cancel <id>` hint, trace trimmed to the 2000-char edit cap
-- [ ] 1.6 `EXEC_TIMEOUT` distinct from `CLAUDE_TIMEOUT`; timeout kills the process group and reports partial state
-- [ ] 1.7 Exec jobs no longer hold locks in a way that stalls conversation calls (per-job concurrency, capped)
-- [ ] 1.8 `!jobs`/`!cancel` added to `HELP_TEXT` + `STARTUP_ANNOUNCEMENT` (this milestone, not wrap-up)
-- [ ] 1.9 Tests: registry lifecycle; restart marks `running` jobs `orphaned`; cancel kills group + escalation + waits before cleanup; stream parser tolerance; `--verbose` pinned; exec timeout independent of conversation timeout; per-project cap; `!cancel` whitelist authorization
+- [x] 1.1 Job registry: in-memory dict + JSON mirror under `discord-state/jobs/` (load-bearing: restart recovery); exec subprocess spawned with `start_new_session=True`; cap 1 concurrent exec job per project (`bridge/jobs.py`, `running_for_project`)
+- [x] 1.2 `!jobs` (id/bot/project/age/status) and `!cancel <id>` (`kill_process_group`: SIGTERM pgid → 5s grace → SIGKILL → `await proc.wait()` before cleanup); the timeout path uses the same killer. Whitelist-gated (upstream command guard).
+- [x] 1.3 Exec calls use `--output-format stream-json --verbose` (`build_claude_args(stream=True)`; `--verbose` mandatory — pinned in test_stream); tolerant `parse_stream_event` (ignores blank/unparseable/non-object lines)
+- [x] 1.4 Stream `result` event replicates json-path bookkeeping: `session_id` save + last-iteration token accounting (`stream_ctx_tokens`) — verified end-to-end (session saved, ctx=17)
+- [x] 1.5 Throttled status updater (≤ 1 edit / `EXEC_STATUS_EDIT_INTERVAL`s), status message posted as a reply, carries job id + `!cancel <id>` hint, trimmed to the edit cap
+- [x] 1.6 `EXEC_TIMEOUT` distinct from `CLAUDE_TIMEOUT`; timeout kills the process group and reports it — verified (returncode -15, ~2s not 120s)
+- [x] 1.7 Exec jobs hold `cwd_locks[cwd]` (per-project) but NOT `bot_locks` — a long job never stalls the bot's conversation calls; per-project cap of 1
+- [x] 1.8 `!jobs`/`!cancel` added to `HELP_TEXT` + `STARTUP_ANNOUNCEMENT`
+- [x] 1.9 Tests: registry lifecycle; restart marks `running`→`orphaned`; cancel kills group (real subprocess) + waits before cleanup; stream parser tolerance; `--verbose` pinned; exec timeout distinct; per-project cap; `!cancel` whitelist-gated (tests/test_jobs.py, tests/test_stream.py)
+  - NOTE (M1 scope): exec jobs run on the LIVE checkout; the git worktree + diff-review gate is M2. Restart recovery here only marks orphans (re-posting awaiting-review diffs is M2).
 
 ## 2. Git worktree + diff-review gate (milestone 2)
 
