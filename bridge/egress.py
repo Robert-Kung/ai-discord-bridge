@@ -25,21 +25,35 @@ log = logging.getLogger("bridge.egress")
 
 EGRESS_OK = "ok"
 EGRESS_OPEN = "open_egress"        # direct route out is still present → refuse
-EGRESS_OPEN_PROXY = "open_proxy"   # proxy tunnels a non-allow-listed host → refuse
+EGRESS_OPEN_PROXY = "open_proxy"   # proxy TUNNELS a non-allow-listed host → refuse
+EGRESS_INCONCLUSIVE = "inconclusive"      # can't prove default-deny → retry, never OK
 EGRESS_ANTHROPIC_DOWN = "anthropic_down"  # transient → retry
+
+# Proxy CONNECT outcomes — kept distinct so probe 2 asserts the SPECIFIC deny signal
+# (403/407), not mere non-reachability. A 502/timeout means the proxy allowed the tunnel
+# but the upstream was down — that is NOT proof of default-deny, so it must never read
+# as "contained" (else an allow-all proxy whose control host blips passes the canary).
+PROXY_TUNNELED = "tunneled"        # 2xx — CONNECT established (host is reachable via proxy)
+PROXY_DENIED = "denied"            # 403/407 — proxy refused (default-deny confirmed)
+PROXY_INCONCLUSIVE = "inconclusive"  # 502/504/timeout/closed — proves nothing
 
 
 def classify_egress(control_direct_reachable: bool,
-                    control_via_proxy_reachable: bool,
-                    anthropic_via_proxy_reachable: bool) -> str:
-    """Pure decision over the three probe outcomes. Order matters: a live direct route
-    is the most severe (no isolation at all), then an allow-all proxy, then Anthropic
-    reachability (the only transient/retryable one)."""
+                    control_via_proxy: str,
+                    anthropic_via_proxy: str) -> str:
+    """Pure decision over the three probe outcomes. `control_via_proxy` and
+    `anthropic_via_proxy` are PROXY_* statuses (not bools). Order matters: a live direct
+    route is most severe (no isolation), then an allow-all proxy, then an unprovable
+    default-deny, then Anthropic reachability."""
     if control_direct_reachable:
         return EGRESS_OPEN
-    if control_via_proxy_reachable:
+    if control_via_proxy == PROXY_TUNNELED:
         return EGRESS_OPEN_PROXY
-    if not anthropic_via_proxy_reachable:
+    if control_via_proxy != PROXY_DENIED:
+        # 502/timeout to the control host: the proxy did not explicitly deny it, so we
+        # cannot prove the allow-list is default-deny. Fail closed (retry), never OK.
+        return EGRESS_INCONCLUSIVE
+    if anthropic_via_proxy != PROXY_TUNNELED:
         return EGRESS_ANTHROPIC_DOWN
     return EGRESS_OK
 
@@ -60,27 +74,37 @@ async def _direct_reachable(host: str, port: int, timeout: float) -> bool:
         return False
 
 
-async def _proxy_connect_ok(proxy_url: str, host: str, port: int, timeout: float) -> bool:
-    """True iff an HTTP CONNECT tunnel to host:port is established through the proxy
-    (proxy replies 2xx). A 403/deny (default-deny allow-list) → False."""
+def _classify_connect_status(status_line: str) -> str:
+    """Map a proxy's CONNECT response status line to a PROXY_* outcome. 2xx = tunneled;
+    an EXPLICIT 403/407 = denied (default-deny); anything else (502/504/malformed) is
+    inconclusive — it does not prove the proxy would refuse a non-allow-listed host."""
+    parts = status_line.split()
+    code = parts[1] if len(parts) >= 2 and parts[1].isdigit() else ""
+    if code.startswith("2"):
+        return PROXY_TUNNELED
+    if code in ("403", "407"):
+        return PROXY_DENIED
+    return PROXY_INCONCLUSIVE
+
+
+async def _proxy_connect_status(proxy_url: str, host: str, port: int, timeout: float) -> str:
+    """CONNECT to host:port through the proxy and classify the reply (PROXY_*). Proxy
+    unreachable / timeout / closed → PROXY_INCONCLUSIVE (proves nothing)."""
     parsed = urlparse(proxy_url)
     phost, pport = parsed.hostname, parsed.port or 8888
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(phost, pport), timeout=timeout)
     except (OSError, asyncio.TimeoutError):
-        # proxy itself unreachable — treat as "not reachable via proxy"
-        return False
+        return PROXY_INCONCLUSIVE
     try:
         writer.write(
             f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n".encode())
         await writer.drain()
         line = await asyncio.wait_for(reader.readline(), timeout=timeout)
-        status = line.decode("latin-1", "replace")
-        # "HTTP/1.1 200 Connection established" = tunnel open; 403/407/502 = denied/blocked
-        return " 200 " in status or status.rstrip().endswith(" 200")
+        return _classify_connect_status(line.decode("latin-1", "replace"))
     except (OSError, asyncio.TimeoutError):
-        return False
+        return PROXY_INCONCLUSIVE
     finally:
         writer.close()
         try:
@@ -96,8 +120,8 @@ async def run_egress_canary(timeout: float = 5.0) -> str:
     control = config.EGRESS_CANARY_CONTROL_HOST
     anthropic = config.ANTHROPIC_API_HOST
     control_direct = await _direct_reachable(control, 443, timeout)
-    control_via_proxy = await _proxy_connect_ok(proxy, control, 443, timeout)
-    anthropic_via_proxy = await _proxy_connect_ok(proxy, anthropic, 443, timeout)
+    control_via_proxy = await _proxy_connect_status(proxy, control, 443, timeout)
+    anthropic_via_proxy = await _proxy_connect_status(proxy, anthropic, 443, timeout)
     status = classify_egress(control_direct, control_via_proxy, anthropic_via_proxy)
     log.info("egress canary: direct(%s)=%s proxy(%s)=%s proxy(%s)=%s → %s",
              control, control_direct, control, control_via_proxy,

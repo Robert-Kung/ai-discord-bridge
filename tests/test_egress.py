@@ -12,34 +12,58 @@ REPO = Path(config.__file__).resolve().parent.parent
 DENY = json.loads((REPO / "settings.json").read_text())["permissions"]["deny"]
 
 
+D = egress.PROXY_DENIED
+T = egress.PROXY_TUNNELED
+I = egress.PROXY_INCONCLUSIVE
+
+
 def test_ok_only_when_contained_and_anthropic_up():
-    # direct fails, proxy denies control, proxy reaches anthropic → contained
-    assert egress.classify_egress(False, False, True) == egress.EGRESS_OK
+    # direct fails, proxy DENIES control (explicit 403), proxy tunnels anthropic → contained
+    assert egress.classify_egress(False, D, T) == egress.EGRESS_OK
 
 
 def test_direct_route_present_refuses():
     # a live direct route means no isolation at all — most severe, checked first
-    assert egress.classify_egress(True, False, True) == egress.EGRESS_OPEN
-    assert egress.classify_egress(True, True, True) == egress.EGRESS_OPEN
+    assert egress.classify_egress(True, D, T) == egress.EGRESS_OPEN
+    assert egress.classify_egress(True, T, T) == egress.EGRESS_OPEN
 
 
 def test_allow_all_proxy_refuses():
-    # THE key case: direct route gone, but the proxy tunnels the control host
+    # THE key case: direct route gone, but the proxy TUNNELS the control host
     # (empty/broken ACL). A connectivity-only canary would pass this; we must not.
-    assert egress.classify_egress(False, True, True) == egress.EGRESS_OPEN_PROXY
-    # even if anthropic is also reachable, an allow-all proxy is still a refusal
-    assert egress.classify_egress(False, True, False) == egress.EGRESS_OPEN_PROXY
+    assert egress.classify_egress(False, T, T) == egress.EGRESS_OPEN_PROXY
+    assert egress.classify_egress(False, T, I) == egress.EGRESS_OPEN_PROXY
+
+
+def test_inconclusive_control_probe_never_reads_as_contained():
+    # 502/timeout to the control host via the proxy does NOT prove default-deny — an
+    # allow-all proxy whose upstream blipped would land here. Must fail closed (retry),
+    # never OK, even when anthropic is reachable.
+    assert egress.classify_egress(False, I, T) == egress.EGRESS_INCONCLUSIVE
 
 
 def test_anthropic_down_is_transient():
-    # contained, but the proxy can't reach anthropic → retryable, not a refusal
-    assert egress.classify_egress(False, False, False) == egress.EGRESS_ANTHROPIC_DOWN
+    # contained (control denied), but the proxy can't tunnel anthropic → retryable
+    assert egress.classify_egress(False, D, I) == egress.EGRESS_ANTHROPIC_DOWN
+    assert egress.classify_egress(False, D, egress.PROXY_DENIED) == egress.EGRESS_ANTHROPIC_DOWN
+
+
+def test_connect_status_parsing():
+    # the exact parsing probe 2's soundness turns on
+    assert egress._classify_connect_status("HTTP/1.1 200 Connection established") == T
+    assert egress._classify_connect_status("HTTP/1.0 200 OK") == T
+    assert egress._classify_connect_status("HTTP/1.1 403 Filtered") == D
+    assert egress._classify_connect_status("HTTP/1.1 407 Proxy Authentication Required") == D
+    assert egress._classify_connect_status("HTTP/1.1 502 Bad Gateway") == I
+    assert egress._classify_connect_status("HTTP/1.1 504 Gateway Timeout") == I
+    assert egress._classify_connect_status("") == I
+    assert egress._classify_connect_status("garbage") == I
 
 
 def test_status_constants_distinct():
-    vals = {egress.EGRESS_OK, egress.EGRESS_OPEN,
-            egress.EGRESS_OPEN_PROXY, egress.EGRESS_ANTHROPIC_DOWN}
-    assert len(vals) == 4
+    vals = {egress.EGRESS_OK, egress.EGRESS_OPEN, egress.EGRESS_OPEN_PROXY,
+            egress.EGRESS_INCONCLUSIVE, egress.EGRESS_ANTHROPIC_DOWN}
+    assert len(vals) == 5
 
 
 # ── deny family unchanged by egress containment ─────────────────────────────

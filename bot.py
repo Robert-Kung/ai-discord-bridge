@@ -42,6 +42,7 @@ async def main():
     # proxy is configured (uncontained single-container deploy) this is skipped.
     if config.EGRESS_PROXY_URL:
         backoff = config.CANARY_RETRY_BASE
+        attempts = 0
         while True:
             status = await egress.run_egress_canary()
             if status == egress.EGRESS_OK:
@@ -55,8 +56,23 @@ async def main():
                     f"({'directly — the internal network still has a route out' if status == egress.EGRESS_OPEN else 'via the proxy — the allow-list is not default-deny'}). "
                     "Refusing to serve so a bypassed agent can't exfiltrate."
                 )
-            log.error("egress canary: Anthropic unreachable via the proxy (transient / "
-                      "proxy still starting). Retrying in %ds (in-process).", backoff)
+            # ANTHROPIC_DOWN / INCONCLUSIVE → fail-closed retry (proxy still starting, or a
+            # transient blip). After several failures it is probably NOT transient — a
+            # permanent allow-list typo (missing api.anthropic.com, or the control host
+            # unreachable via the proxy) — so escalate the message instead of looping
+            # silently on a lie (the canary_oauth_crashloop diagnosability lesson).
+            attempts += 1
+            if attempts >= 5:
+                hint = ("check egress-proxy/filter includes api.anthropic.com"
+                        if status == egress.EGRESS_ANTHROPIC_DOWN
+                        else "the control host is not reachable via the proxy — check the "
+                             "proxy is up and EGRESS_CANARY_CONTROL_HOST resolves")
+                log.error("egress canary still failing after %d attempts (status=%s) — this "
+                          "is likely a PERMANENT misconfig, not transient: %s. Still retrying "
+                          "in %ds (fail-closed, not serving).", attempts, status, hint, backoff)
+            else:
+                log.error("egress canary not yet green (status=%s; proxy still starting?). "
+                          "Retrying in %ds (in-process, fail-closed).", status, backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, config.CANARY_RETRY_MAX)
 
