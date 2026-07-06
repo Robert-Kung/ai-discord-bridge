@@ -91,8 +91,11 @@ async def run_plan_then_execute(
 ) -> None:
     """For bypass mode: post plan, await reaction, then execute."""
     cwd = config.DEFAULT_CWD if cwd is None else cwd
-    spf = memory.build_combined_system_prompt(channel.id, cwd, bot_name)
+    # Build the summary/notes snapshot per call (matching the original, which rebuilt
+    # it inside each _call_claude): the plan and execute phases are separated by the
+    # human-reaction wait, during which a flush may refresh the on-disk context.
     if skip_plan:
+        spf = memory.build_combined_system_prompt(channel.id, cwd, bot_name)
         async with state.bot_locks[bot_name]:
             async with channel.typing():
                 reply, _ = await runner.execute(
@@ -108,7 +111,9 @@ async def run_plan_then_execute(
     async with state.bot_locks[bot_name]:
         async with channel.typing():
             plan_reply, ok = await runner.converse(
-                bot_name, prompt, system_prompt_file=spf, cwd=cwd,
+                bot_name, prompt,
+                system_prompt_file=memory.build_combined_system_prompt(channel.id, cwd, bot_name),
+                cwd=cwd,
             )
     if not ok:
         await channel.send(plan_reply)
@@ -134,12 +139,13 @@ async def run_plan_then_execute(
         await channel.send("❌ 已取消")
         return
 
-    # Phase 2: execute
+    # Phase 2: execute (rebuild the snapshot — a flush may have run during the wait)
     async with state.bot_locks[bot_name]:
         async with channel.typing():
             exec_reply, _ = await runner.execute(
                 bot_name, prompt, mode="bypass",
-                system_prompt_file=spf, cwd=cwd,
+                system_prompt_file=memory.build_combined_system_prompt(channel.id, cwd, bot_name),
+                cwd=cwd,
             )
     memory.record_bot_reply(channel.id, bot_name, exec_reply[:1000], cwd=cwd)
     for c in chunk_message(f"🚀 **[mode=bypass · executed]**\n{exec_reply}"):
