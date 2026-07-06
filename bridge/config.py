@@ -28,6 +28,13 @@ CSWAP_USAGE_FILE = STATE_DIR / "cswap-usage.json"  # written by host cron, read 
 # ── Thresholds (env defaults at import; no crash; referenced by HELP_TEXT etc.) ──
 MAX_BOT_TURNS = int(os.environ.get("MAX_BOT_TURNS", "6"))
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "300"))
+# Execution-tier background jobs (agent-exec-loop M1) get a much larger timeout than a
+# conversation call, run as tracked background jobs, and stream progress. Distinct from
+# CLAUDE_TIMEOUT so a long edit task never inherits the short conversation kill-timer.
+EXEC_TIMEOUT = int(os.environ.get("EXEC_TIMEOUT", "1800"))
+# Status-message edit throttle (s) and the rolling tool-use trace depth.
+EXEC_STATUS_EDIT_INTERVAL = float(os.environ.get("EXEC_STATUS_EDIT_INTERVAL", "2.0"))
+EXEC_TRACE_LINES = int(os.environ.get("EXEC_TRACE_LINES", "12"))
 AUTO_FLUSH_THRESHOLD = int(os.environ.get("AUTO_FLUSH_THRESHOLD", "20"))
 # Startup-canary retry backoff (s) for the "claude can't run / not logged in" case.
 # We wait-and-retry IN-PROCESS instead of letting a SystemExit hand docker a tight

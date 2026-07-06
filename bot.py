@@ -11,7 +11,7 @@ import logging
 import os
 from pathlib import Path
 
-from bridge import config, egress
+from bridge import config, egress, jobs
 from bridge.approver_ipc import start_approval_server
 from bridge.frontend import make_client, request_discord_approval
 from bridge import runner, state
@@ -25,6 +25,7 @@ log = logging.getLogger("bridge")
 
 async def main():
     config.load_config()  # read env into globals + ensure dirs + fail-closed validation
+    jobs.recover_orphans()  # mark exec jobs left "running" by a previous container as orphaned
 
     # Fail-closed startup assertion: a dead approve tier (script missing) would only
     # surface the first time someone uses `!mode approve`; the default-mode canary

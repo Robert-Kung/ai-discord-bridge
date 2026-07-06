@@ -9,11 +9,12 @@ import asyncio
 import json
 import logging
 import time
+from collections import deque
 from pathlib import Path
 
 import discord
 
-from bridge import config, discuss, memory, runner, sessions, state, trust
+from bridge import config, discuss, jobs, memory, runner, sessions, state, trust
 from bridge.util import chunk_message
 
 log = logging.getLogger("bridge.frontend")
@@ -152,12 +153,114 @@ async def run_plan_then_execute(
         await channel.send(c)
 
 
+# ── Execution-tier background jobs (agent-exec-loop M1) ──────────────────────
+def _where(cwd: str) -> str:
+    return "~" if cwd == config.DEFAULT_CWD else Path(cwd).name
+
+
+def _render_job_status(job, where: str, trace) -> str:
+    head = (f"🚀 **[job `{job.id}` · Bot-{job.bot} · `{where}`]** 執行中…"
+            f"（`!cancel {job.id}` 取消）")
+    if not trace:
+        return head
+    body = "\n".join(f"• {t}" for t in trace)
+    return f"{head}\n{body}"[:1990]
+
+
+async def start_exec_job(message: discord.Message, bot_name: str, prompt: str,
+                         mode: str, cwd: str) -> None:
+    """Spawn an execution-tier task as a tracked background job (M1). Capped at one
+    running job per project; conversation calls are not blocked while it runs."""
+    if jobs.running_for_project(cwd) >= 1:
+        await message.channel.send(
+            f"🛑 `{_where(cwd)}` 已有執行中的任務（`!jobs` 查看，`!cancel <id>` 取消）；"
+            "一個專案一次只跑一個 exec job。")
+        return
+    job = jobs.create_job(bot_name, cwd, message.channel.id)
+    status_msg = await message.channel.send(
+        _render_job_status(job, _where(cwd), None), reference=message)
+    jobs.set_msg(job, status_msg.id)
+    asyncio.create_task(
+        _drive_exec_job(job, message.channel, status_msg, bot_name, prompt, mode, cwd))
+
+
+async def _drive_exec_job(job, channel, status_msg, bot_name: str, prompt: str,
+                          mode: str, cwd: str) -> None:
+    where = _where(cwd)
+    trace: deque = deque(maxlen=config.EXEC_TRACE_LINES)
+    done = asyncio.Event()
+
+    async def _updater():
+        # Throttled: edit the status message at most once per interval with the rolling
+        # tool-use trace, until the job finishes.
+        while not done.is_set():
+            try:
+                await asyncio.wait_for(done.wait(), timeout=config.EXEC_STATUS_EDIT_INTERVAL)
+            except asyncio.TimeoutError:
+                pass
+            if trace:
+                try:
+                    await status_msg.edit(content=_render_job_status(job, where, list(trace)))
+                except discord.HTTPException:
+                    pass
+
+    upd = asyncio.create_task(_updater())
+    spf = memory.build_combined_system_prompt(channel.id, cwd, bot_name)
+    try:
+        reply, outcome = await runner.run_streaming_exec(
+            bot_name, prompt, mode=mode, cwd=cwd, system_prompt_file=spf,
+            on_trace=trace.append,
+            on_proc=lambda proc: jobs.attach_proc(job, proc),
+            timeout=config.EXEC_TIMEOUT,
+        )
+    except Exception as e:  # noqa: BLE001 — a job crash must not take down the bot
+        done.set()
+        await upd
+        jobs.set_status(job, jobs.FAILED)
+        log.exception("exec-job %s crashed", job.id)
+        await _safe_edit(status_msg, f"❌ **[job `{job.id}`]** 內部錯誤：{e}")
+        return
+    done.set()
+    await upd
+
+    if job.status == jobs.CANCELLED:
+        await _safe_edit(status_msg,
+                         f"🛑 **[job `{job.id}`]** 已取消（部分變更可能已寫入 live checkout）")
+        return
+    if outcome == runner.EXEC_TIMEOUT:
+        jobs.set_status(job, jobs.TIMEOUT)
+        await _safe_edit(status_msg,
+                         f"⏱️ **[job `{job.id}`]** 逾時（{config.EXEC_TIMEOUT}s）→ 已終止 process group")
+        return
+    if reply is None or outcome == runner.EXEC_FAILED:
+        jobs.set_status(job, jobs.FAILED)
+        await _safe_edit(status_msg, f"❌ **[job `{job.id}`]** 執行失敗（無結果）")
+        return
+
+    jobs.set_status(job, jobs.DONE)
+    memory.record_bot_reply(channel.id, bot_name, reply, cwd=cwd)
+    await _safe_edit(status_msg, f"✅ **[job `{job.id}` · `{where}`]** 完成")
+    cwd_tag = "" if cwd == config.DEFAULT_CWD else f"[{where}] "
+    for c in chunk_message(f"{cwd_tag}**[mode={mode} · job {job.id}]** {reply}"):
+        await channel.send(c)
+    await memory.maybe_token_flush(channel, bot_name, cwd)
+
+
+async def _safe_edit(msg, content: str) -> None:
+    try:
+        await msg.edit(content=content[:1990])
+    except discord.HTTPException:
+        pass
+
+
 # ── Command handlers ────────────────────────────────────────────────────
 HELP_TEXT = """**Bridge 指令參考**
 `!mode plan|edit|bypass|approve` — 設 channel 預設模式（bypass/approve 需 whitelist + opt-in tier）
 `!once <mode>` — 單一訊息使用該模式（末尾加，不獨佔一行）
 `!yolo` — bypass 跳過 plan-then-execute（單訊息）
 `!discuss <topic>` — A↔B 強制輪流辯論
+`!jobs` — 列出執行中的背景任務（id / bot / 專案 / 已跑多久）
+`!cancel <id>` — 取消某個執行中的任務（終止整個 process group）
 `!flush` — 立即整理對話到 summary 知識檔
 `!reset` — 清掉當前 bot session id（保留 summary）
 `!cd <專案名|路徑>` — 把此 channel 切到該專案工作目錄（限白名單 git 專案）
@@ -357,6 +460,18 @@ def make_client(bot_name: str) -> discord.Client:
                         return
                     asyncio.create_task(discuss.run_discuss(message.channel, args.strip()))
                     return
+                if name == "jobs":
+                    await message.channel.send(jobs.render_job_list())
+                    return
+                if name == "cancel":
+                    jid = args.strip()
+                    job = jobs.get_job(jid)
+                    if job is None or job.status != jobs.RUNNING:
+                        await message.channel.send(f"找不到執行中的 job `{jid}`（`!jobs` 查看）")
+                        return
+                    await jobs.cancel_job(job)
+                    await message.channel.send(f"🛑 job `{jid}` 已取消")
+                    return
                 # Unknown command: don't reply (may be a typo)
 
         if not mentioned:
@@ -417,25 +532,22 @@ def make_client(bot_name: str) -> discord.Client:
             return
 
         # Standard call. Layer split (D3): a bot-origin mention → converse() (plan),
-        # regardless of channel mode. Only a human-driven edit-tier request reaches
-        # execute(), and only after the whitelist check above.
+        # regardless of channel mode. Only a human-driven edit-tier request reaches the
+        # execution layer — and in M1 that runs as a streaming, cancellable BACKGROUND
+        # JOB (never blocking conversation), not a synchronous call.
+        if runner.exec_layer_for(is_bot_msg, effective_mode) == "execute":
+            await start_exec_job(message, bot_name, prompt, effective_mode, cwd)
+            return
+
         spf = memory.build_combined_system_prompt(message.channel.id, cwd, bot_name)
         async with state.bot_locks[bot_name]:
             async with message.channel.typing():
-                if runner.exec_layer_for(is_bot_msg, effective_mode) == "execute":
-                    reply, _ok = await runner.execute(
-                        bot_name, prompt, mode=effective_mode,
-                        system_prompt_file=spf, cwd=cwd,
-                    )
-                else:
-                    reply, _ok = await runner.converse(
-                        bot_name, prompt, system_prompt_file=spf, cwd=cwd,
-                    )
+                reply, _ok = await runner.converse(
+                    bot_name, prompt, system_prompt_file=spf, cwd=cwd,
+                )
         memory.record_bot_reply(message.channel.id, bot_name, reply, cwd=cwd)
         cwd_tag = "" if cwd == config.DEFAULT_CWD else f"[{Path(cwd).name}] "
-        prefix = ""
-        if once_mode:
-            prefix = f"**[mode={effective_mode} · once]** "
+        prefix = f"**[mode={effective_mode} · once]** " if once_mode else ""
         for c in chunk_message(cwd_tag + prefix + reply):
             await message.channel.send(c)
         await memory.maybe_token_flush(message.channel, bot_name, cwd)
@@ -476,6 +588,10 @@ STARTUP_ANNOUNCEMENT = """🚀 **Bridge v3 上線**
 • `@A`、`@B` 單獨叫 — 自然回，被 @ 才接話
 • `@A @B` 一起 — 並行雙視角
 • `!discuss <主題>` — 強制 A↔B 輪流辯論
+
+**⚙️ 背景執行任務**
+• 執行層任務（edit/approve）改走背景 job：即時進度、可 `!cancel`、獨立逾時
+• `!jobs` 看執行中的任務  •  `!cancel <id>` 取消（終止整個 process group）
 
 **🔐 授權執行**
 • `!mode plan|edit|bypass` 切 channel 模式
