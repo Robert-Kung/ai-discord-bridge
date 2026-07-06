@@ -1,7 +1,8 @@
 ## 0. Blocking prerequisite spike
 
-- [ ] 0.1 Throwaway compose: `internal: true` network + CONNECT-proxy sidecar; prove discord.py 2.x REST **and gateway websocket** connect via `proxy=` (go/no-go — nothing below ships until this passes)
-- [ ] 0.2 If the spike fails: document the route-removing fallback (`DOCKER-USER` egress DROP with maintained IP set); the env-only "proxy for claude only" fallback is rejected as unsafe and must not be implemented
+- [x] 0.1 Throwaway compose: `internal: true` network + CONNECT-proxy sidecar; prove discord.py 2.x REST **and gateway websocket** connect via `proxy=` (go/no-go — nothing below ships until this passes)
+  - **GO (2026-07-06).** discord.py 2.4.0 (repo pin) on python:3.12-slim: `discord.Client(intents=..., proxy="http://proxy:8888")` covers both REST and gateway; no env vars / proxy_auth / aiohttp patches. Proxy: `alpine:3.20 + apk add tinyproxy`, `ConnectPort 443`, `Filter` BRE allow-list (`^discord\.com$`, `^gateway\.discord\.gg$`), `FilterDefaultDeny Yes`, `LogLevel Connect`. Evidence: direct egress = `OSError(101)` (route absent); `CONNECT example.com` → `403 Filtered`; `CONNECT discord.com`/`gateway.discord.gg` established, `on_ready` + `application_info()` OK. `LogLevel Connect` already yields the grep-able deny-log lines task 1.6 needs; scope `Allow` to the internal subnet in prod.
+- [x] 0.2 If the spike fails: document the route-removing fallback — **N/A, spike passed**; iptables fallback not needed, compose-internal + tinyproxy sidecar proceeds as designed. (Env-only "proxy for claude only" fallback remains rejected as unsafe.)
 
 ## 1. Egress proxy + network (phase 1)
 

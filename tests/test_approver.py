@@ -14,11 +14,11 @@ from pathlib import Path
 
 import pytest
 
-import bot
+from bridge import config, runner, trust
 import approver_policy
 import mcp_approver
 
-REPO = Path(bot.__file__).resolve().parent
+REPO = Path(config.__file__).resolve().parent.parent
 ALLOWLIST = approver_policy.load_allowlist(REPO / "approver-allowlist.json")
 
 
@@ -155,7 +155,7 @@ def test_mcp_protocol_end_to_end(monkeypatch):
 
 # ── bot.py wiring: approve tier flags, default-closed, routing ──────────────
 def test_build_args_wires_approver_when_configured():
-    args = bot.build_claude_args("default", approver_mcp_config="/tmp/x.json")
+    args = runner.build_claude_args("default", approver_mcp_config="/tmp/x.json")
     assert "--permission-prompt-tool" in args
     assert args[args.index("--permission-prompt-tool") + 1] == "mcp__approver__approve"
     assert args[args.index("--mcp-config") + 1] == "/tmp/x.json"
@@ -165,44 +165,44 @@ def test_build_args_wires_approver_when_configured():
 
 
 def test_build_args_no_approver_flags_by_default():
-    args = bot.build_claude_args("acceptEdits")
+    args = runner.build_claude_args("acceptEdits")
     assert "--permission-prompt-tool" not in args and "--mcp-config" not in args
     assert "--settings" in args  # 5.3: with approver off, deny/sandbox still apply
 
 
 def test_approve_mode_maps_to_default():
-    assert bot.MODE_ALIASES["approve"] == "default"  # only mode the prompt-tool is consulted in
+    assert config.MODE_ALIASES["approve"] == "default"  # only mode the prompt-tool is consulted in
 
 
 def test_approve_tier_default_closed(monkeypatch):
-    monkeypatch.setattr(bot, "ALLOWED_USER_IDS", {111})
-    monkeypatch.setattr(bot, "APPROVER_TIER_ENABLED", False)
-    assert bot.approve_allowed(111) is False  # whitelisted but tier off → no
+    monkeypatch.setattr(config, "ALLOWED_USER_IDS", {111})
+    monkeypatch.setattr(config, "APPROVER_TIER_ENABLED", False)
+    assert trust.approve_allowed(111) is False  # whitelisted but tier off → no
 
 
 def test_approve_tier_requires_tier_and_whitelist(monkeypatch):
-    monkeypatch.setattr(bot, "ALLOWED_USER_IDS", {111})
-    monkeypatch.setattr(bot, "APPROVER_TIER_ENABLED", True)
-    assert bot.approve_allowed(111) is True
-    assert bot.approve_allowed(999) is False
+    monkeypatch.setattr(config, "ALLOWED_USER_IDS", {111})
+    monkeypatch.setattr(config, "APPROVER_TIER_ENABLED", True)
+    assert trust.approve_allowed(111) is True
+    assert trust.approve_allowed(999) is False
 
 
 def test_routing_human_approve_executes_bot_converses():
-    assert bot.exec_layer_for(is_bot_msg=False, effective_mode="approve") == "execute"
-    assert bot.exec_layer_for(is_bot_msg=True, effective_mode="approve") == "converse"
+    assert runner.exec_layer_for(is_bot_msg=False, effective_mode="approve") == "execute"
+    assert runner.exec_layer_for(is_bot_msg=True, effective_mode="approve") == "converse"
 
 
 def test_execute_accepts_approve_mode():
-    assert "approve" in bot._EXEC_MODES
+    assert "approve" in runner._EXEC_MODES
 
 
 def test_approve_timeouts_are_nested(monkeypatch):
     # the human window must fit inside the approver socket wait, which must fit inside the
     # claude subprocess lifetime — else a slow-but-valid approval is killed before it lands
-    monkeypatch.setattr(bot, "CLAUDE_TIMEOUT", 300)
-    monkeypatch.setattr(bot, "PLAN_REACTION_TIMEOUT", 300)
-    assert bot.PLAN_REACTION_TIMEOUT < bot.approver_socket_timeout() < bot.approve_call_timeout()
+    monkeypatch.setattr(config, "CLAUDE_TIMEOUT", 300)
+    monkeypatch.setattr(config, "PLAN_REACTION_TIMEOUT", 300)
+    assert config.PLAN_REACTION_TIMEOUT < config.approver_socket_timeout() < config.approve_call_timeout()
     # and the ordering holds for other configured windows too
-    monkeypatch.setattr(bot, "PLAN_REACTION_TIMEOUT", 600)
-    monkeypatch.setattr(bot, "CLAUDE_TIMEOUT", 120)
-    assert bot.PLAN_REACTION_TIMEOUT < bot.approver_socket_timeout() < bot.approve_call_timeout()
+    monkeypatch.setattr(config, "PLAN_REACTION_TIMEOUT", 600)
+    monkeypatch.setattr(config, "CLAUDE_TIMEOUT", 120)
+    assert config.PLAN_REACTION_TIMEOUT < config.approver_socket_timeout() < config.approve_call_timeout()

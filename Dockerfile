@@ -18,5 +18,6 @@ RUN pip install --no-cache-dir discord.py==2.4.0
 
 WORKDIR /app
 COPY bot.py approver_policy.py mcp_approver.py approver-allowlist.json settings.json /app/
+COPY bridge/ /app/bridge/
 
 CMD ["python3", "/app/bot.py"]
