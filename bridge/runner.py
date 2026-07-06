@@ -29,6 +29,13 @@ def build_subprocess_env(cfg: dict, base_env: "dict | None" = None) -> dict:
     env["CLAUDE_CONFIG_DIR"] = cfg["config_dir"]
     if config.USE_API_KEY and cfg.get("api_key"):
         env["ANTHROPIC_API_KEY"] = cfg["api_key"]
+    # Egress containment (phase 1): route `claude`'s HTTPS through the allow-list proxy
+    # and drop non-essential telemetry so those endpoints need not be opened. The proxy
+    # env is plumbing, not the boundary — the boundary is the routeless internal network.
+    if config.EGRESS_PROXY_URL:
+        env["HTTPS_PROXY"] = config.EGRESS_PROXY_URL
+        env["HTTP_PROXY"] = config.EGRESS_PROXY_URL
+        env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
     return env
 
 

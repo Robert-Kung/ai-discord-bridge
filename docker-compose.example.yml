@@ -8,15 +8,49 @@
 # each holding ONLY a minimal CLAUDE.md (no personal data, no @import of any
 # shared CLAUDE.md). The bots authenticate via the single credential file
 # bind-mounted below — no re-login, same subscription billing.
+#
+# EGRESS CONTAINMENT (phase 1): the bridge runs on a routeless `internal: true`
+# network and reaches the world ONLY through the default-deny egress-proxy sidecar
+# (see ./egress-proxy). The startup egress canary refuses to serve unless a
+# non-allow-listed control host is unreachable both directly and via the proxy.
+# Phase 1 is a scaffold: the allow-list still includes Discord hosts (webhooks are a
+# usable exfil sink) — real credential containment arrives in phase 2 (split
+# executor/frontend containers). See SECURITY.md §6/§7.
 services:
+  egress-proxy:
+    build: ./egress-proxy
+    container_name: ai-discord-bridge-egress-proxy
+    restart: unless-stopped
+    # Straddles the internal (routeless) network and an outbound bridge network:
+    # it is the only member with a route out.
+    networks:
+      - egress_internal
+      - egress_outbound
+    healthcheck:
+      test: ["CMD-SHELL", "netstat -tln 2>/dev/null | grep -q ':8888 ' || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
   ai-discord-bridge:
     build: .
     container_name: ai-discord-bridge
     restart: unless-stopped
     env_file: .env
     user: "1000:1000"
+    # Routeless internal network only — no direct path out; egress is via the proxy.
+    networks:
+      - egress_internal
+    depends_on:
+      egress-proxy:
+        condition: service_healthy
     environment:
       HOME: /home/user
+      # Egress containment: all HTTPS leaves via the allow-list proxy. discord.py
+      # takes this as proxy=; `claude -p` gets it as HTTPS_PROXY (set by the bridge).
+      # Unset this (and drop the internal network) to run uncontained (canary skipped).
+      EGRESS_PROXY_URL: http://egress-proxy:8888
       # cwd whitelist: !cd only accepts these paths (each must contain .git).
       # MUST match the project bind mounts below. Comma-separated, absolute paths.
       PROJECT_DIRS: >-
@@ -56,3 +90,11 @@ services:
       # in the container = mount-level isolation.
       - /home/user/your-project-a:/home/user/your-project-a
       - /home/user/your-project-b:/home/user/your-project-b
+
+networks:
+  # Routeless: containers on this network have NO direct path to the internet.
+  egress_internal:
+    internal: true
+  # Only the proxy joins this one — its single route out.
+  egress_outbound:
+    driver: bridge
