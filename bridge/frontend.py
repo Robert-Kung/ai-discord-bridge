@@ -283,7 +283,10 @@ def make_client(bot_name: str) -> discord.Client:
     intents = discord.Intents.default()
     intents.message_content = True
     intents.reactions = True
-    client = discord.Client(intents=intents)
+    # Egress containment (phase 1): on an internal (routeless) network the gateway
+    # websocket AND REST must traverse the allow-list proxy. discord.py 2.4 honours a
+    # single proxy= kwarg for both (verified in the step-0 spike). Unset → direct.
+    client = discord.Client(intents=intents, proxy=config.EGRESS_PROXY_URL)
 
     @client.event
     async def on_ready():

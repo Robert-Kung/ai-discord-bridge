@@ -11,7 +11,7 @@ import logging
 import os
 from pathlib import Path
 
-from bridge import config
+from bridge import config, egress
 from bridge.approver_ipc import start_approval_server
 from bridge.frontend import make_client, request_discord_approval
 from bridge import runner, state
@@ -34,6 +34,31 @@ async def main():
             f"ENABLE_APPROVER_TIER is set but the approver script is missing: "
             f"{config.APPROVER_SCRIPT}. Refusing to start with a dead approve tier."
         )
+
+    # Egress containment (phase 1): when a proxy is configured, prove the network
+    # posture before anything else — a live direct route (OPEN_EGRESS) or an allow-all
+    # proxy (OPEN_PROXY) is a hard failure (refuse to serve); Anthropic unreachable is
+    # transient (backoff retry, same shape as the settings canary's CANNOT_RUN). When no
+    # proxy is configured (uncontained single-container deploy) this is skipped.
+    if config.EGRESS_PROXY_URL:
+        backoff = config.CANARY_RETRY_BASE
+        while True:
+            status = await egress.run_egress_canary()
+            if status == egress.EGRESS_OK:
+                log.info("egress canary passed: network egress is contained (proxy=%s)",
+                         config.EGRESS_PROXY_URL)
+                break
+            if status in (egress.EGRESS_OPEN, egress.EGRESS_OPEN_PROXY):
+                raise SystemExit(
+                    f"egress canary failed ({status}) — the container's network posture is "
+                    "wrong: a non-allow-listed control host is reachable "
+                    f"({'directly — the internal network still has a route out' if status == egress.EGRESS_OPEN else 'via the proxy — the allow-list is not default-deny'}). "
+                    "Refusing to serve so a bypassed agent can't exfiltrate."
+                )
+            log.error("egress canary: Anthropic unreachable via the proxy (transient / "
+                      "proxy still starting). Retrying in %ds (in-process).", backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, config.CANARY_RETRY_MAX)
 
     # OV1 — prove the --settings deny family is actually in force before serving.
     skip_canary = os.environ.get("BRIDGE_SKIP_CANARY", "").strip().lower() in ("1", "true", "yes", "on")

@@ -50,6 +50,17 @@ if FLUSH_TOKEN_THRESHOLD and RESET_TOKEN_THRESHOLD and RESET_TOKEN_THRESHOLD < F
     FLUSH_TOKEN_THRESHOLD = 0
 PLAN_REACTION_TIMEOUT = int(os.environ.get("PLAN_REACTION_TIMEOUT", "300"))
 
+# ── Egress containment (phase 1) ────────────────────────────────────────
+# When EGRESS_PROXY_URL is set the bridge runs behind a default-deny CONNECT proxy on
+# an internal (routeless) network: the bridge process reaches Discord via discord.py's
+# proxy= kwarg, and `claude -p` reaches Anthropic via HTTPS_PROXY. Unset → no proxy
+# (single-container non-contained deploy; the egress canary is skipped). The startup
+# egress canary proves containment fail-closed before serving. See egress-containment.
+EGRESS_PROXY_URL = os.environ.get("EGRESS_PROXY_URL") or None
+# A host that MUST be unreachable (direct and via the proxy) if containment holds.
+EGRESS_CANARY_CONTROL_HOST = os.environ.get("EGRESS_CANARY_CONTROL_HOST", "example.com")
+ANTHROPIC_API_HOST = "api.anthropic.com"
+
 # Static (env-free) bot identity → config dir. Dedicated MINIMAL config dirs (D4):
 # the bots do NOT run under the operator's own ~/.claude / ~/.claude-b account dirs.
 BOT_CONFIG_DIRS = {"A": "/home/user/.claude-bot-a", "B": "/home/user/.claude-bot-b"}

@@ -176,6 +176,44 @@ returns *"File is in a directory that is denied by your permission settings."* A
 file actually loaded — because claude *silently ignores* a settings file that
 fails validation. If the canary does not trip the deny, the bot fails closed.
 
+### Network egress containment (phase 1) — the primary barrier now
+
+Name-based deny is no longer the *sole* exfil barrier. When `EGRESS_PROXY_URL` is set,
+the bridge runs on a **routeless `internal: true` docker network** and every outbound
+connection must pass a **default-deny CONNECT proxy** (`./egress-proxy`, tinyproxy with a
+hostname allow-list). A bypassed agent that evades the name-based deny and reads a
+credential still has **no route** to send it anywhere off the allow-list. This is proven
+before serving by a **three-probe egress canary** (fail-closed):
+
+1. a direct connect to a non-allow-listed control host **must fail** (the route is gone);
+2. that control host **via the proxy must be denied** (403 — proves the allow-list is
+   *default-deny*, catching an allow-all/empty-ACL proxy that a connectivity-only check
+   would miss);
+3. `api.anthropic.com` via the proxy **must succeed**.
+
+A live direct route or an allow-all proxy → refuse to serve; Anthropic unreachable →
+in-process backoff retry.
+
+**Phase 1 is a scaffold, not credential containment.** The allow-list still contains the
+Discord hosts the bridge process needs (`discord.com`, `cdn.discordapp.com`, `gateway.discord.gg`)
+— and `discord.com` webhooks / CDN uploads are a **usable exfil sink**. So phase 1
+collapses egress from "anywhere" to "Anthropic or Discord", which reduces autonomous /
+injection-driven exfil but does **not** contain the OAuth credential. Real containment is
+**phase 2**: split into a `discord-frontend` container (Discord egress only, bot tokens)
+and an `executor` container (Anthropic egress only, credentials) so each secret lives
+where the *other* secret's egress can't reach. Egress containment also does nothing
+against the **reply channel** itself — a trusted `bypass` user can have the agent print a
+secret into its own Discord reply; that residual is bounded only by §3 (who you grant
+`bypass`), not by the network.
+
+**Operator cutover (do this in order):** before switching the live `docker-compose.yml`
+onto the internal network, **empirically pin the OAuth-refresh host** — run the bridge with
+the proxy and its deny-log on, force a token refresh, and confirm the refresh traverses the
+proxy (add its host to `egress-proxy/filter` if it is not `console.anthropic.com`). A wrong
+allow-list guess passes the startup canary but silently loops on `CANNOT_RUN` hours later
+when the token expires. The `docker-compose.example.yml` shows the full wired topology; the
+proxy's `LogLevel Connect` gives the grep-able deny lines to watch.
+
 **Limits — read these (the honest residual after the preflight gates):**
 
 - **Deny is by command/tool name, and there is no OS sandbox** (§2). A determined
@@ -236,8 +274,12 @@ fails validation. If the canary does not trip the deny, the bot fails closed.
 - **Bare-running loses all filesystem isolation** (§2): without the container,
   `bypass` reaches your whole `$HOME`. Use the bundled container on any host you
   don't fully control.
-- **Network egress is unrestricted:** `bypass` can exfiltrate any mounted data
-  over the network (§2). Mount isolation ≠ network isolation.
+- **Network egress (phase 1: contained to Anthropic + Discord; uncontained if
+  `EGRESS_PROXY_URL` unset).** With the egress proxy on, a bypassed agent can reach only
+  the allow-listed hosts — but Discord is on that list, so `discord.com` webhooks remain a
+  usable exfil sink until phase 2 splits the executor onto Anthropic-only egress (§6). With
+  the proxy off (no internal network), egress is fully unrestricted — mount isolation ≠
+  network isolation.
 - **Temp system-prompt files:** flush writes channel summaries to
   `/tmp/_sysprompt_*.md`. Harmless inside the container; on a shared host under a
   bare run, other host users could read them.
