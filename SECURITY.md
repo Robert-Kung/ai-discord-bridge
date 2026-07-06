@@ -176,9 +176,11 @@ returns *"File is in a directory that is denied by your permission settings."* A
 file actually loaded — because claude *silently ignores* a settings file that
 fails validation. If the canary does not trip the deny, the bot fails closed.
 
-### Network egress containment (phase 1) — the primary barrier now
+### Network egress containment (phase 1) — the primary barrier once enabled
 
-Name-based deny is no longer the *sole* exfil barrier. When `EGRESS_PROXY_URL` is set,
+Name-based deny is no longer the *sole* exfil barrier **once the proxy is enabled**
+(`EGRESS_PROXY_URL` set + the bridge on the routeless internal network). Until that
+operator cutover, the name-based deny is still the only barrier. When `EGRESS_PROXY_URL` is set,
 the bridge runs on a **routeless `internal: true` docker network** and every outbound
 connection must pass a **default-deny CONNECT proxy** (`./egress-proxy`, tinyproxy with a
 hostname allow-list). A bypassed agent that evades the name-based deny and reads a
