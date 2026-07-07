@@ -161,27 +161,38 @@ def _where(cwd: str) -> str:
 
 async def _save_attachments(attachments, dest_dir) -> list[str]:
     """Download up to the count cap of attachments into dest_dir under sanitized basenames,
-    skipping any over the size cap. Returns the saved container paths. Pure of Discord
-    routing (takes the attachment list) so it is unit-testable with fakes."""
+    skipping any over the per-file size cap or the aggregate byte budget. Returns the saved
+    container paths. Pure of Discord routing (takes the attachment list) so it is
+    unit-testable with fakes."""
     saved: list[str] = []
+    total = 0
     for att in attachments[: config.EXEC_ATTACH_MAX_COUNT]:
-        size = getattr(att, "size", 0) or 0
-        if size > config.EXEC_ATTACH_MAX_BYTES:
-            log.info("skipping oversize attachment %r (%d bytes)", getattr(att, "filename", "?"), size)
-            continue
         name = jobs.sanitize_attachment_name(getattr(att, "filename", None))
-        target = Path(dest_dir) / name
-        n = 1
-        while target.exists():  # collision after sanitize/dedupe
-            target = Path(dest_dir) / f"{n}-{name}"
-            n += 1
+        declared = getattr(att, "size", 0) or 0
+        if declared > config.EXEC_ATTACH_MAX_BYTES:
+            log.info("skipping oversize attachment %r (%d bytes declared)", name, declared)
+            continue
         try:
             data = await att.read()
         except Exception as e:  # noqa: BLE001 — one bad attachment must not fail the job
             log.warning("could not read attachment %r: %s", name, e)
             continue
+        # Re-check the REAL payload size (declared size is client-supplied) and the running
+        # aggregate, so a lying size or many mid-size files can't exhaust the volume.
+        if len(data) > config.EXEC_ATTACH_MAX_BYTES:
+            log.warning("skipping attachment %r: real size %d exceeds per-file cap", name, len(data))
+            continue
+        if total + len(data) > config.EXEC_ATTACH_MAX_TOTAL_BYTES:
+            log.warning("attachment budget reached (%d bytes) — skipping the rest", total)
+            break
+        target = Path(dest_dir) / name
+        n = 1
+        while target.exists():  # collision after sanitize → dedupe
+            target = Path(dest_dir) / f"{n}-{name}"
+            n += 1
         try:
             target.write_bytes(data)
+            total += len(data)
             saved.append(str(target))
         except OSError as e:
             log.warning("could not write attachment %r: %s", name, e)
@@ -280,7 +291,14 @@ async def _drive_exec_job(job, message: discord.Message, bot_name: str, prompt: 
                     await _safe_edit(status_msg, _render_job_status(job, where, list(trace)))
 
         upd = asyncio.create_task(_updater())
-        att_paths = await _ingest_attachments(message, job)
+        # Bounded so a slow/stalled download can't pin the project (the proc doesn't exist
+        # yet, so !cancel can't help). Best-effort: timeout → no attachments.
+        try:
+            att_paths = await asyncio.wait_for(
+                _ingest_attachments(message, job), timeout=config.EXEC_ATTACH_TIMEOUT)
+        except asyncio.TimeoutError:
+            log.warning("attachment ingestion timed out for job %s — proceeding without", job.id)
+            att_paths = []
         if att_paths:
             prompt = prompt + _attachment_context(att_paths)
             await channel.send(f"📎 job `{job.id}`：已收 {len(att_paths)} 個附件為 context")
