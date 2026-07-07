@@ -35,11 +35,11 @@
 - [ ] 4.4 Enable Bash for the exec tier only inside the phase-2 executor container (mounts = job worktree + credential); credential/env denies unchanged
 - [ ] 4.5 Tests: milestone inert when phase-2 gate unproven; verify config never sourced from worktree; verify env contains no Discord tokens / API keys; denies still fire with Bash on
 
-## 5. Dual-account evaluator (milestone 5 — optional)
+## 5. Dual-account evaluator (milestone 5 — optional) — DONE
 
-- [ ] 5.1 Before the ✅ prompt, optionally hand the diff to the other bot via `converse()` with a skeptical review prompt; post findings above the diff
-- [ ] 5.2 Advisory only — human ✅ still gates merge; feature-flagged off by default
-- [ ] 5.3 Test: evaluator output is advisory and never auto-merges
+- [x] 5.1 `discuss.evaluate_diff` hands the diff (capped at `_EVAL_DIFF_CAP`, truncation flagged) to the OTHER bot via `converse()` — sessionless, plan-mode cwd = live checkout for Read/Grep context, skeptical + untrusted-data framing; `frontend._post_evaluator_review` posts findings above the diff gate
+- [x] 5.2 Advisory by construction: the evaluator path never touches `pending_actions` or the merge path; any failure (call or post) degrades to a log line and the human gate always follows. Flag `ENABLE_EXEC_EVALUATOR` (config.EVALUATOR_ENABLED, `_CONFIG_GLOBALS`), OFF by default
+- [x] 5.3 Tests (tests/test_evaluator.py): flag default-off/opt-in; other-bot selection both directions; diff + framing in prompt; giant-diff cap; failure/no-other-bot → None; integration (real repo + fake claude): a "merge it" verdict never merges (forbidden `merge_job` trap), findings post before the gate, gate parks on timeout, live tree untouched; flag-off → no converse call; crashing evaluator never blocks the gate
 
 ## 6. Wrap-up
 
