@@ -224,6 +224,32 @@ def recover_jobs() -> list[Job]:
     return awaiting
 
 
+def gc_job_state(keep_ids: "set[str]") -> int:
+    """Remove on-disk job state (the `<id>.json` mirror and the `<id>/` dir holding
+    attachments + diff.patch) for every job NOT in keep_ids. Called at startup with the
+    awaiting-review ids so their branch, diff, and attachments survive; everything else
+    (done/failed/cancelled/orphaned) is cleaned up — otherwise user-uploaded content
+    accumulates forever on the mounted volume."""
+    import shutil
+    removed = 0
+    d = _jobs_dir()
+    for p in list(d.iterdir()):
+        jid = p.stem if (p.is_file() and p.suffix == ".json") else p.name
+        if jid in keep_ids:
+            continue
+        try:
+            if p.is_dir():
+                shutil.rmtree(p)
+            else:
+                p.unlink()
+            removed += 1
+        except OSError as e:
+            log.warning("could not GC job state %s: %s", p.name, e)
+    if removed:
+        log.info("GC: removed %d stale job-state entr(ies)", removed)
+    return removed
+
+
 def awaiting_review_ids_by_project() -> dict[str, set[str]]:
     """project → {job ids awaiting review}, for startup GC's keep-set."""
     out: dict[str, set[str]] = {}

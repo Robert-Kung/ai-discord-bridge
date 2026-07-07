@@ -35,6 +35,9 @@ async def main():
             await worktree.gc_project(_project, _keep.get(_project, set()))
         except Exception:
             log.exception("startup GC failed for %s", _project)
+    # Clean up on-disk job state (mirrors + attachment/diff dirs) for finished jobs,
+    # keeping only the awaiting-review ones — else uploaded content accumulates forever.
+    jobs.gc_job_state({jid for ids in _keep.values() for jid in ids})
 
     # Fail-closed startup assertion: a dead approve tier (script missing) would only
     # surface the first time someone uses `!mode approve`; the default-mode canary
