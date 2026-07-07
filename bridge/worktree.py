@@ -96,15 +96,25 @@ async def job_diff(project: str, base: str, job_id: str) -> tuple[str, str]:
     return stat, full
 
 
-async def merge_job(project: str, job_id: str) -> tuple[str, str]:
+async def merge_job(project: str, job_id: str, base: str) -> tuple[str, str]:
     """Merge bridge/<id> into the project's current branch. Returns (result, detail) where
-    result is 'merged' | 'dirty' | 'conflict' | 'error'. NEVER forces. On conflict it aborts
-    (leaving no conflict markers in the live tree) and keeps the branch for manual merge."""
+    result is 'merged' | 'dirty' | 'diverged' | 'conflict' | 'error'. NEVER forces. On
+    conflict it aborts (no markers left in the live tree) and keeps the branch.
+
+    The `base` (the commit the worktree branched from) MUST still be an ancestor of the
+    current HEAD. Otherwise the operator has switched to a divergent branch, and merging
+    `bridge/<id>` — which carries the *original* branch's history — would pull in commits
+    the operator never reviewed. That is a 'diverged' refusal (the diff gate's promise is
+    "what you reviewed is what merges")."""
     rc, porcelain, err = await _git(project, "status", "--porcelain")
     if rc != 0:
         return ("error", err.strip())
     if porcelain.strip():
         return ("dirty", "live checkout has uncommitted changes")
+    rc, _, _ = await _git(project, "merge-base", "--is-ancestor", base, "HEAD")
+    if rc != 0:
+        return ("diverged", f"base {base[:8]} is not an ancestor of the current HEAD "
+                            "(the live branch has diverged since the job started)")
     branch = branch_name(job_id)
     rc, out, err = await _git(project, "merge", "--no-ff", "-m", f"Merge bridge job {job_id}", branch)
     if rc == 0:

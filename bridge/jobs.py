@@ -30,9 +30,11 @@ TIMEOUT = "timeout"
 CANCELLED = "cancelled"
 ORPHANED = "orphaned"          # process gone after a restart — cannot be resumed
 AWAITING_REVIEW = "awaiting_review"  # M2: committed to bridge/<id>, parked for !merge/!discard
-# Statuses whose bridge/<id> branch must survive startup GC.
+MERGING = "merging"            # M2: claimed for a merge — blocks a concurrent merge/discard
 _LIVE = {RUNNING}
-_KEEP_BRANCH = {RUNNING, AWAITING_REVIEW}
+# Statuses that occupy a project (block a new job) or must survive startup GC.
+_OCCUPY = {RUNNING, AWAITING_REVIEW, MERGING}
+_KEEP_BRANCH = {RUNNING, AWAITING_REVIEW, MERGING}
 
 
 @dataclass
@@ -144,11 +146,10 @@ def running_for_project(project: str) -> int:
 
 
 def project_occupied(project: str) -> bool:
-    """True if the project has a RUNNING job or one AWAITING_REVIEW (an unmerged branch).
-    The cap: never start a second job while either holds the project, so a new job can't
-    branch from an un-reviewed HEAD (the approved-diff-vs-moved-base TOCTOU)."""
-    return any(j.project == project and j.status in (RUNNING, AWAITING_REVIEW)
-               for j in _registry.values())
+    """True if the project has a job RUNNING, AWAITING_REVIEW, or MERGING (an unmerged
+    branch). The cap: never start a second job while any holds the project, so a new job
+    can't branch from an un-reviewed HEAD (the approved-diff-vs-moved-base TOCTOU)."""
+    return any(j.project == project and j.status in _OCCUPY for j in _registry.values())
 
 
 def list_jobs() -> list[Job]:
@@ -187,7 +188,11 @@ def recover_jobs() -> list[Job]:
                 orphaned += 1
             except OSError:
                 pass
-        elif status == AWAITING_REVIEW:
+        elif status in (AWAITING_REVIEW, MERGING):
+            # a job interrupted mid-merge reloads as awaiting-review: its branch survives
+            # and a retry !merge hits the clean-tree precondition (safe if the merge
+            # half-applied), so the operator can re-merge or discard.
+            data["status"] = AWAITING_REVIEW
             job = Job.from_dict(data)
             _registry[job.id] = job
             awaiting.append(job)
