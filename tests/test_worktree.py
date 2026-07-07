@@ -68,7 +68,7 @@ def test_merge_clean_applies_to_live(project):
         wt, branch, base = await worktree.create_job_worktree(project, "m1")
         Path(wt, "a.txt").write_text("hello\nmerged\n")
         await worktree.commit_job(wt, "m1", "edit", base)
-        result, _ = await worktree.merge_job(project, "m1")
+        result, _ = await worktree.merge_job(project, "m1", base)
         assert result == "merged"
         assert Path(project, "a.txt").read_text() == "hello\nmerged\n"
     asyncio.run(go())
@@ -82,7 +82,7 @@ def test_merge_refuses_dirty_live_tree(project):
         await worktree.commit_job(wt, "m2", "edit", base)
         # operator has uncommitted work in the live tree
         Path(project, "a.txt").write_text("hello\nlocal-uncommitted\n")
-        result, _ = await worktree.merge_job(project, "m2")
+        result, _ = await worktree.merge_job(project, "m2", base)
         assert result == "dirty"
         # live tree untouched by the refused merge
         assert Path(project, "a.txt").read_text() == "hello\nlocal-uncommitted\n"
@@ -98,13 +98,37 @@ def test_merge_conflict_aborts_and_keeps_branch(project):
         # live branch advances with a conflicting change, committed
         Path(project, "a.txt").write_text("hello\nlive-line\n")
         _run(project, "git", "commit", "-aqm", "live change")
-        result, detail = await worktree.merge_job(project, "m3")
+        result, detail = await worktree.merge_job(project, "m3", base)
         assert result == "conflict"
         # merge aborted → no conflict markers, live content preserved
         assert Path(project, "a.txt").read_text() == "hello\nlive-line\n"
         assert "<<<<<<<" not in Path(project, "a.txt").read_text()
         # branch survives for manual merge
         assert "m3" in await worktree.list_bridge_branches(project)
+    asyncio.run(go())
+
+
+def test_merge_refuses_diverged_branch(project):
+    # HIGH-finding guard: if the operator switches to a branch that doesn't contain the
+    # job's base, merging bridge/<id> would drag in unreviewed history → must refuse.
+    async def go():
+        from pathlib import Path
+        wt, branch, base = await worktree.create_job_worktree(project, "dv")
+        Path(wt, "a.txt").write_text("hello\njobedit\n")
+        await worktree.commit_job(wt, "dv", "edit", base)
+        # create a divergent branch from BEFORE base and advance main past base
+        _run(project, "git", "checkout", "-q", "-b", "feature", "HEAD~0")
+        _run(project, "git", "checkout", "-q", "--orphan", "sidetrack")
+        _run(project, "git", "rm", "-rfq", ".")
+        (Path(project) / "z.txt").write_text("side\n")
+        _run(project, "git", "add", "-A")
+        _run(project, "git", "commit", "-qm", "sidetrack root")
+        # HEAD (sidetrack) does not contain base → diverged
+        result, detail = await worktree.merge_job(project, "dv", base)
+        assert result == "diverged"
+        # live tree untouched (still the sidetrack content, no jobedit)
+        assert not (Path(project) / "a.txt").exists() or "jobedit" not in (Path(project) / "a.txt").read_text()
+        assert "dv" in await worktree.list_bridge_branches(project)
     asyncio.run(go())
 
 

@@ -199,6 +199,7 @@ async def _drive_exec_job(job, message: discord.Message, bot_name: str, prompt: 
     upd = None
     use_worktree = worktree.is_git_repo(cwd)
     workdir = cwd
+    committed = False  # set once the job's changes are committed to bridge/<id>
     try:
         try:
             status_msg = await channel.send(
@@ -283,6 +284,7 @@ async def _drive_exec_job(job, message: discord.Message, bot_name: str, prompt: 
             await channel.send(f"（job `{job.id}`：agent 未變更任何檔案，無 diff 可審）")
             await worktree.discard_job(cwd, job.id)
             return
+        committed = True  # branch now holds real work — never auto-discard it below
         stat, full = await worktree.job_diff(cwd, job.base, job.id)
         jobs.save_diff(job, full)
         await _post_diff_gate(job, channel, stat, full)
@@ -296,28 +298,54 @@ async def _drive_exec_job(job, message: discord.Message, bot_name: str, prompt: 
             except Exception:
                 pass
         if job.status == jobs.RUNNING:
-            jobs.set_status(job, jobs.FAILED)
-            if status_msg is not None:
-                await _safe_edit(status_msg, f"❌ **[job `{job.id}`]** 內部錯誤（已結束）")
-            if use_worktree:
-                try:
-                    await worktree.discard_job(cwd, job.id)
-                except Exception:
-                    pass
+            if committed:
+                # a transient failure (e.g. posting the diff) after the branch was
+                # committed → PARK the finished work, never auto-delete it.
+                jobs.set_status(job, jobs.AWAITING_REVIEW)
+                if use_worktree:
+                    try:
+                        await worktree.remove_worktree(cwd, job.id)
+                    except Exception:
+                        pass
+                if status_msg is not None:
+                    await _safe_edit(status_msg,
+                                     f"⚠️ **[job `{job.id}`]** 貼 diff 時出錯，已保留待審"
+                                     f"（`!merge {job.id}` / `!discard {job.id}`）")
+            else:
+                jobs.set_status(job, jobs.FAILED)
+                if status_msg is not None:
+                    await _safe_edit(status_msg, f"❌ **[job `{job.id}`]** 內部錯誤（已結束）")
+                if use_worktree:
+                    try:
+                        await worktree.discard_job(cwd, job.id)
+                    except Exception:
+                        pass
 
 
 async def _post_diff_gate(job, channel, stat: str, full: str) -> None:
     """Post the job's diff for ✅/❌ review and resolve it: ✅ merge, ❌ discard, timeout
     park as awaiting-review (branch + persisted diff survive for !merge/!discard)."""
     base8 = (job.base or "")[:8]
+    stat_shown = stat.strip()
+    stat_trunc = "" if len(stat_shown) <= 1500 else (
+        f"\n⚠️ **diffstat 已截斷（{len(stat_shown) - 1500} 字元未顯示）——完整檔案清單見附件/分支**")
     header = (f"🔍 **[job `{job.id}` diff · base `{base8}`]** "
               f"✅ 合併到 live / ❌ 丟棄（{config.PLAN_REACTION_TIMEOUT}s，逾時＝保留待審）\n"
-              f"```\n{stat.strip()[:1500]}\n```")
+              f"```\n{stat_shown[:1500]}\n```{stat_trunc}")
+    full_bytes = full.encode("utf-8")
     if len(full) <= 1500:
         msg = await channel.send(f"{header}\n```diff\n{full}\n```")
+    elif len(full_bytes) <= 8_000_000:
+        msg = await channel.send(header, file=discord.File(io.BytesIO(full_bytes),
+                                                           filename=f"job-{job.id}.diff.txt"))
     else:
-        data = io.BytesIO(full.encode("utf-8")[:8_000_000])
-        msg = await channel.send(header, file=discord.File(data, filename=f"job-{job.id}.diff.txt"))
+        # oversized diff: attach the truncated head and WARN — merging applies the full
+        # branch, so unseen hunks past the cutoff would otherwise merge silently.
+        warn = (f"\n⚠️ **diff 超過 8 MB，附件只含前段——**後面的變更**你看不到但 ✅ 會一起合併**。"
+                f"不確定就 ❌ / `!discard`，或 `git diff {base8}..bridge/{job.id}` 全看。")
+        msg = await channel.send(
+            header + warn,
+            file=discord.File(io.BytesIO(full_bytes[:8_000_000]), filename=f"job-{job.id}.diff.txt"))
     await msg.add_reaction("✅")
     await msg.add_reaction("❌")
     fut: asyncio.Future = asyncio.get_event_loop().create_future()
@@ -341,26 +369,36 @@ async def _post_diff_gate(job, channel, stat: str, full: str) -> None:
 
 async def _do_merge(job, channel) -> None:
     """Merge protocol (task 2.4): under the project lock; clean-live-tree precondition;
-    never force; abort on conflict. On success the branch + worktree are removed."""
+    base must still be an ancestor of HEAD; never force; abort on conflict. On success the
+    branch + worktree are removed. Claims the job synchronously (→ MERGING) so a concurrent
+    ✅ reaction + `!merge`/`!discard` cannot double-resolve it."""
+    if job.status not in (jobs.RUNNING, jobs.AWAITING_REVIEW):
+        return  # already resolved or being merged by another handler
+    jobs.set_status(job, jobs.MERGING)  # synchronous claim (no await before this)
     async with state.cwd_locks[job.project]:
-        result, detail = await worktree.merge_job(job.project, job.id)
+        result, detail = await worktree.merge_job(job.project, job.id, job.base or "")
     if result == "merged":
         jobs.set_status(job, jobs.DONE)
         await worktree.remove_worktree(job.project, job.id)
         await worktree.delete_branch(job.project, job.id)
         await channel.send(f"✅ job `{job.id}` 已合併進 live branch")
-    elif result == "dirty":
-        jobs.set_status(job, jobs.AWAITING_REVIEW)
+        return
+    # any non-merge outcome re-parks for a retry !merge / !discard
+    jobs.set_status(job, jobs.AWAITING_REVIEW)
+    if result == "dirty":
         await channel.send(
             f"⚠️ live checkout 有未 commit 的變更，拒絕合併 job `{job.id}`（不冒險動你的樹）。"
             f"先 commit/stash，再 `!merge {job.id}`；分支 `bridge/{job.id}` 保留。")
+    elif result == "diverged":
+        await channel.send(
+            f"⚠️ job `{job.id}` 的 base 已不是目前 HEAD 的祖先——你在任務開始後切換/改寫了分支。"
+            f"直接合併會把你沒審過的歷史一起帶進來，已拒絕。手動：`git merge bridge/{job.id}`"
+            f"（自行確認），或 `!discard {job.id}`。")
     elif result == "conflict":
-        jobs.set_status(job, jobs.AWAITING_REVIEW)
         await channel.send(
             f"⚠️ job `{job.id}` 合併衝突，已 `merge --abort`（live tree 未留衝突標記）。"
             f"手動：`git merge bridge/{job.id}`，或 `!discard {job.id}` 放棄。")
     else:
-        jobs.set_status(job, jobs.AWAITING_REVIEW)
         await channel.send(f"❌ job `{job.id}` 合併失敗：{detail[:300]}（分支保留，可 `!discard`）")
 
 
@@ -611,7 +649,7 @@ def make_client(bot_name: str) -> discord.Client:
                     if job is None or job.status != jobs.AWAITING_REVIEW:
                         await message.channel.send(f"找不到待審 job `{jid}`（`!jobs` 查看）")
                         return
-                    jobs.set_status(job, jobs.DONE)
+                    jobs.set_status(job, jobs.DONE)  # claim synchronously → blocks a racing !merge
                     await worktree.discard_job(job.project, job.id)
                     await message.channel.send(f"🗑️ job `{jid}` 已丟棄（分支已刪）")
                     return
