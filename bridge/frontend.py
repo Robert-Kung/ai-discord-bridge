@@ -361,6 +361,8 @@ async def _drive_exec_job(job, message: discord.Message, bot_name: str, prompt: 
         committed = True  # branch now holds real work — never auto-discard it below
         stat, full = await worktree.job_diff(cwd, job.base, job.id)
         jobs.save_diff(job, full)
+        if config.EVALUATOR_ENABLED:
+            await _post_evaluator_review(job, channel, bot_name, stat, full)
         await _post_diff_gate(job, channel, stat, full)
     except Exception:  # noqa: BLE001 — a job crash must never take down the bot
         log.exception("exec-job %s crashed", job.id)
@@ -394,6 +396,25 @@ async def _drive_exec_job(job, message: discord.Message, bot_name: str, prompt: 
                         await worktree.discard_job(cwd, job.id)
                     except Exception:
                         pass
+
+
+async def _post_evaluator_review(job, channel, author_bot: str, stat: str, full: str) -> None:
+    """M5 cross-review: post the other bot's skeptical take ABOVE the diff gate.
+    Advisory by construction — this function never touches pending_actions or the merge
+    path, and ANY failure (evaluator call or Discord post) degrades to a log line so the
+    human gate always follows."""
+    try:
+        note = await channel.send(f"🧐 job `{job.id}`：交叉審查中（advisory，不影響 ✅/❌）…")
+        res = await discuss.evaluate_diff(author_bot, job.project, job.id, job.base, stat, full)
+        if res is None:
+            await _safe_edit(note, f"⚠️ job `{job.id}`：交叉審查不可用——請自行審 diff")
+            return
+        evaluator, findings = res
+        header = f"🧐 **[job `{job.id}` 交叉審查 · Bot-{evaluator}（advisory，僅供參考）]**"
+        for c in chunk_message(f"{header}\n{findings}"):
+            await channel.send(c)
+    except Exception:  # noqa: BLE001 — the evaluator must never block the human gate
+        log.exception("evaluator review failed for job %s — proceeding to the diff gate", job.id)
 
 
 async def _post_diff_gate(job, channel, stat: str, full: str) -> None:
