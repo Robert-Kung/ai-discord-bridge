@@ -35,6 +35,9 @@ EXEC_TIMEOUT = int(os.environ.get("EXEC_TIMEOUT", "1800"))
 # Status-message edit throttle (s) and the rolling tool-use trace depth.
 EXEC_STATUS_EDIT_INTERVAL = float(os.environ.get("EXEC_STATUS_EDIT_INTERVAL", "2.0"))
 EXEC_TRACE_LINES = int(os.environ.get("EXEC_TRACE_LINES", "12"))
+# Attachment ingestion (M3): per-message count cap and per-file size cap (bytes).
+EXEC_ATTACH_MAX_COUNT = int(os.environ.get("EXEC_ATTACH_MAX_COUNT", "5"))
+EXEC_ATTACH_MAX_BYTES = int(os.environ.get("EXEC_ATTACH_MAX_BYTES", str(10 * 1024 * 1024)))
 AUTO_FLUSH_THRESHOLD = int(os.environ.get("AUTO_FLUSH_THRESHOLD", "20"))
 # Startup-canary retry backoff (s) for the "claude can't run / not logged in" case.
 # We wait-and-retry IN-PROCESS instead of letting a SystemExit hand docker a tight
