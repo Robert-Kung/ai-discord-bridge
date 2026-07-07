@@ -7,6 +7,7 @@ memory — callers here build the system-prompt file and hand runner the path.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from pathlib import Path
 
@@ -32,14 +33,45 @@ def latest_summary_path(channel_id: int, cwd: str | None = None) -> Path | None:
     return p if p.exists() else None
 
 
-def save_summary(channel_id: int, content: str, cwd: str | None = None) -> Path:
+_FRONTMATTER_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*:\s")
+
+
+def _strip_frontmatter(text: str) -> str:
+    """Return the summary body without a leading YAML frontmatter block (if any). Tolerant
+    of summaries written before lineage existed (no frontmatter → returned unchanged), and
+    of a body that merely OPENS with a `---` line (markdown rule / fenced block): only a
+    block whose first inner line is a real `key: value` is treated as frontmatter, so prose
+    is never mangled."""
+    if text.startswith("---\n"):
+        end = text.find("\n---\n", 4)
+        if end != -1 and _FRONTMATTER_KEY.match(text[4:end].split("\n", 1)[0]):
+            return text[end + 5:]
+    return text
+
+
+def save_summary(channel_id: int, content: str, cwd: str | None = None,
+                 parent_session_id: str | None = None) -> Path:
+    """Write a mid-term summary. When the caller knows the Claude session id this summary
+    condensed (a session reset/flush), it is stamped into YAML frontmatter so the lossy
+    summary keeps a pointer back to the full transcript — best-effort, operator-side
+    tracing (the transcripts live under deny-listed bot config dirs). Omitted (no
+    placeholder) when unknown."""
     cwd = config.DEFAULT_CWD if cwd is None else cwd
     d = channel_summary_dir(channel_id, cwd)
     ts = time.strftime("%Y%m%d-%H%M%S")
+    if parent_session_id:
+        text = (f"---\nparent_session_id: {parent_session_id}\ncwd: {cwd}\nts: {ts}\n---\n"
+                + content)
+    else:
+        text = content
     target = d / f"{ts}.md"
-    target.write_text(content)
+    n = 1
+    while target.exists():  # same-second flushes must not clobber an older archived summary
+        target = d / f"{ts}-{n}.md"
+        n += 1
+    target.write_text(text)
     latest = d / "latest.md"
-    latest.write_text(content)  # plain copy avoids bind-mount symlink quirks
+    latest.write_text(text)  # plain copy avoids bind-mount symlink quirks
     return target
 
 
@@ -81,11 +113,21 @@ def build_combined_system_prompt(channel_id: int, cwd: str, bot_name: str) -> Pa
     parts: list[str] = []
     latest = latest_summary_path(channel_id, cwd)
     if latest:
-        parts.append("# 對話摘要（中期記憶）\n\n" + latest.read_text())
+        parts.append("# 對話摘要（中期記憶）\n\n" + _strip_frontmatter(latest.read_text()))
     if cwd != config.DEFAULT_CWD:
         notes = project_notes_path(cwd)
         if notes.exists():
             parts.append(f"# 專案筆記（{Path(cwd).name}）\n\n" + notes.read_text())
+    # Cross-session recall (downsized): when older summaries exist beyond the latest one,
+    # point the agent at the on-disk tree and tell it to search on demand. The conversation
+    # layer runs plan mode (Read/Grep available) and this dir is mounted, so the agent does
+    # its own LLM-driven retrieval — no bridge-side rg pipeline, cost only when it looks.
+    sdir = channel_summary_dir(channel_id, cwd)
+    if len(list(sdir.glob("2*.md"))) >= 2:  # ≥2 timestamped files ⇒ history older than latest
+        parts.append(
+            "# 歷史摘要（跨 session）\n\n"
+            f"更早的頻道摘要存在 `{sdir}`（一檔一次 flush，檔名含時間戳；上方「對話摘要」已是最新一份）。"
+            "當使用者提到更早的決定/討論、而上方摘要沒涵蓋時，先用 Grep/Read 搜尋這個目錄再回答。")
     if not parts:
         return None
     tmp = Path("/tmp") / f"_sysprompt_{channel_id}_{bot_name}.md"
@@ -248,7 +290,8 @@ async def flush_session_then_reset(channel, bot_name: str, cwd: str) -> bool:
     reply, ok = await runner.converse(bot_name, prompt, use_session=True, cwd=cwd)
     if not ok:
         return False
-    save_summary(channel.id, reply, cwd)
+    # `sid` is the session this summary condensed — stamp it as lineage BEFORE clearing.
+    save_summary(channel.id, reply, cwd, parent_session_id=sid)
     sessions.clear_session(bot_name, cwd)
     return True
 
