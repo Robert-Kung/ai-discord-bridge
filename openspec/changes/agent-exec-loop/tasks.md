@@ -21,11 +21,11 @@
 - [x] 2.6 Startup GC (`bot.main`): `git worktree prune` + remove bridge/<id> branches/worktrees for jobs not awaiting review; non-git dirs fall back to the M1 direct-on-live path (no worktree)
 - [x] 2.7 Tests (tests/test_worktree.py, real repos): live tree untouched; commit→diff→merge; dirty-tree refusal; conflict aborts cleanly (no markers); discard cleanup; GC keeps awaiting/removes stale. Plus jobs reload-awaiting test + a fake-claude M2 integration harness (isolation + project identity + merge-to-live)
 
-## 3. Attachment ingestion (milestone 3)
+## 3. Attachment ingestion (milestone 3) — DONE
 
-- [ ] 3.1 Download whitelisted-user attachments: sanitized basename only, `attachment.size` cap checked before download, per-message count cap, stored in `discord-state/jobs/<id>/attachments/` (outside the worktree — can never shadow repo files or enter the diff)
-- [ ] 3.2 Inject paths as delimited untrusted context
-- [ ] 3.3 Tests: whitelist-only; traversal-name neutralized; size/count caps; storage outside worktree
+- [x] 3.1 Whitelisted-user attachments downloaded via `_save_attachments`: `sanitize_attachment_name` strips path components (`../`, absolute, leading dot) → safe basename; `attachment.size` checked against `EXEC_ATTACH_MAX_BYTES` before read; `EXEC_ATTACH_MAX_COUNT` slice; stored in `discord-state/jobs/<id>/attachments/` (outside the worktree — can't shadow repo files or enter the diff); collisions deduped
+- [x] 3.2 Paths injected into the exec prompt via `_attachment_context` — delimited, explicitly framed as untrusted DATA not instructions
+- [x] 3.3 Tests (tests/test_attachments.py): traversal/absolute/hidden-name neutralized; size + count caps; count-slice-then-size ordering; dedupe; dir outside any worktree; whitelist-only; untrusted framing
 
 ## 4. Verification + Bash relaxation (milestone 4 — gated on egress-exec-isolation PHASE 2)
 

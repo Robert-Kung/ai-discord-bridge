@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import secrets
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from bridge import config, runner
 
@@ -125,6 +127,25 @@ def _job_dir(job_id: str):
     d = _jobs_dir() / job_id
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def attachments_dir(job_id: str):
+    """Where a job's ingested attachments live — under discord-state/jobs/<id>, OUTSIDE
+    the git worktree, so an attachment can never shadow a repo file or enter the diff."""
+    d = _job_dir(job_id) / "attachments"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def sanitize_attachment_name(filename: "str | None") -> str:
+    """Reduce a user-supplied attachment filename to a safe basename: strip ALL path
+    components (defeats `../` traversal and absolute paths), drop leading dots (no hidden
+    files), allow only [A-Za-z0-9._-], cap length. Never returns an empty string."""
+    base = Path(filename or "").name       # strips dirs incl. ../ and /abs/paths
+    base = base.lstrip(".")                 # no leading-dot hidden/dotfile
+    base = re.sub(r"[^A-Za-z0-9._-]", "_", base)
+    base = base[:100]
+    return base or "attachment"
 
 
 def save_diff(job: Job, diff: str) -> None:
