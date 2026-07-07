@@ -30,6 +30,30 @@ def test_no_frontmatter_when_sid_unknown():
     assert memory._strip_frontmatter(text) == "plain body"
 
 
+def test_strip_only_removes_real_frontmatter_not_a_leading_rule():
+    # a body that merely OPENS with a --- line + has a later --- must NOT be stripped
+    body = "---\n這是內文不是 frontmatter\n---\n更多內文"
+    assert memory._strip_frontmatter(body) == body
+    # empty + no-closing-fence are safe no-ops
+    assert memory._strip_frontmatter("") == ""
+    assert memory._strip_frontmatter("---\nkey: v\nno closing fence") == "---\nkey: v\nno closing fence"
+    # a genuine frontmatter block IS stripped
+    assert memory._strip_frontmatter("---\nparent_session_id: s\n---\nbody") == "body"
+
+
+def test_same_second_flushes_do_not_clobber(monkeypatch):
+    # recall relies on historical summaries accumulating — two flushes in the same wall
+    # second must produce two distinct archive files, not overwrite.
+    monkeypatch.setattr(memory.time, "strftime", lambda fmt: "20260707-120000")
+    p1 = memory.save_summary(9, "first summary")
+    p2 = memory.save_summary(9, "second summary")
+    assert p1 != p2
+    assert p1.read_text() == "first summary" and p2.read_text() == "second summary"
+    # both archived + the pointer now sees ≥2 files
+    d = memory.channel_summary_dir(9, config.DEFAULT_CWD)
+    assert len(list(d.glob("2*.md"))) == 2
+
+
 def test_injected_latest_summary_carries_no_frontmatter():
     memory.save_summary(1, "decided X", parent_session_id="sess-1")
     prompt_file = memory.build_combined_system_prompt(1, config.DEFAULT_CWD, "A")

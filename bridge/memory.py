@@ -7,6 +7,7 @@ memory — callers here build the system-prompt file and hand runner the path.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from pathlib import Path
 
@@ -32,12 +33,18 @@ def latest_summary_path(channel_id: int, cwd: str | None = None) -> Path | None:
     return p if p.exists() else None
 
 
+_FRONTMATTER_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*:\s")
+
+
 def _strip_frontmatter(text: str) -> str:
     """Return the summary body without a leading YAML frontmatter block (if any). Tolerant
-    of summaries written before lineage existed (no frontmatter → returned unchanged)."""
+    of summaries written before lineage existed (no frontmatter → returned unchanged), and
+    of a body that merely OPENS with a `---` line (markdown rule / fenced block): only a
+    block whose first inner line is a real `key: value` is treated as frontmatter, so prose
+    is never mangled."""
     if text.startswith("---\n"):
         end = text.find("\n---\n", 4)
-        if end != -1:
+        if end != -1 and _FRONTMATTER_KEY.match(text[4:end].split("\n", 1)[0]):
             return text[end + 5:]
     return text
 
@@ -58,6 +65,10 @@ def save_summary(channel_id: int, content: str, cwd: str | None = None,
     else:
         text = content
     target = d / f"{ts}.md"
+    n = 1
+    while target.exists():  # same-second flushes must not clobber an older archived summary
+        target = d / f"{ts}-{n}.md"
+        n += 1
     target.write_text(text)
     latest = d / "latest.md"
     latest.write_text(text)  # plain copy avoids bind-mount symlink quirks
