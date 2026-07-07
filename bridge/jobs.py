@@ -1,9 +1,11 @@
 """Background execution-job registry (agent-exec-loop M1).
 
-An in-memory registry plus a JSON mirror under `discord-state/jobs/` so `!jobs` history
-and restart recovery survive a container restart. A job tracks one execution-tier task:
-its id, bot, project (cwd), Discord channel/status-message, status, and — while running —
-the subprocess (for cancellation). The subprocess itself is NOT persisted.
+An in-memory registry plus a JSON mirror under `discord-state/jobs/`. `!jobs` and
+`!cancel` operate on the in-memory registry (live jobs only); the mirror exists for
+restart recovery (`recover_orphans`) and post-mortem inspection, not for `!jobs` history.
+A job tracks one execution-tier task: its id, bot, project (cwd), Discord
+channel/status-message, status, and — while running — the subprocess (for cancellation).
+The subprocess itself is NOT persisted.
 
 M1 scope: jobs run on the live checkout (the git worktree + diff gate is M2). Restart
 recovery here only marks orphaned running jobs; re-posting awaiting-review diffs is M2.

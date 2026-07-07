@@ -366,6 +366,12 @@ async def kill_process_group(proc: "asyncio.subprocess.Process", grace: float = 
         pass
 
 
+# stdout StreamReader buffer: a single tool_use / tool_result JSONL line can be large
+# (the agent writing a whole file). asyncio's 64 KB default would raise on such a line
+# and orphan the subprocess; give it real headroom.
+_STREAM_LIMIT = 16 * 1024 * 1024
+
+
 async def run_streaming_exec(
     bot_name: str,
     prompt: str,
@@ -375,6 +381,7 @@ async def run_streaming_exec(
     system_prompt_file: "str | Path | None" = None,
     on_trace: "Callable[[str], None] | None" = None,
     on_proc: "Callable[[asyncio.subprocess.Process], None] | None" = None,
+    should_abort: "Callable[[], bool] | None" = None,
     timeout: "int | None" = None,
 ) -> tuple["str | None", str]:
     """Run an execution-tier task as a streaming subprocess. Returns (reply, outcome)
@@ -382,9 +389,11 @@ async def run_streaming_exec(
 
     `on_trace(line)` is called (sync, best-effort) for each tool-use action for the live
     status trace; `on_proc(proc)` is called once the subprocess exists so the caller can
-    register it for cancellation. The subprocess is spawned in its own session so a cancel
-    or timeout kills the whole process group. Serialized per-cwd (never per-bot) so a long
-    job does not stall the bot's conversation calls elsewhere."""
+    register it for cancellation. `should_abort()` is checked right after spawn — if it
+    returns True (a cancel landed while we were blocked on cwd_locks, before the proc
+    existed to kill) the just-spawned process group is killed immediately. The subprocess
+    is spawned in its own session so a cancel or timeout kills the whole group. Serialized
+    per-cwd (never per-bot) so a long job does not stall conversation calls elsewhere."""
     if mode not in _EXEC_MODES:
         raise ValueError(f"run_streaming_exec requires an execution mode, got {mode!r}")
     timeout = config.EXEC_TIMEOUT if timeout is None else timeout
@@ -405,9 +414,15 @@ async def run_streaming_exec(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
+            limit=_STREAM_LIMIT,
         )
         if on_proc:
             on_proc(proc)
+        # A cancel may have arrived while we were blocked on cwd_locks (proc did not yet
+        # exist to kill). Honour it now, deterministically, before doing any work.
+        if should_abort and should_abort():
+            await kill_process_group(proc)
+            return (None, EXEC_FAILED)
         try:
             proc.stdin.write(prompt.encode())
             await proc.stdin.drain()
@@ -424,15 +439,26 @@ async def run_streaming_exec(
                         continue
                     if is_result_event(event):
                         final = event
-                    elif on_trace:
+                        break  # result is terminal — don't wait on a lingering process
+                    if on_trace:
                         line = stream_trace_line(event)
                         if line:
                             on_trace(line)
-                await proc.wait()
+                # give a cleanly-finishing process a bounded moment to exit
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    await kill_process_group(proc)
         except asyncio.TimeoutError:
             log.error("[%s] exec-job timeout after %ds — killing process group", bot_name, timeout)
             await kill_process_group(proc)
             return (None, EXEC_TIMEOUT)
+        except (ValueError, asyncio.LimitOverrunError):
+            # an over-limit stdout line (shouldn't happen given _STREAM_LIMIT, but never
+            # leave the subprocess running on the live tree if it does)
+            log.error("[%s] exec-job stream read error — killing process group", bot_name)
+            await kill_process_group(proc)
+            return (None, EXEC_FAILED)
 
     if final is None:
         # cancelled (killed mid-stream) or the process died without a result event
