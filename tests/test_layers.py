@@ -37,18 +37,19 @@ def _capture_call_claude(monkeypatch):
     return seen
 
 
-# ── subprocess launch + argv assembly confined to the runner, package-wide ──
-def test_subprocess_launch_and_arg_assembly_confined_to_runner():
-    # One argv assembler (build_claude_args). The `claude -p` subprocess may be launched
-    # in more than one place inside the runner (the json chokepoint + the streaming exec
-    # job), but NEVER outside it, and the argv literal lives only in the assembler.
-    assert _ALL_SRC.count("def build_claude_args(") == 1, "argv must be assembled in one place"
-    assert "create_subprocess_exec(" in RUNNER_SRC
+# ── claude invocation + argv assembly confined to the runner, package-wide ──
+def test_claude_invocation_confined_to_runner():
+    # The chokepoint invariant is about the CLAUDE subprocess: its argv is assembled once
+    # (build_claude_args) and the `claude -p` literal + the assembler live only in the
+    # runner. (Other modules may spawn non-claude subprocesses — worktree runs `git` —
+    # so a raw create_subprocess_exec count is not the invariant; the claude argv is.)
+    assert _ALL_SRC.count("def build_claude_args(") == 1, "claude argv must be assembled in one place"
+    assert '"claude", "-p"' in RUNNER_SRC
     for name, src in _SOURCES.items():
         if name == "runner.py":
             continue
-        assert "create_subprocess_exec(" not in src, f"{name} launches a claude subprocess"
         assert '"claude", "-p"' not in src, f"{name} assembles the claude argv"
+        assert "build_claude_args" not in src, f"{name} references the claude argv assembler"
 
 
 def test_only_runner_references_the_private_chokepoint():

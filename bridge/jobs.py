@@ -28,25 +28,40 @@ DONE = "done"
 FAILED = "failed"
 TIMEOUT = "timeout"
 CANCELLED = "cancelled"
-ORPHANED = "orphaned"   # process gone after a restart — cannot be resumed in M1
+ORPHANED = "orphaned"          # process gone after a restart — cannot be resumed
+AWAITING_REVIEW = "awaiting_review"  # M2: committed to bridge/<id>, parked for !merge/!discard
+# Statuses whose bridge/<id> branch must survive startup GC.
 _LIVE = {RUNNING}
+_KEEP_BRANCH = {RUNNING, AWAITING_REVIEW}
 
 
 @dataclass
 class Job:
     id: str
     bot: str
-    project: str            # the resolved cwd
+    project: str            # stable project path (identity: sessions/locks/notes)
     channel_id: int
     status: str = RUNNING
     started: float = field(default_factory=time.time)
     msg_id: "int | None" = None
     proc: "object | None" = None   # asyncio subprocess while running; never persisted
+    # M2 worktree job (None for M1 / non-git direct jobs)
+    worktree: "str | None" = None
+    branch: "str | None" = None
+    base: "str | None" = None       # base commit the worktree branched from
 
     def as_dict(self) -> dict:
         return {"id": self.id, "bot": self.bot, "project": self.project,
                 "channel_id": self.channel_id, "status": self.status,
-                "started": self.started, "msg_id": self.msg_id}
+                "started": self.started, "msg_id": self.msg_id,
+                "worktree": self.worktree, "branch": self.branch, "base": self.base}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Job":
+        return cls(id=d["id"], bot=d["bot"], project=d["project"],
+                   channel_id=d["channel_id"], status=d.get("status", RUNNING),
+                   started=d.get("started", time.time()), msg_id=d.get("msg_id"),
+                   worktree=d.get("worktree"), branch=d.get("branch"), base=d.get("base"))
 
 
 # The live registry (id → Job).
@@ -95,13 +110,45 @@ def set_msg(job: Job, msg_id: int) -> None:
     _persist(job)
 
 
+def set_worktree(job: Job, worktree: str, branch: str, base: str) -> None:
+    job.worktree, job.branch, job.base = worktree, branch, base
+    _persist(job)
+
+
 def attach_proc(job: Job, proc) -> None:
     job.proc = proc
 
 
+def _job_dir(job_id: str):
+    d = _jobs_dir() / job_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def save_diff(job: Job, diff: str) -> None:
+    """Persist the review diff so a parked job survives a restart."""
+    try:
+        (_job_dir(job.id) / "diff.patch").write_text(diff)
+    except OSError as e:
+        log.warning("could not persist diff for job %s: %s", job.id, e)
+
+
+def load_diff(job_id: str) -> "str | None":
+    p = _jobs_dir() / job_id / "diff.patch"
+    return p.read_text() if p.exists() else None
+
+
 def running_for_project(project: str) -> int:
-    """Count live (running) jobs for a project — used to cap concurrency at 1/project."""
+    """Count live (running) jobs for a project."""
     return sum(1 for j in _registry.values() if j.project == project and j.status in _LIVE)
+
+
+def project_occupied(project: str) -> bool:
+    """True if the project has a RUNNING job or one AWAITING_REVIEW (an unmerged branch).
+    The cap: never start a second job while either holds the project, so a new job can't
+    branch from an un-reviewed HEAD (the approved-diff-vs-moved-base TOCTOU)."""
+    return any(j.project == project and j.status in (RUNNING, AWAITING_REVIEW)
+               for j in _registry.values())
 
 
 def list_jobs() -> list[Job]:
@@ -120,26 +167,44 @@ async def cancel_job(job: Job) -> bool:
     return True
 
 
-def recover_orphans() -> int:
-    """At startup, load the on-disk mirror and mark any job left `running` as orphaned
-    (its process died with the previous container). Returns the number recovered."""
-    n = 0
-    d = _jobs_dir()
-    for p in d.glob("*.json"):
+def recover_jobs() -> list[Job]:
+    """At startup, read the on-disk mirror: mark any job left `running` as orphaned (its
+    process died with the previous container), and RELOAD `awaiting_review` jobs into the
+    in-memory registry so `!merge`/`!discard` keep working across a restart. Returns the
+    reloaded awaiting-review jobs (their branch + persisted diff survive on disk)."""
+    orphaned = 0
+    awaiting: list[Job] = []
+    for p in _jobs_dir().glob("*.json"):
         try:
             data = json.loads(p.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        if data.get("status") == RUNNING:
+        status = data.get("status")
+        if status == RUNNING:
             data["status"] = ORPHANED
             try:
                 p.write_text(json.dumps(data, ensure_ascii=False))
-                n += 1
+                orphaned += 1
             except OSError:
                 pass
-    if n:
-        log.info("recovered %d orphaned job(s) from a previous run", n)
-    return n
+        elif status == AWAITING_REVIEW:
+            job = Job.from_dict(data)
+            _registry[job.id] = job
+            awaiting.append(job)
+    if orphaned:
+        log.info("recovered %d orphaned job(s) from a previous run", orphaned)
+    if awaiting:
+        log.info("reloaded %d awaiting-review job(s)", len(awaiting))
+    return awaiting
+
+
+def awaiting_review_ids_by_project() -> dict[str, set[str]]:
+    """project → {job ids awaiting review}, for startup GC's keep-set."""
+    out: dict[str, set[str]] = {}
+    for j in _registry.values():
+        if j.status == AWAITING_REVIEW:
+            out.setdefault(j.project, set()).add(j.id)
+    return out
 
 
 def _age(started: float) -> str:
@@ -152,15 +217,18 @@ def _age(started: float) -> str:
 
 
 def render_job_list() -> str:
-    jobs = [j for j in list_jobs() if j.status in _LIVE]
-    if not jobs:
-        return "（目前沒有執行中的 job）用 `!cancel <id>` 取消、`@` 觸發新任務。"
-    lines = ["**執行中的 jobs**"]
-    for j in jobs:
-        from pathlib import Path
+    from pathlib import Path
+    active = [j for j in list_jobs() if j.status in (RUNNING, AWAITING_REVIEW)]
+    if not active:
+        return "（目前沒有進行中的 job）`@` 觸發新任務。"
+    lines = ["**進行中的 jobs**"]
+    for j in active:
         proj = "~" if j.project == config.DEFAULT_CWD else Path(j.project).name
-        lines.append(f"• `{j.id}` · Bot-{j.bot} · `{proj}` · {_age(j.started)} · {j.status}"
-                     f"（`!cancel {j.id}`）")
+        if j.status == AWAITING_REVIEW:
+            action = f"`!merge {j.id}` / `!discard {j.id}`"
+        else:
+            action = f"`!cancel {j.id}`"
+        lines.append(f"• `{j.id}` · Bot-{j.bot} · `{proj}` · {_age(j.started)} · {j.status}（{action}）")
     return "\n".join(lines)
 
 
