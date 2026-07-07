@@ -170,80 +170,97 @@ def _render_job_status(job, where: str, trace) -> str:
 async def start_exec_job(message: discord.Message, bot_name: str, prompt: str,
                          mode: str, cwd: str) -> None:
     """Spawn an execution-tier task as a tracked background job (M1). Capped at one
-    running job per project; conversation calls are not blocked while it runs."""
+    running job per project; conversation calls are not blocked while it runs. The cap
+    check and create_job are synchronous with no await between them, and the driver task
+    is spawned with no failable await in between, so the project can never be left pinned
+    RUNNING by a mid-setup exception."""
     if jobs.running_for_project(cwd) >= 1:
         await message.channel.send(
             f"🛑 `{_where(cwd)}` 已有執行中的任務（`!jobs` 查看，`!cancel <id>` 取消）；"
             "一個專案一次只跑一個 exec job。")
         return
     job = jobs.create_job(bot_name, cwd, message.channel.id)
-    status_msg = await message.channel.send(
-        _render_job_status(job, _where(cwd), None), reference=message)
-    jobs.set_msg(job, status_msg.id)
-    asyncio.create_task(
-        _drive_exec_job(job, message.channel, status_msg, bot_name, prompt, mode, cwd))
+    asyncio.create_task(_drive_exec_job(job, message, bot_name, prompt, mode, cwd))
 
 
-async def _drive_exec_job(job, channel, status_msg, bot_name: str, prompt: str,
+async def _drive_exec_job(job, message: discord.Message, bot_name: str, prompt: str,
                           mode: str, cwd: str) -> None:
+    """Own the whole lifecycle of one exec job. A try/finally guarantees the updater is
+    torn down and the job reaches a terminal state + status message no matter what fails,
+    so a mid-setup exception can never leak the updater or pin the project RUNNING."""
+    channel = message.channel
     where = _where(cwd)
     trace: deque = deque(maxlen=config.EXEC_TRACE_LINES)
     done = asyncio.Event()
-
-    async def _updater():
-        # Throttled: edit the status message at most once per interval with the rolling
-        # tool-use trace, until the job finishes.
-        while not done.is_set():
-            try:
-                await asyncio.wait_for(done.wait(), timeout=config.EXEC_STATUS_EDIT_INTERVAL)
-            except asyncio.TimeoutError:
-                pass
-            if trace:
-                try:
-                    await status_msg.edit(content=_render_job_status(job, where, list(trace)))
-                except discord.HTTPException:
-                    pass
-
-    upd = asyncio.create_task(_updater())
-    spf = memory.build_combined_system_prompt(channel.id, cwd, bot_name)
+    status_msg = None
+    upd = None
     try:
+        try:
+            status_msg = await channel.send(
+                _render_job_status(job, where, None), reference=message)
+        except discord.HTTPException:
+            # e.g. the triggering message was deleted → reference fails; post unref'd
+            status_msg = await channel.send(_render_job_status(job, where, None))
+        jobs.set_msg(job, status_msg.id)
+
+        async def _updater():
+            while not done.is_set():
+                try:
+                    await asyncio.wait_for(done.wait(), timeout=config.EXEC_STATUS_EDIT_INTERVAL)
+                except asyncio.TimeoutError:
+                    pass
+                if trace:
+                    await _safe_edit(status_msg, _render_job_status(job, where, list(trace)))
+
+        upd = asyncio.create_task(_updater())
+        spf = memory.build_combined_system_prompt(channel.id, cwd, bot_name)
         reply, outcome = await runner.run_streaming_exec(
             bot_name, prompt, mode=mode, cwd=cwd, system_prompt_file=spf,
             on_trace=trace.append,
             on_proc=lambda proc: jobs.attach_proc(job, proc),
+            should_abort=lambda: job.status == jobs.CANCELLED,
             timeout=config.EXEC_TIMEOUT,
         )
-    except Exception as e:  # noqa: BLE001 — a job crash must not take down the bot
+
+        # Decide + commit the terminal status SYNCHRONOUSLY (no await) so a !cancel landing
+        # in the messaging window below cannot flip a finished job to cancelled (F5).
+        if job.status == jobs.CANCELLED:
+            terminal, note = jobs.CANCELLED, f"🛑 **[job `{job.id}`]** 已取消（部分變更可能已寫入 live checkout）"
+        elif outcome == runner.EXEC_TIMEOUT:
+            terminal, note = jobs.TIMEOUT, f"⏱️ **[job `{job.id}`]** 逾時（{config.EXEC_TIMEOUT}s）→ 已終止 process group"
+        elif reply is None or outcome == runner.EXEC_FAILED:
+            terminal, note = jobs.FAILED, f"❌ **[job `{job.id}`]** 執行失敗（無結果）"
+        else:
+            terminal, note = jobs.DONE, f"✅ **[job `{job.id}` · `{where}`]** 完成"
+        jobs.set_status(job, terminal)
+
         done.set()
-        await upd
-        jobs.set_status(job, jobs.FAILED)
+        if upd:
+            await upd
+            upd = None
+        await _safe_edit(status_msg, note)
+
+        if terminal == jobs.DONE:
+            memory.record_bot_reply(channel.id, bot_name, reply, cwd=cwd)
+            cwd_tag = "" if cwd == config.DEFAULT_CWD else f"[{where}] "
+            for c in chunk_message(f"{cwd_tag}**[mode={mode} · job {job.id}]** {reply}"):
+                await channel.send(c)
+            await memory.maybe_token_flush(channel, bot_name, cwd)
+    except Exception:  # noqa: BLE001 — a job crash must never take down the bot
         log.exception("exec-job %s crashed", job.id)
-        await _safe_edit(status_msg, f"❌ **[job `{job.id}`]** 內部錯誤：{e}")
-        return
-    done.set()
-    await upd
-
-    if job.status == jobs.CANCELLED:
-        await _safe_edit(status_msg,
-                         f"🛑 **[job `{job.id}`]** 已取消（部分變更可能已寫入 live checkout）")
-        return
-    if outcome == runner.EXEC_TIMEOUT:
-        jobs.set_status(job, jobs.TIMEOUT)
-        await _safe_edit(status_msg,
-                         f"⏱️ **[job `{job.id}`]** 逾時（{config.EXEC_TIMEOUT}s）→ 已終止 process group")
-        return
-    if reply is None or outcome == runner.EXEC_FAILED:
-        jobs.set_status(job, jobs.FAILED)
-        await _safe_edit(status_msg, f"❌ **[job `{job.id}`]** 執行失敗（無結果）")
-        return
-
-    jobs.set_status(job, jobs.DONE)
-    memory.record_bot_reply(channel.id, bot_name, reply, cwd=cwd)
-    await _safe_edit(status_msg, f"✅ **[job `{job.id}` · `{where}`]** 完成")
-    cwd_tag = "" if cwd == config.DEFAULT_CWD else f"[{where}] "
-    for c in chunk_message(f"{cwd_tag}**[mode={mode} · job {job.id}]** {reply}"):
-        await channel.send(c)
-    await memory.maybe_token_flush(channel, bot_name, cwd)
+    finally:
+        done.set()
+        if upd:
+            try:
+                await upd
+            except Exception:
+                pass
+        # If we fell out before committing a terminal status, the project must not stay
+        # pinned RUNNING — mark it failed and surface it.
+        if job.status == jobs.RUNNING:
+            jobs.set_status(job, jobs.FAILED)
+            if status_msg is not None:
+                await _safe_edit(status_msg, f"❌ **[job `{job.id}`]** 內部錯誤（已結束）")
 
 
 async def _safe_edit(msg, content: str) -> None:
