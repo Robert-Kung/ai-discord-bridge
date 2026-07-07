@@ -114,7 +114,9 @@ ai-discord-bridge/
 │
 ├── discord-summaries/<channel_id>/<cwd-slug>/   記憶中期層（v3：加 cwd 一段）
 │   ├── latest.md                        該 (channel, cwd) 最新摘要（呼叫時 prepend）
-│   └── <YYYYMMDD-HHMMSS>.md             歷史摘要快照
+│   └── <YYYYMMDD-HHMMSS>.md             歷史摘要快照（session reset 時的檔案帶
+│                                        parent_session_id frontmatter＝lineage，供
+│                                        operator 追溯原 transcript）
 │
 ├── discord-project-notes/<cwd-slug>/    記憶專案層（v3 新增；**可寫**，不在 ro 的 memory/ 下）
 │   ├── notes.md                         per-cwd 專案筆記（架構決策/進行中/關鍵路徑/Open Q）
@@ -158,6 +160,11 @@ ai-discord-bridge/
 ### 自動行為
 - **自動 flush**：channel 累計 `AUTO_FLUSH_THRESHOLD`（預設 20）則訊息 → 背景跑 flush
 - **summary prepend**：每次 call 用 `--append-system-prompt-file latest.md` 注入最新摘要
+- **跨 session 召回**：當該 (channel, cwd) 有比 latest 更早的摘要檔時，注入的 system prompt
+  會多一段「歷史摘要」指路——把摘要目錄路徑＋「需要時自己 Grep/Read」告訴 agent（對話層是
+  plan mode，有 Read/Grep，目錄也掛進容器），由 agent 依需求自行檢索。**刻意不做** bridge 端的
+  rg/FTS5/embedding 管線（對中文摘要關鍵字召回品質差、且與 agent 既有能力重複）；若觀察到 agent
+  該搜時不搜，先加強指路字句，再考慮 bridge 端檢索。
 - **啟動公告**：容器重啟後 Bot-A 自動在 #ai-chat 貼功能清單
 
 ---
