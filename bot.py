@@ -11,7 +11,7 @@ import logging
 import os
 from pathlib import Path
 
-from bridge import config, egress, jobs
+from bridge import config, egress, jobs, worktree
 from bridge.approver_ipc import start_approval_server
 from bridge.frontend import make_client, request_discord_approval
 from bridge import runner, state
@@ -25,7 +25,16 @@ log = logging.getLogger("bridge")
 
 async def main():
     config.load_config()  # read env into globals + ensure dirs + fail-closed validation
-    jobs.recover_orphans()  # mark exec jobs left "running" by a previous container as orphaned
+    # Recover exec jobs from the previous container: mark orphaned running jobs, reload
+    # awaiting-review jobs into the registry (so !merge/!discard keep working), then GC
+    # stale bridge/<id> worktrees + branches — keeping only the awaiting-review ones.
+    jobs.recover_jobs()
+    _keep = jobs.awaiting_review_ids_by_project()
+    for _project in {str(p) for p in config.PROJECT_DIRS}:
+        try:
+            await worktree.gc_project(_project, _keep.get(_project, set()))
+        except Exception:
+            log.exception("startup GC failed for %s", _project)
 
     # Fail-closed startup assertion: a dead approve tier (script missing) would only
     # surface the first time someone uses `!mode approve`; the default-mode canary

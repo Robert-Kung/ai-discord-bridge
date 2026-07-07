@@ -6,6 +6,7 @@ business logic lives in the service modules. This is the ONLY module that import
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import time
@@ -14,7 +15,7 @@ from pathlib import Path
 
 import discord
 
-from bridge import config, discuss, jobs, memory, runner, sessions, state, trust
+from bridge import config, discuss, jobs, memory, runner, sessions, state, trust, worktree
 from bridge.util import chunk_message
 
 log = logging.getLogger("bridge.frontend")
@@ -169,15 +170,15 @@ def _render_job_status(job, where: str, trace) -> str:
 
 async def start_exec_job(message: discord.Message, bot_name: str, prompt: str,
                          mode: str, cwd: str) -> None:
-    """Spawn an execution-tier task as a tracked background job (M1). Capped at one
-    running job per project; conversation calls are not blocked while it runs. The cap
-    check and create_job are synchronous with no await between them, and the driver task
-    is spawned with no failable await in between, so the project can never be left pinned
-    RUNNING by a mid-setup exception."""
-    if jobs.running_for_project(cwd) >= 1:
+    """Spawn an execution-tier task as a tracked background job. Capped at one active job
+    per project — a RUNNING job OR one AWAITING_REVIEW (an unmerged branch) blocks a new
+    one, so a second job can never branch from an un-reviewed HEAD. The cap check and
+    create_job are synchronous with no await between them, and the driver task is spawned
+    with no failable await in between, so the project can never be left pinned."""
+    if jobs.project_occupied(cwd):
         await message.channel.send(
-            f"🛑 `{_where(cwd)}` 已有執行中的任務（`!jobs` 查看，`!cancel <id>` 取消）；"
-            "一個專案一次只跑一個 exec job。")
+            f"🛑 `{_where(cwd)}` 已有進行中的任務（`!jobs` 查看）；一個專案一次只跑一個 exec job，"
+            "待審中的變更請先 `!merge` 或 `!discard`。")
         return
     job = jobs.create_job(bot_name, cwd, message.channel.id)
     asyncio.create_task(_drive_exec_job(job, message, bot_name, prompt, mode, cwd))
@@ -185,23 +186,36 @@ async def start_exec_job(message: discord.Message, bot_name: str, prompt: str,
 
 async def _drive_exec_job(job, message: discord.Message, bot_name: str, prompt: str,
                           mode: str, cwd: str) -> None:
-    """Own the whole lifecycle of one exec job. A try/finally guarantees the updater is
-    torn down and the job reaches a terminal state + status message no matter what fails,
-    so a mid-setup exception can never leak the updater or pin the project RUNNING."""
+    """Own the whole lifecycle of one exec job (M2). On a git project the task runs in a
+    throwaway worktree; on success its changes are committed to bridge/<id> and posted as a
+    diff for ✅/❌ review (merge / discard / park). On a non-git dir it falls back to the M1
+    direct-on-live-tree behaviour (no diff gate). A try/finally guarantees the updater is
+    torn down and the project is never left pinned by a mid-setup exception."""
     channel = message.channel
     where = _where(cwd)
     trace: deque = deque(maxlen=config.EXEC_TRACE_LINES)
     done = asyncio.Event()
     status_msg = None
     upd = None
+    use_worktree = worktree.is_git_repo(cwd)
+    workdir = cwd
     try:
         try:
             status_msg = await channel.send(
                 _render_job_status(job, where, None), reference=message)
         except discord.HTTPException:
-            # e.g. the triggering message was deleted → reference fails; post unref'd
             status_msg = await channel.send(_render_job_status(job, where, None))
         jobs.set_msg(job, status_msg.id)
+
+        if use_worktree:
+            try:
+                wt, branch, base = await worktree.create_job_worktree(cwd, job.id)
+                jobs.set_worktree(job, wt, branch, base)
+                workdir = wt
+            except worktree.WorktreeError as e:
+                jobs.set_status(job, jobs.FAILED)
+                await _safe_edit(status_msg, f"❌ **[job `{job.id}`]** 無法建立 worktree：{e}")
+                return
 
         async def _updater():
             while not done.is_set():
@@ -215,37 +229,63 @@ async def _drive_exec_job(job, message: discord.Message, bot_name: str, prompt: 
         upd = asyncio.create_task(_updater())
         spf = memory.build_combined_system_prompt(channel.id, cwd, bot_name)
         reply, outcome = await runner.run_streaming_exec(
-            bot_name, prompt, mode=mode, cwd=cwd, system_prompt_file=spf,
+            bot_name, prompt, mode=mode, cwd=workdir, project=cwd, system_prompt_file=spf,
             on_trace=trace.append,
             on_proc=lambda proc: jobs.attach_proc(job, proc),
             should_abort=lambda: job.status == jobs.CANCELLED,
             timeout=config.EXEC_TIMEOUT,
         )
 
-        # Decide + commit the terminal status SYNCHRONOUSLY (no await) so a !cancel landing
-        # in the messaging window below cannot flip a finished job to cancelled (F5).
+        # Classify the run outcome synchronously (no await) so a late !cancel cannot flip
+        # a finished job (F5). DONE stays RUNNING here — the diff gate resolves it below.
         if job.status == jobs.CANCELLED:
-            terminal, note = jobs.CANCELLED, f"🛑 **[job `{job.id}`]** 已取消（部分變更可能已寫入 live checkout）"
+            kind = "cancelled"
         elif outcome == runner.EXEC_TIMEOUT:
-            terminal, note = jobs.TIMEOUT, f"⏱️ **[job `{job.id}`]** 逾時（{config.EXEC_TIMEOUT}s）→ 已終止 process group"
+            kind = "timeout"
         elif reply is None or outcome == runner.EXEC_FAILED:
-            terminal, note = jobs.FAILED, f"❌ **[job `{job.id}`]** 執行失敗（無結果）"
+            kind = "failed"
         else:
-            terminal, note = jobs.DONE, f"✅ **[job `{job.id}` · `{where}`]** 完成"
-        jobs.set_status(job, terminal)
+            kind = "done"
 
         done.set()
         if upd:
             await upd
             upd = None
-        await _safe_edit(status_msg, note)
 
-        if terminal == jobs.DONE:
-            memory.record_bot_reply(channel.id, bot_name, reply, cwd=cwd)
-            cwd_tag = "" if cwd == config.DEFAULT_CWD else f"[{where}] "
-            for c in chunk_message(f"{cwd_tag}**[mode={mode} · job {job.id}]** {reply}"):
-                await channel.send(c)
-            await memory.maybe_token_flush(channel, bot_name, cwd)
+        if kind != "done":
+            note = {
+                "cancelled": f"🛑 **[job `{job.id}`]** 已取消（worktree 變更已丟棄）",
+                "timeout": f"⏱️ **[job `{job.id}`]** 逾時（{config.EXEC_TIMEOUT}s）→ 已終止 process group，變更丟棄",
+                "failed": f"❌ **[job `{job.id}`]** 執行失敗（無結果）",
+            }[kind]
+            jobs.set_status(job, {"cancelled": jobs.CANCELLED, "timeout": jobs.TIMEOUT,
+                                  "failed": jobs.FAILED}[kind])
+            await _safe_edit(status_msg, note)
+            if use_worktree:
+                await worktree.discard_job(cwd, job.id)
+            return
+
+        # DONE — post the agent's textual reply first, then gate the file changes.
+        memory.record_bot_reply(channel.id, bot_name, reply, cwd=cwd)
+        await _safe_edit(status_msg, f"✅ **[job `{job.id}` · `{where}`]** 完成")
+        cwd_tag = "" if cwd == config.DEFAULT_CWD else f"[{where}] "
+        for c in chunk_message(f"{cwd_tag}**[mode={mode} · job {job.id}]** {reply}"):
+            await channel.send(c)
+        await memory.maybe_token_flush(channel, bot_name, cwd)
+
+        if not use_worktree:
+            jobs.set_status(job, jobs.DONE)  # non-git direct run: no diff gate
+            return
+
+        changed = await worktree.commit_job(workdir, job.id, prompt, job.base)
+        if not changed:
+            jobs.set_status(job, jobs.DONE)
+            await channel.send(f"（job `{job.id}`：agent 未變更任何檔案，無 diff 可審）")
+            await worktree.discard_job(cwd, job.id)
+            return
+        stat, full = await worktree.job_diff(cwd, job.base, job.id)
+        jobs.save_diff(job, full)
+        await _post_diff_gate(job, channel, stat, full)
     except Exception:  # noqa: BLE001 — a job crash must never take down the bot
         log.exception("exec-job %s crashed", job.id)
     finally:
@@ -255,12 +295,73 @@ async def _drive_exec_job(job, message: discord.Message, bot_name: str, prompt: 
                 await upd
             except Exception:
                 pass
-        # If we fell out before committing a terminal status, the project must not stay
-        # pinned RUNNING — mark it failed and surface it.
         if job.status == jobs.RUNNING:
             jobs.set_status(job, jobs.FAILED)
             if status_msg is not None:
                 await _safe_edit(status_msg, f"❌ **[job `{job.id}`]** 內部錯誤（已結束）")
+            if use_worktree:
+                try:
+                    await worktree.discard_job(cwd, job.id)
+                except Exception:
+                    pass
+
+
+async def _post_diff_gate(job, channel, stat: str, full: str) -> None:
+    """Post the job's diff for ✅/❌ review and resolve it: ✅ merge, ❌ discard, timeout
+    park as awaiting-review (branch + persisted diff survive for !merge/!discard)."""
+    base8 = (job.base or "")[:8]
+    header = (f"🔍 **[job `{job.id}` diff · base `{base8}`]** "
+              f"✅ 合併到 live / ❌ 丟棄（{config.PLAN_REACTION_TIMEOUT}s，逾時＝保留待審）\n"
+              f"```\n{stat.strip()[:1500]}\n```")
+    if len(full) <= 1500:
+        msg = await channel.send(f"{header}\n```diff\n{full}\n```")
+    else:
+        data = io.BytesIO(full.encode("utf-8")[:8_000_000])
+        msg = await channel.send(header, file=discord.File(data, filename=f"job-{job.id}.diff.txt"))
+    await msg.add_reaction("✅")
+    await msg.add_reaction("❌")
+    fut: asyncio.Future = asyncio.get_event_loop().create_future()
+    state.pending_actions[msg.id] = fut
+    try:
+        decision = await asyncio.wait_for(fut, timeout=config.PLAN_REACTION_TIMEOUT)
+    except asyncio.TimeoutError:
+        state.pending_actions.pop(msg.id, None)
+        jobs.set_status(job, jobs.AWAITING_REVIEW)  # park; keep branch + persisted diff
+        await worktree.remove_worktree(job.project, job.id)
+        await channel.send(
+            f"🅿️ job `{job.id}` 無人審核 → 已保留待審（`!merge {job.id}` / `!discard {job.id}`）")
+        return
+    if decision == "confirm":
+        await _do_merge(job, channel)
+    else:
+        jobs.set_status(job, jobs.DONE)
+        await worktree.discard_job(job.project, job.id)
+        await channel.send(f"🗑️ job `{job.id}` 的變更已丟棄（分支已刪）")
+
+
+async def _do_merge(job, channel) -> None:
+    """Merge protocol (task 2.4): under the project lock; clean-live-tree precondition;
+    never force; abort on conflict. On success the branch + worktree are removed."""
+    async with state.cwd_locks[job.project]:
+        result, detail = await worktree.merge_job(job.project, job.id)
+    if result == "merged":
+        jobs.set_status(job, jobs.DONE)
+        await worktree.remove_worktree(job.project, job.id)
+        await worktree.delete_branch(job.project, job.id)
+        await channel.send(f"✅ job `{job.id}` 已合併進 live branch")
+    elif result == "dirty":
+        jobs.set_status(job, jobs.AWAITING_REVIEW)
+        await channel.send(
+            f"⚠️ live checkout 有未 commit 的變更，拒絕合併 job `{job.id}`（不冒險動你的樹）。"
+            f"先 commit/stash，再 `!merge {job.id}`；分支 `bridge/{job.id}` 保留。")
+    elif result == "conflict":
+        jobs.set_status(job, jobs.AWAITING_REVIEW)
+        await channel.send(
+            f"⚠️ job `{job.id}` 合併衝突，已 `merge --abort`（live tree 未留衝突標記）。"
+            f"手動：`git merge bridge/{job.id}`，或 `!discard {job.id}` 放棄。")
+    else:
+        jobs.set_status(job, jobs.AWAITING_REVIEW)
+        await channel.send(f"❌ job `{job.id}` 合併失敗：{detail[:300]}（分支保留，可 `!discard`）")
 
 
 async def _safe_edit(msg, content: str) -> None:
@@ -276,8 +377,9 @@ HELP_TEXT = """**Bridge 指令參考**
 `!once <mode>` — 單一訊息使用該模式（末尾加，不獨佔一行）
 `!yolo` — bypass 跳過 plan-then-execute（單訊息）
 `!discuss <topic>` — A↔B 強制輪流辯論
-`!jobs` — 列出執行中的背景任務（id / bot / 專案 / 已跑多久）
+`!jobs` — 列出進行中的背景任務（執行中 / 待審）
 `!cancel <id>` — 取消某個執行中的任務（終止整個 process group）
+`!merge <id>` / `!discard <id>` — 合併 / 丟棄某個待審變更（見下方「diff 審查」）
 `!flush` — 立即整理對話到 summary 知識檔
 `!reset` — 清掉當前 bot session id（保留 summary）
 `!cd <專案名|路徑>` — 把此 channel 切到該專案工作目錄（限白名單 git 專案）
@@ -417,6 +519,12 @@ def make_client(bot_name: str) -> discord.Client:
             channel = client.get_channel(config.CHANNEL_ID)
             if channel:
                 await channel.send(STARTUP_ANNOUNCEMENT)
+                parked = [j for j in jobs.list_jobs() if j.status == jobs.AWAITING_REVIEW]
+                if parked:
+                    lines = "\n".join(f"• `{j.id}` · `{_where(j.project)}`" for j in parked)
+                    await channel.send(
+                        f"🅿️ 重啟後有 {len(parked)} 個 job 待審（分支與 diff 已保留）：\n{lines}\n"
+                        "用 `!merge <id>` 合併或 `!discard <id>` 丟棄。")
 
     @client.event
     async def on_message(message: discord.Message):
@@ -488,6 +596,24 @@ def make_client(bot_name: str) -> discord.Client:
                         return
                     await jobs.cancel_job(job)
                     await message.channel.send(f"🛑 job `{jid}` 已取消")
+                    return
+                if name == "merge":
+                    jid = args.strip()
+                    job = jobs.get_job(jid)
+                    if job is None or job.status != jobs.AWAITING_REVIEW:
+                        await message.channel.send(f"找不到待審 job `{jid}`（`!jobs` 查看）")
+                        return
+                    await _do_merge(job, message.channel)
+                    return
+                if name == "discard":
+                    jid = args.strip()
+                    job = jobs.get_job(jid)
+                    if job is None or job.status != jobs.AWAITING_REVIEW:
+                        await message.channel.send(f"找不到待審 job `{jid}`（`!jobs` 查看）")
+                        return
+                    jobs.set_status(job, jobs.DONE)
+                    await worktree.discard_job(job.project, job.id)
+                    await message.channel.send(f"🗑️ job `{jid}` 已丟棄（分支已刪）")
                     return
                 # Unknown command: don't reply (may be a typo)
 
@@ -606,9 +732,12 @@ STARTUP_ANNOUNCEMENT = """🚀 **Bridge v3 上線**
 • `@A @B` 一起 — 並行雙視角
 • `!discuss <主題>` — 強制 A↔B 輪流辯論
 
-**⚙️ 背景執行任務**
+**⚙️ 背景執行任務 + diff 審查門**
 • 執行層任務（edit/approve）改走背景 job：即時進度、可 `!cancel`、獨立逾時
-• `!jobs` 看執行中的任務  •  `!cancel <id>` 取消（終止整個 process group）
+• 改動先進 throwaway git worktree（不碰 live checkout），完成後貼 diff 等你 ✅ 合併 / ❌ 丟棄
+• 逾時無人審 → 保留待審：`!merge <id>` / `!discard <id>`（分支 `bridge/<id>` 保留）
+• 合併採嚴格協定：live tree 有未 commit 變更會拒絕、衝突自動 abort 不留標記
+• `!jobs` 看進行中/待審任務  •  `!cancel <id>` 取消執行中的任務
 
 **🔐 授權執行**
 • `!mode plan|edit|bypass` 切 channel 模式

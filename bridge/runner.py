@@ -378,6 +378,7 @@ async def run_streaming_exec(
     *,
     mode: str,
     cwd: str,
+    project: "str | None" = None,
     system_prompt_file: "str | Path | None" = None,
     on_trace: "Callable[[str], None] | None" = None,
     on_proc: "Callable[[asyncio.subprocess.Process], None] | None" = None,
@@ -387,27 +388,35 @@ async def run_streaming_exec(
     """Run an execution-tier task as a streaming subprocess. Returns (reply, outcome)
     where outcome is EXEC_DONE / EXEC_TIMEOUT / EXEC_FAILED.
 
+    PROJECT IDENTITY vs SUBPROCESS CWD (M2): `cwd` is where the subprocess runs (a git
+    worktree for a diff-gated job); `project` is the stable project path that keys the
+    session, the cwd lock, and the token accounting. They differ for a worktree job —
+    otherwise every job would burn a fresh session, litter discord-state, and lose the
+    project's summary/notes memory. `project` defaults to `cwd` (M1 / non-git dirs).
+
     `on_trace(line)` is called (sync, best-effort) for each tool-use action for the live
     status trace; `on_proc(proc)` is called once the subprocess exists so the caller can
     register it for cancellation. `should_abort()` is checked right after spawn — if it
-    returns True (a cancel landed while we were blocked on cwd_locks, before the proc
+    returns True (a cancel landed while we were blocked on the lock, before the proc
     existed to kill) the just-spawned process group is killed immediately. The subprocess
     is spawned in its own session so a cancel or timeout kills the whole group. Serialized
-    per-cwd (never per-bot) so a long job does not stall conversation calls elsewhere."""
+    per-project (never per-bot) so a long job does not stall conversation calls elsewhere."""
     if mode not in _EXEC_MODES:
         raise ValueError(f"run_streaming_exec requires an execution mode, got {mode!r}")
     timeout = config.EXEC_TIMEOUT if timeout is None else timeout
+    project = cwd if project is None else project
     cfg = config.BOTS[bot_name]
     api_mode = config.MODE_ALIASES.get(mode, mode)
-    sid = sessions.load_session(bot_name, cwd)
+    sid = sessions.load_session(bot_name, project)
     args = build_claude_args(
         api_mode, session_id=sid,
         system_prompt_file=str(system_prompt_file) if system_prompt_file else None,
         stream=True)
     env = build_subprocess_env(cfg)
-    log.info("[%s] exec-job start mode=%s cwd=%s prompt_len=%d", bot_name, api_mode, cwd, len(prompt))
+    log.info("[%s] exec-job start mode=%s cwd=%s project=%s prompt_len=%d",
+             bot_name, api_mode, cwd, project, len(prompt))
 
-    async with state.cwd_locks[cwd]:
+    async with state.cwd_locks[project]:
         proc = await asyncio.create_subprocess_exec(
             *args, env=env, cwd=cwd,
             stdin=asyncio.subprocess.PIPE,
@@ -467,9 +476,9 @@ async def run_streaming_exec(
     reply = final.get("result") or "(空回覆)"
     new_sid = final.get("session_id")
     if new_sid:
-        sessions.save_session(bot_name, new_sid, cwd)
+        sessions.save_session(bot_name, new_sid, project)
     ctx = stream_ctx_tokens(final.get("usage") or {})
     if ctx:
-        state.session_ctx_tokens[(bot_name, cwd)] = ctx
-        log.info("[%s] exec-job context now ~%dk tokens (cwd=%s)", bot_name, ctx // 1000, cwd)
+        state.session_ctx_tokens[(bot_name, project)] = ctx
+        log.info("[%s] exec-job context now ~%dk tokens (project=%s)", bot_name, ctx // 1000, project)
     return (reply, EXEC_DONE)

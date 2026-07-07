@@ -40,20 +40,33 @@ def test_finished_job_frees_the_project(tmp_state):
     assert job.proc is None  # cleared on leaving the running state
 
 
-def test_recover_orphans_marks_running_as_orphaned(tmp_state):
+def test_recover_marks_running_as_orphaned(tmp_state):
     job = jobs.create_job("B", "/home/user/proj", 7)
     jobs.reset_registry_for_tests()  # simulate a restart: in-memory registry gone, mirror stays
-    n = jobs.recover_orphans()
-    assert n == 1
+    awaiting = jobs.recover_jobs()
+    assert awaiting == []
     data = json.loads((config.STATE_DIR / "jobs" / f"{job.id}.json").read_text())
     assert data["status"] == jobs.ORPHANED
 
 
-def test_recover_orphans_ignores_finished(tmp_state):
+def test_recover_ignores_finished(tmp_state):
     job = jobs.create_job("B", "/home/user/proj", 7)
     jobs.set_status(job, jobs.DONE)
     jobs.reset_registry_for_tests()
-    assert jobs.recover_orphans() == 0
+    assert jobs.recover_jobs() == []
+
+
+def test_recover_reloads_awaiting_review(tmp_state):
+    job = jobs.create_job("B", "/home/user/proj", 7)
+    jobs.set_worktree(job, "/wt", "bridge/" + job.id, "abc123")
+    jobs.set_status(job, jobs.AWAITING_REVIEW)
+    jobs.reset_registry_for_tests()  # restart
+    awaiting = jobs.recover_jobs()
+    assert [j.id for j in awaiting] == [job.id]
+    # reloaded into the registry so !merge/!discard work, with worktree metadata intact
+    reloaded = jobs.get_job(job.id)
+    assert reloaded is not None and reloaded.branch == "bridge/" + job.id and reloaded.base == "abc123"
+    assert jobs.project_occupied("/home/user/proj") is True  # blocks a new job until resolved
 
 
 def test_cancel_without_proc_marks_cancelled(tmp_state):

@@ -11,15 +11,15 @@
 - [x] 1.9 Tests: registry lifecycle; restart marks `running`→`orphaned`; cancel kills group (real subprocess) + waits before cleanup; stream parser tolerance; `--verbose` pinned; exec timeout distinct; per-project cap; `!cancel` whitelist-gated (tests/test_jobs.py, tests/test_stream.py)
   - NOTE (M1 scope): exec jobs run on the LIVE checkout; the git worktree + diff-review gate is M2. Restart recovery here only marks orphans (re-posting awaiting-review diffs is M2).
 
-## 2. Git worktree + diff-review gate (milestone 2)
+## 2. Git worktree + diff-review gate (milestone 2) — DONE
 
-- [ ] 2.1 Worktree helpers: `create_job_worktree(project, job_id)` (`git worktree add discord-state/worktrees/<slug>/<id> -b bridge/<id>` from HEAD), `commit_job(job_id)` (bridge commits all changes; message carries task summary + base commit), `merge_job(job_id)`, `discard_job(job_id)`
-- [ ] 2.2 Route execution-tier tasks to the worktree as **subprocess cwd** while keeping **project identity** (real project path) for sessions, notes/summaries injection, `cwd_locks`, and the registry key (runner signature separates the two; coordinate with bridge-restructure)
-- [ ] 2.3 On completion: commit to the branch; post `--stat` inline + full diff (inline code block < ~1500 chars, else `.txt` attachment, truncated fallback at the upload limit); persist `diff.patch` under `discord-state/jobs/<id>/`; ✅/❌ via `pending_actions`
-- [ ] 2.4 Merge protocol: under `cwd_locks[project]`; require clean `git status --porcelain` in the live checkout (dirty → refuse with manual commands); on conflict `git merge --abort` + report + keep branch; never force; result message states the base commit
-- [ ] 2.5 Reaction timeout → park as `awaiting-review` (never auto-discard); `!merge <id>` / `!discard <id>` act on the surviving branch; restart re-posts awaiting-review diffs from the persisted patch; parked-branch GC after days
-- [ ] 2.6 Startup GC: `git worktree prune` per mounted project; remove worktrees/branches only for jobs absent from the registry and not awaiting review
-- [ ] 2.7 Tests: live tree untouched mid-job; commit-then-merge path; dirty-live-tree refusal; conflict aborts cleanly (no markers left); discard cleanup; park-on-timeout; restart re-post; prune/GC
+- [x] 2.1 `bridge/worktree.py` helpers: `create_job_worktree` (`git worktree add discord-state/worktrees/<slug>/<id> -b bridge/<id>` from HEAD), `commit_job` (committer identity + task summary + base in message; returns changed?), `job_diff`, `merge_job`, `discard_job`, `remove_worktree`/`delete_branch`, `prune`, `gc_project`
+- [x] 2.2 Runner separates **subprocess cwd** (the worktree) from **project identity** (`project` param keys sessions / `cwd_locks` / token accounting). Verified: session keyed by project not worktree; live tree untouched mid-job
+- [x] 2.3 On completion: commit to the branch; post `--stat` inline + full diff (inline `diff` code block if ≤1500 chars, else `.txt` attachment truncated at 8 MB); persist `diff.patch` under `discord-state/jobs/<id>/`; ✅/❌ via `pending_actions`
+- [x] 2.4 Merge protocol: under `cwd_locks[project]`; clean `git status --porcelain` precondition (dirty → refuse, branch kept); conflict → `git merge --abort` + report + keep branch; never force. Verified against real repos (clean/dirty/conflict-abort)
+- [x] 2.5 Reaction timeout → park as `awaiting_review` (never auto-discard); `!merge`/`!discard` act on the surviving branch; startup reloads awaiting-review jobs into the registry + re-lists them (branch + persisted diff survive); the per-project cap counts awaiting-review so a new job can't branch from an un-reviewed HEAD
+- [x] 2.6 Startup GC (`bot.main`): `git worktree prune` + remove bridge/<id> branches/worktrees for jobs not awaiting review; non-git dirs fall back to the M1 direct-on-live path (no worktree)
+- [x] 2.7 Tests (tests/test_worktree.py, real repos): live tree untouched; commit→diff→merge; dirty-tree refusal; conflict aborts cleanly (no markers); discard cleanup; GC keeps awaiting/removes stale. Plus jobs reload-awaiting test + a fake-claude M2 integration harness (isolation + project identity + merge-to-live)
 
 ## 3. Attachment ingestion (milestone 3)
 
