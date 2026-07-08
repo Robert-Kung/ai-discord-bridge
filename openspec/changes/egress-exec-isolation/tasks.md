@@ -6,7 +6,7 @@
 
 ## 1. Egress proxy + network (phase 1)
 
-- [ ] 1.1 **OPERATOR CUTOVER STEP** — force an OAuth token refresh through the proxy and record the actual host(s) from the proxy log; pin the allow-list to observed reality (do not trust the `console.anthropic.com` guess). Must run BEFORE the live `docker-compose.yml` is switched onto the internal network; documented in SECURITY.md §6 "Operator cutover".
+- [x] 1.1 **OPERATOR CUTOVER STEP** — DONE 2026-07-08: live compose switched to phase-1 topology, three-probe canary green, forced refresh (scripts/expire-oauth-token.sh, host-side through the published proxy port) observed contacting **api.anthropic.com only** with the token persisted (+8h). `console.anthropic.com` never attempted → removed from the filter. Denied-and-harmless during the run: `mcp-proxy.anthropic.com` (MCP connectors, noisy retries), `http-intake.logs.us5.datadoghq.com` (CLI telemetry). Recorded in SECURITY.md §6.
 - [x] 1.2 Add the egress-proxy sidecar (default-deny hostname allow-list) — `egress-proxy/{Dockerfile,tinyproxy.conf,filter}`, wired in `docker-compose.example.yml`; allow-list: `api.anthropic.com`, `console.anthropic.com` (pending 1.1 confirmation), `gateway.discord.gg`, `discord.com`, `cdn.discordapp.com`. Functionally verified: allow-listed → `200 established`, `example.com` → `403 Filtered`.
 - [x] 1.3 Move the bridge container onto an `internal: true` network; proxy straddles internal + outbound networks (example.yml; live cutover is 1.1's operator step)
 - [x] 1.4 Set `HTTPS_PROXY`/`HTTP_PROXY` in `build_subprocess_env` for `claude` + `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, gated on `config.EGRESS_PROXY_URL` (in-code note: proxy env is plumbing; the boundary is the internal network)
