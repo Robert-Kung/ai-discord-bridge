@@ -361,6 +361,12 @@ async def _drive_exec_job(job, message: discord.Message, bot_name: str, prompt: 
         committed = True  # branch now holds real work — never auto-discard it below
         stat, full = await worktree.job_diff(cwd, job.base, job.id)
         jobs.save_diff(job, full)
+        if config.EVALUATOR_ENABLED:
+            await _post_evaluator_review(job, channel, bot_name, stat, full)
+            if job.status == jobs.CANCELLED:  # !cancel arrived during the review
+                await worktree.discard_job(cwd, job.id)
+                await channel.send(f"🛑 job `{job.id}` 已在交叉審查期間取消——變更已丟棄")
+                return
         await _post_diff_gate(job, channel, stat, full)
     except Exception:  # noqa: BLE001 — a job crash must never take down the bot
         log.exception("exec-job %s crashed", job.id)
@@ -396,6 +402,31 @@ async def _drive_exec_job(job, message: discord.Message, bot_name: str, prompt: 
                         pass
 
 
+async def _post_evaluator_review(job, channel, author_bot: str, stat: str, full: str) -> None:
+    """M5 cross-review: post the other bot's skeptical take ABOVE the diff gate.
+    Advisory by construction — this function never touches pending_actions or the merge
+    path, and ANY failure (evaluator call or Discord post) degrades to a log line so the
+    human gate always follows."""
+    note = None
+    try:
+        note = await channel.send(f"🧐 job `{job.id}`：交叉審查中（advisory，不影響 ✅/❌）…")
+        res = await discuss.evaluate_diff(author_bot, job.project, job.id, job.base, stat, full)
+        if res is None:
+            await _safe_edit(note, f"⚠️ job `{job.id}`：交叉審查不可用——請自行審 diff")
+            return
+        evaluator, findings = res
+        if len(findings) > 4000:  # bound the fan-out: raw model output, chunked below
+            findings = findings[:4000] + "\n…（審查意見過長已截斷）"
+        header = f"🧐 **[job `{job.id}` 交叉審查 · Bot-{evaluator}（advisory，僅供參考）]**"
+        for c in chunk_message(f"{header}\n{findings}"):
+            await channel.send(c)
+        await _safe_edit(note, f"🧐 job `{job.id}`：交叉審查完成（advisory，見下方）")
+    except Exception:  # noqa: BLE001 — the evaluator must never block the human gate
+        log.exception("evaluator review failed for job %s — proceeding to the diff gate", job.id)
+        if note is not None:
+            await _safe_edit(note, f"⚠️ job `{job.id}`：交叉審查失敗——請自行審 diff")
+
+
 async def _post_diff_gate(job, channel, stat: str, full: str) -> None:
     """Post the job's diff for ✅/❌ review and resolve it: ✅ merge, ❌ discard, timeout
     park as awaiting-review (branch + persisted diff survive for !merge/!discard)."""
@@ -428,6 +459,8 @@ async def _post_diff_gate(job, channel, stat: str, full: str) -> None:
         decision = await asyncio.wait_for(fut, timeout=config.PLAN_REACTION_TIMEOUT)
     except asyncio.TimeoutError:
         state.pending_actions.pop(msg.id, None)
+        if job.status != jobs.RUNNING:
+            return  # e.g. !cancel while the gate was pending — never resurrect it as reviewable
         jobs.set_status(job, jobs.AWAITING_REVIEW)  # park; keep branch + persisted diff
         await worktree.remove_worktree(job.project, job.id)
         await channel.send(

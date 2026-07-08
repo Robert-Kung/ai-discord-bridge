@@ -145,11 +145,16 @@ DEFAULT_CHANNEL_MODE = "plan"  # safe default; bypass requires opt-in
 BYPASS_TIER_ENABLED: bool = False
 # M4 — per-command MCP approver tier (ENABLE_APPROVER_TIER), OFF by default.
 APPROVER_TIER_ENABLED: bool = False
+# M5 — dual-account cross-review of exec diffs (ENABLE_EXEC_EVALUATOR), OFF by default.
+# Advisory only: the evaluator's findings are posted above the diff gate; the human
+# ✅/❌ remains the sole merge authority.
+EVALUATOR_ENABLED: bool = False
 
 # The env-derived globals load_config() owns — single source of truth so tests can
 # snapshot/restore them without a hand-maintained list drifting out of sync.
 _CONFIG_GLOBALS = ("CHANNEL_ID", "ALLOWED_USER_IDS", "USE_API_KEY", "BOTS",
-                   "PROJECT_DIRS", "BYPASS_TIER_ENABLED", "APPROVER_TIER_ENABLED")
+                   "PROJECT_DIRS", "BYPASS_TIER_ENABLED", "APPROVER_TIER_ENABLED",
+                   "EVALUATOR_ENABLED")
 
 
 def load_config() -> None:
@@ -157,7 +162,7 @@ def load_config() -> None:
     exist. Called once at startup; tests call it after monkeypatching os.environ.
     Ends by validating (fail-closed)."""
     global CHANNEL_ID, ALLOWED_USER_IDS, USE_API_KEY, BOTS, PROJECT_DIRS
-    global BYPASS_TIER_ENABLED, APPROVER_TIER_ENABLED
+    global BYPASS_TIER_ENABLED, APPROVER_TIER_ENABLED, EVALUATOR_ENABLED
     CHANNEL_ID = int(os.environ["DISCORD_CHANNEL_ID"])
     ALLOWED_USER_IDS = {
         int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").split(",") if x.strip()
@@ -165,6 +170,7 @@ def load_config() -> None:
     USE_API_KEY = os.environ.get("USE_API_KEY", "").strip().lower() in ("1", "true", "yes", "on")
     BYPASS_TIER_ENABLED = os.environ.get("ENABLE_BYPASS_TIER", "").strip().lower() in ("1", "true", "yes", "on")
     APPROVER_TIER_ENABLED = os.environ.get("ENABLE_APPROVER_TIER", "").strip().lower() in ("1", "true", "yes", "on")
+    EVALUATOR_ENABLED = os.environ.get("ENABLE_EXEC_EVALUATOR", "").strip().lower() in ("1", "true", "yes", "on")
     BOTS = {
         n: {"token": os.environ[f"DISCORD_BOT_{n}_TOKEN"],
             "config_dir": BOT_CONFIG_DIRS[n],
