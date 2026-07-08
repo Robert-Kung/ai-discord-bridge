@@ -54,8 +54,11 @@ def test_exec_settings_adds_bash_allow_preserving_deny(tmp_path, monkeypatch):
 
 
 def test_exec_settings_used_only_for_live_stream(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "BRIDGE_SETTINGS_PATH", "/base/settings.json")
-    monkeypatch.setattr(config, "EXEC_SETTINGS_PATH", "/exec/settings.json")
+    base = tmp_path / "settings.json"
+    base.write_text(json.dumps({"permissions": {"deny": ["Bash(curl)"]}}))
+    exec_path = tmp_path / "exec-settings.json"
+    monkeypatch.setattr(config, "BRIDGE_SETTINGS_PATH", str(base))
+    monkeypatch.setattr(config, "EXEC_SETTINGS_PATH", str(exec_path))
     monkeypatch.setattr(config, "BOTS", {"A": {"config_dir": "/c", "api_key": None}})
     monkeypatch.setattr(config, "USE_API_KEY", False)
     monkeypatch.setattr(config, "EXEC_BASH_ENABLED", True)
@@ -68,16 +71,21 @@ def test_exec_settings_used_only_for_live_stream(tmp_path, monkeypatch):
         args, _, _ = runner._exec_request_to_spawn(req)
         return args[args.index("--settings") + 1]
 
-    assert _settings_of(True) == "/exec/settings.json"   # live stream exec → Bash-allow
-    assert _settings_of(False) == "/base/settings.json"  # non-stream → base deny-only
+    assert _settings_of(True) == str(exec_path)   # live stream exec → Bash-allow
+    # regenerated fresh each spawn (tamper can't persist) with Bash allowed + deny kept
+    got = json.loads(exec_path.read_text())
+    assert "Bash" in got["permissions"]["allow"] and "Bash(curl)" in got["permissions"]["deny"]
+    assert _settings_of(False) == str(base)       # non-stream → base deny-only
     monkeypatch.setattr(config, "EXEC_BASH_ENABLED", False)
-    assert _settings_of(True) == "/base/settings.json"   # tier off → base even for stream
+    assert _settings_of(True) == str(base)        # tier off → base even for stream
 
 
 # ── 4.2 verify: config from discord-state, stripped env, own timeout ─────────
 @pytest.fixture
 def verify_env(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "STATE_DIR", tmp_path / "state")
+    # verify config lives in its OWN (read-only-in-prod) dir, not the rw discord-state.
+    monkeypatch.setattr(config, "VERIFY_CONFIG_DIR", tmp_path / "verify-config")
     config.verify_dir().mkdir(parents=True)
     project = "/home/user/proj"
     # workdir must live under STATE_DIR/worktrees (the executor validator pins it there)
@@ -120,13 +128,31 @@ def test_verify_runs_in_the_worktree(verify_env):
 
 
 def test_verify_command_never_read_from_worktree(verify_env):
-    """A .bridge-verify planted IN the worktree must be ignored — only discord-state
-    config is honored (the agent must not author its own verify)."""
+    """A .bridge-verify planted IN the worktree must be ignored — only the read-only
+    verify config dir is honored (the agent must not author its own verify)."""
     project, workdir = verify_env
     (Path(workdir) / ".bridge-verify").write_text("exit 0")
-    # no discord-state config written
+    # no verify-config written
     configured, passed, _ = asyncio.run(runner.run_verify(project, workdir))
     assert configured is False and passed is False
+
+
+def test_verify_config_dir_is_not_the_rw_state_volume():
+    """The verify config dir must NOT live under the rw discord-state volume — the
+    Bash-enabled exec agent mounts that rw and could forge its own green there. It
+    defaults under SHARED_DIR (mounted :ro in the executor per the example compose)."""
+    assert config.STATE_DIR not in config.VERIFY_CONFIG_DIR.parents
+    assert config.VERIFY_CONFIG_DIR != config.STATE_DIR
+
+
+def test_verify_slug_uses_resolved_project(verify_env):
+    """A non-canonical project path resolves to the same verify file (no silent
+    'not configured' from a slug mismatch with the whitelist)."""
+    project, workdir = verify_env
+    _write_verify(project, "true")  # keyed by the canonical slug
+    configured, passed, _ = asyncio.run(
+        runner.run_verify(project + "/./", workdir))  # non-canonical
+    assert configured is True and passed is True
 
 
 def test_verify_timeout(verify_env, monkeypatch):
@@ -135,6 +161,16 @@ def test_verify_timeout(verify_env, monkeypatch):
     _write_verify(project, "sleep 5")
     configured, passed, tail = asyncio.run(runner.run_verify(project, workdir))
     assert configured is True and passed is False and "timed out" in tail
+
+
+def test_verify_exposes_proc_for_disconnect_kill(verify_env):
+    """run_verify hands its process to on_proc so the IPC handler's disconnect watchdog
+    can kill it — without this a cancelled verify would run to VERIFY_TIMEOUT."""
+    project, workdir = verify_env
+    _write_verify(project, "true")
+    seen = []
+    asyncio.run(runner.run_verify(project, workdir, on_proc=seen.append))
+    assert len(seen) == 1 and hasattr(seen[0], "returncode")
 
 
 # ── 4.5 verify env carries no Discord tokens / API keys ──────────────────────
