@@ -261,15 +261,16 @@ single-file mount, so a container-side refresh cannot persist anyway).
   stripped from the subprocess env (§2), but any *other* environment variable
   present is still visible to a `bypass`-mode `printenv`. Keep host secrets out
   of the bridge's environment.
-- **API-key mode** (`USE_API_KEY=true`): that bot's own key is, by necessity,
-  injected into the subprocess env as `ANTHROPIC_API_KEY` — so a `bypass`-mode
-  `printenv` can read it. Only *that* bot's key is present (the other bot's key
-  and the whole auth/billing-override family — `ANTHROPIC_API_KEY_{A,B}`,
-  `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_*` — are
-  stripped). Unlike subscription mode (which keeps **no** key in the env), this
-  is an accepted trade-off: use a key with a **spend cap / scoped workspace** so
-  a leak is bounded. (A future milestone moves this to `apiKeyHelper` so the key
-  never enters the env at all.)
+- **API-key mode** (`USE_API_KEY=true`): the key does **not** enter the subprocess
+  env. At startup each bot's key is materialized as a `0600` file
+  (`<config-dir>/anthropic-api-key`) behind an executable `apiKeyHelper` wired into
+  that bot's config-dir `settings.json` (mechanism live-verified: the CLI consults
+  it); the whole `ANTHROPIC_API_KEY*` / auth/billing-override family is stripped
+  from the env in both modes, so `printenv` finds nothing. The key file itself
+  lives on a name-deny-guarded path (`Read` deny on the config dirs and on
+  `**/anthropic-api-key`) — name-based and evadable like the rest of §6, so still
+  use a key with a **spend cap / scoped workspace**. Subscription mode is untouched
+  by all of this: no helper is provisioned, and OAuth resolution is unchanged.
 
 ---
 

@@ -1,6 +1,7 @@
 """L3 — build_subprocess_env: the claude subprocess must never inherit the
-secret/auth-routing family (B review), and API-key mode must inject ONLY the
-bot's own key."""
+secret/auth-routing family (B review). Since egress-exec-isolation 3.x, API-key
+mode injects NOTHING either — the key reaches the CLI via the config-dir
+apiKeyHelper, so the subprocess env is key-free in both modes."""
 from bridge import config, runner
 
 # A host env that contains every var we care about leaking.
@@ -31,14 +32,13 @@ def test_subscription_mode_strips_everything(monkeypatch):
     assert not (_SENSITIVE & set(env)), f"leaked: {_SENSITIVE & set(env)}"
 
 
-def test_api_mode_injects_only_own_key(monkeypatch):
+def test_api_mode_env_is_key_free(monkeypatch):
+    """3.2: API-key mode no longer injects the key — the whole ANTHROPIC_API_KEY*
+    family is absent; auth flows through the config-dir apiKeyHelper instead."""
     monkeypatch.setattr(config, "USE_API_KEY", True)
     env = runner.build_subprocess_env(CFG_A, base_env=HOST)
-    assert env["ANTHROPIC_API_KEY"] == "keyA"          # this bot's own key
-    assert "ANTHROPIC_API_KEY_A" not in env             # raw per-bot vars stripped
-    assert "ANTHROPIC_API_KEY_B" not in env             # the OTHER bot's key gone
-    assert "ANTHROPIC_BASE_URL" not in env              # billing override gone
-    assert "CLAUDE_CODE_USE_BEDROCK" not in env
+    assert not (_SENSITIVE & set(env)), f"leaked: {_SENSITIVE & set(env)}"
+    assert "ANTHROPIC_API_KEY" not in env
 
 
 def test_discord_tokens_never_present(monkeypatch):
