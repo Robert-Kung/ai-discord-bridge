@@ -27,13 +27,13 @@
 - [x] 3.2 Paths injected into the exec prompt via `_attachment_context` — delimited, explicitly framed as untrusted DATA not instructions
 - [x] 3.3 Tests (tests/test_attachments.py): traversal/absolute/hidden-name neutralized; size + count caps; count-slice-then-size ordering; dedupe; dir outside any worktree; whitelist-only; untrusted framing
 
-## 4. Verification + Bash relaxation (milestone 4 — gated on egress-exec-isolation PHASE 2)
+## 4. Verification + Bash relaxation (milestone 4 — gated on egress-exec-isolation PHASE 2) — DONE (code; live smoke = operator)
 
-- [ ] 4.1 Startup gate: assert the phase-2 executor posture (per-container egress canary contract) before enabling anything in this milestone; fail-closed otherwise
-- [ ] 4.2 Per-project verify config stored in `discord-state` (NEVER read from the repo/worktree); runner executes it inside the worktree with stripped env (extend `_SUBPROCESS_ENV_DENY` scrubbing to this subprocess) + own timeout
-- [ ] 4.3 Append pass/fail + output tail to the result; absent config → explicit "not configured", never a green claim
-- [ ] 4.4 Enable Bash for the exec tier only inside the phase-2 executor container (mounts = job worktree + credential); credential/env denies unchanged
-- [ ] 4.5 Tests: milestone inert when phase-2 gate unproven; verify config never sourced from worktree; verify env contains no Discord tokens / API keys; denies still fire with Bash on
+- [x] 4.1 Gate `runner.m4_live()` = `EXEC_BASH_ENABLED` (ENABLE_EXEC_BASH, off by default) AND `EXECUTOR_SOCKET` set — i.e. the phase-2 executor whose Discord-deny egress canary executor.py proved before serving. Single-container/frontend → unproven → inert regardless of the flag (fail-closed by construction)
+- [x] 4.2 Per-project verify command read ONLY from `STATE_DIR/verify/<slug>` (never the repo/worktree); `runner.run_verify` runs it in the worktree with a stripped env (`build_verify_env` reuses `_SUBPROCESS_ENV_DENY` — no Discord token / API key), own `VERIFY_TIMEOUT`, own process group killed on timeout. Runs executor-side over the IPC verify op (`_validate_verify_request` pins project→whitelist, workdir→worktree root)
+- [x] 4.3 `frontend._post_verify` posts pass/fail + output tail above the diff gate; absent config → explicit "未設定 verify" (never a green claim); any failure degrades to a note, never blocks the gate
+- [x] 4.4 Exec-tier Bash: `write_exec_settings` (executor startup when m4_live) derives an exec settings file from settings.json = base deny family + `Bash` allow; `_exec_request_to_spawn` uses it ONLY for live stream jobs. Deny outranks allow so credential/env/curl/wget stay denied (defense-in-depth); base deny-only settings for every other call
+- [x] 4.5 Tests (tests/test_verify_bash.py, 16): tier inert when flag off / single-container; exec settings keep the whole deny family with Bash allowed and are used only for live stream; verify config never sourced from worktree (planted .bridge-verify ignored); verify runs in the worktree, times out, and its env + a real subprocess cannot see a Discord token / API key; IPC round-trip live vs inert; workdir-outside-worktree refused
 
 ## 5. Dual-account evaluator (milestone 5 — optional) — DONE
 

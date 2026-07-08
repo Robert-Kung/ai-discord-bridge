@@ -76,6 +76,9 @@ services:
       EXECUTOR_SOCKET: /home/user/.claude-shared/discord-state/executor.sock
       EXEC_TIMEOUT: ${EXEC_TIMEOUT:-1800}
       CLAUDE_TIMEOUT: ${CLAUDE_TIMEOUT:-300}
+      # M4 (post-task verify + exec-tier Bash) — LIVE only in this executor (proven
+      # phase-2 posture). Set on both services; it stays inert single-container.
+      ENABLE_EXEC_BASH: ${ENABLE_EXEC_BASH:-}
       # M4 approver tier: the frontend serves the socket + writes the mcp-config on the
       # shared volume; the executor spawns claude and must point at the SAME paths.
       APPROVER_SOCKET_PATH: /home/user/.claude-shared/discord-state/approver.sock
@@ -143,6 +146,8 @@ services:
       ENABLE_BYPASS_TIER: ${ENABLE_BYPASS_TIER:-}
       ENABLE_APPROVER_TIER: ${ENABLE_APPROVER_TIER:-}
       ENABLE_EXEC_EVALUATOR: ${ENABLE_EXEC_EVALUATOR:-}
+      # M4: the frontend reads this to decide whether to request post-task verify.
+      ENABLE_EXEC_BASH: ${ENABLE_EXEC_BASH:-}
       # cwd whitelist: !cd only accepts these paths (each must contain .git).
       # MUST match the project bind mounts below and the executor's copy.
       PROJECT_DIRS: >-

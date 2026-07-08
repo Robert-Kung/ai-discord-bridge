@@ -133,6 +133,21 @@ a settings file that fails validation) — if the deny does not fire, the bot
 speed-bump for honest mistakes, **not** a security boundary against a malicious
 request.
 
+**Exec-tier Bash (M4, `ENABLE_EXEC_BASH`, off by default).** Background exec jobs
+otherwise cannot run shell (headless `acceptEdits` grants no Bash). When enabled,
+the exec tier runs with an exec-settings file = the **same deny family + `Bash`
+allowed** (deny outranks allow, so credential/env/`curl`/`wget` stay blocked). This
+is **LIVE only inside the phase-2 executor container** (`runner.m4_live()`:
+`EXECUTOR_SOCKET` set, whose Discord-deny egress canary is proven at startup) — in
+the single-container posture the gate is unproven and the tier stays inert regardless
+of the flag. Rationale: only that posture makes the diff gate sound (the writable
+surface IS the reviewed surface) and denies shell any route to Discord. **Post-task
+verification** shares the same gate: a per-project command read **only** from
+`discord-state/verify/<slug>` (never the repo/worktree — the agent must not author
+its own verify) runs in the worktree with a **stripped env** (no Discord token / API
+key) and its own timeout, executor-side; absent config → an explicit "not
+configured", never a fake green.
+
 ---
 
 ## 5. Prompt-injection isolation

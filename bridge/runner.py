@@ -88,6 +88,7 @@ def build_claude_args(
     session_id: str | None = None,
     system_prompt_file: str | None = None,
     approver_mcp_config: str | None = None,
+    settings_path: str | None = None,
     stream: bool = False,
 ) -> list[str]:
     """Assemble the `claude -p` argv — the single place argv is constructed.
@@ -96,17 +97,19 @@ def build_claude_args(
     `--resume`, `--append-system-prompt-file`) each taking exactly one argument. No
     variadic flag is emitted; the prompt is always fed via stdin (never argv).
 
+    `settings_path` defaults to the base deny-family settings; the executor passes the
+    Bash-permitting exec-tier settings (M4) for stream jobs when the tier is live.
+
     `stream=True` selects the incremental JSONL surface for background exec jobs:
     `--output-format stream-json` REQUIRES `--verbose` in `-p` mode (the CLI hard-fails
     without it), so both are emitted together."""
+    settings = settings_path or config.BRIDGE_SETTINGS_PATH
     if stream:
         args = ["claude", "-p", "--output-format", "stream-json", "--verbose",
-                "--settings", config.BRIDGE_SETTINGS_PATH,
-                "--permission-mode", api_mode]
+                "--settings", settings, "--permission-mode", api_mode]
     else:
         args = ["claude", "-p", "--output-format", "json",
-                "--settings", config.BRIDGE_SETTINGS_PATH,
-                "--permission-mode", api_mode]
+                "--settings", settings, "--permission-mode", api_mode]
     if session_id:
         args += ["--resume", session_id]
     if system_prompt_file:
@@ -280,14 +283,104 @@ def _validate_exec_request(req: dict) -> "str | None":
     return None
 
 
+def _validate_verify_request(req: dict) -> "str | None":
+    """Trust boundary for the verify op: project must be a known project dir, and
+    workdir must be inside the worktree root (a job worktree) — never an arbitrary path.
+    The command itself is NOT taken from the request; run_verify reads it from
+    STATE_DIR/verify/<slug> keyed by project."""
+    project = req.get("project")
+    if not isinstance(project, str):
+        return "missing project"
+    rproj = Path(project).resolve()
+    if not any(rproj == p for p in config.PROJECT_DIRS):
+        return f"project {project!r} not in the whitelist"
+    workdir = req.get("workdir")
+    if not isinstance(workdir, str):
+        return "missing workdir"
+    wt_root = (config.STATE_DIR / "worktrees").resolve()
+    if not Path(workdir).resolve().is_relative_to(wt_root):
+        return "workdir is not a job worktree"
+    return None
+
+
+# ── M4: verification + exec-tier Bash (egress-exec-isolation phase-2 gated) ───
+def m4_live() -> bool:
+    """The M4 tier (post-task verify + exec-tier Bash) is LIVE only when opted in AND
+    running as the phase-2 executor. `EXECUTOR_SOCKET` set means this process is the
+    executor half of the split, whose Discord-deny egress canary is proven at startup
+    (executor.py runs it before serving) — so the diff gate soundly covers the writable
+    surface and shell can't reach Discord. Single-container / frontend → unproven → the
+    tier stays inert regardless of the flag (fail-closed)."""
+    return bool(config.EXEC_BASH_ENABLED and config.EXECUTOR_SOCKET)
+
+
+def write_exec_settings() -> None:
+    """Generate the exec-tier settings file: the base deny family (so credential/env/
+    curl/wget stay denied — defense-in-depth, deny outranks allow) PLUS `Bash` allowed.
+    Written under STATE_DIR at executor startup only when m4_live(); the file is derived
+    from settings.json so the deny family never drifts from the canary-proven one."""
+    base = json.loads(Path(config.BRIDGE_SETTINGS_PATH).read_text())
+    perms = base.setdefault("permissions", {})
+    allow = perms.setdefault("allow", [])
+    if "Bash" not in allow:
+        allow.append("Bash")
+    Path(config.EXEC_SETTINGS_PATH).write_text(json.dumps(base, indent=2) + "\n")
+    log.info("exec-tier settings written (Bash permitted) at %s", config.EXEC_SETTINGS_PATH)
+
+
+def build_verify_env(base_env: "dict | None" = None) -> dict:
+    """Env for the verify subprocess — NOT a claude child, so it gets no proxy and no
+    key. Strip the whole secret/auth-routing family (`_SUBPROCESS_ENV_DENY` covers the
+    Discord tokens + ANTHROPIC_API_KEY family): a verify command is agent-influenced
+    (it runs the repo's own conftest/scripts) and must never see a token to exfiltrate."""
+    src = os.environ if base_env is None else base_env
+    return {k: v for k, v in src.items() if k not in config._SUBPROCESS_ENV_DENY}
+
+
+async def run_verify(project: str, workdir: str) -> "tuple[bool, bool, str]":
+    """Run the per-project verify command (executor side). Returns
+    (configured, passed, output_tail). The command is read ONLY from
+    STATE_DIR/verify/<slug> — never the repo/worktree — so the agent cannot author its
+    own verify. Runs in the worktree with a stripped env + its own timeout + process
+    group (killed on timeout). Absent config → (False, False, '') so the caller states
+    'not configured', never a fake green."""
+    cmd_path = config.verify_command_path(sessions._cwd_slug(project))
+    if not cmd_path.exists():
+        return (False, False, "")
+    command = cmd_path.read_text().strip()
+    if not command:
+        return (False, False, "")
+    env = build_verify_env()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "bash", "-c", command, cwd=workdir, env=env,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True, limit=_STREAM_LIMIT)
+    except OSError as e:
+        return (True, False, f"verify could not start: {e}")
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=config.VERIFY_TIMEOUT)
+    except asyncio.TimeoutError:
+        await kill_process_group(proc)
+        return (True, False, f"⏱️ verify timed out ({config.VERIFY_TIMEOUT}s)")
+    tail = out.decode("utf-8", "replace")[-config.VERIFY_OUTPUT_TAIL:]
+    return (True, proc.returncode == 0, tail)
+
+
 def _exec_request_to_spawn(req: dict) -> tuple[list, dict, str]:
     """Assemble (argv, env, cwd) for a VALIDATED request — executor side, so argv/env
     construction (and the credentials they imply) never exist in the frontend."""
     cfg = config.BOTS[req["bot"]]
+    # exec-tier stream jobs get the Bash-permitting settings only when the M4 tier is
+    # live; every other call keeps the base deny-only settings.
+    settings = config.EXEC_SETTINGS_PATH if (req["stream"] and m4_live()) else None
     args = build_claude_args(
         req["api_mode"], session_id=req.get("session_id"),
         system_prompt_file=req.get("system_prompt_file"),
         approver_mcp_config=config.APPROVER_MCP_CONFIG_PATH if req["approver"] else None,
+        settings_path=settings,
         stream=req["stream"])
     env = build_subprocess_env(cfg)
     if req["approver"]:
@@ -317,6 +410,18 @@ async def _handle_executor_conn(reader: asyncio.StreamReader,
             req = json.loads(line.decode("utf-8", "replace"))
         except json.JSONDecodeError:
             req = None
+        # M4 verify op: a distinct, non-claude request. Inert unless the tier is live.
+        if isinstance(req, dict) and req.get("op") == "verify":
+            verr = _validate_verify_request(req)
+            if verr:
+                send({"ok": False, "error": verr})
+            elif not m4_live():
+                send({"ok": True, "configured": False, "passed": False, "tail": ""})
+            else:
+                configured, passed, tail = await run_verify(req["project"], req["workdir"])
+                send({"ok": True, "configured": configured, "passed": passed, "tail": tail})
+            await writer.drain()
+            return
         err = _validate_exec_request(req)
         if err:
             log.warning("executor: rejected request (%s)", err)
@@ -400,6 +505,34 @@ async def _handle_executor_conn(reader: asyncio.StreamReader,
     finally:
         if proc is not None:
             await kill_process_group(proc)
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+
+async def request_verify(project: str, workdir: str) -> "tuple[bool, bool, str]":
+    """Frontend → executor: run the per-project verify command in `workdir`. Returns
+    (configured, passed, tail). Any IPC failure → (False, False, error) so the caller
+    reports 'verify unavailable', never a fake green. Only meaningful in a split deploy;
+    in single-container the tier is inert and the frontend does not call this."""
+    req = {"op": "verify", "project": project, "workdir": workdir}
+    try:
+        reader, writer = await asyncio.open_unix_connection(
+            config.EXECUTOR_SOCKET, limit=_STREAM_LIMIT)
+    except OSError as e:
+        return (False, False, f"executor unreachable: {e}")
+    try:
+        writer.write((json.dumps(req) + "\n").encode())
+        await writer.drain()
+        line = await asyncio.wait_for(reader.readline(), timeout=config.VERIFY_TIMEOUT + 30)
+        resp = json.loads(line.decode("utf-8", "replace"))
+        if not resp.get("ok"):
+            return (False, False, f"verify refused: {resp.get('error')}")
+        return (bool(resp["configured"]), bool(resp["passed"]), resp.get("tail", ""))
+    except (OSError, asyncio.TimeoutError, ValueError, KeyError) as e:
+        return (False, False, f"verify IPC failure: {e}")
+    finally:
         try:
             writer.close()
         except Exception:

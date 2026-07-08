@@ -41,6 +41,10 @@ EXEC_ATTACH_MAX_COUNT = int(os.environ.get("EXEC_ATTACH_MAX_COUNT", "5"))
 EXEC_ATTACH_MAX_BYTES = int(os.environ.get("EXEC_ATTACH_MAX_BYTES", str(10 * 1024 * 1024)))
 EXEC_ATTACH_MAX_TOTAL_BYTES = int(os.environ.get("EXEC_ATTACH_MAX_TOTAL_BYTES", str(25 * 1024 * 1024)))
 EXEC_ATTACH_TIMEOUT = int(os.environ.get("EXEC_ATTACH_TIMEOUT", "60"))
+# M4 post-task verification: wall-clock cap on the verify command, and how much of its
+# combined output tail is appended to the result.
+VERIFY_TIMEOUT = int(os.environ.get("VERIFY_TIMEOUT", "600"))
+VERIFY_OUTPUT_TAIL = int(os.environ.get("VERIFY_OUTPUT_TAIL", "2000"))
 AUTO_FLUSH_THRESHOLD = int(os.environ.get("AUTO_FLUSH_THRESHOLD", "20"))
 # Startup-canary retry backoff (s) for the "claude can't run / not logged in" case.
 # We wait-and-retry IN-PROCESS instead of letting a SystemExit hand docker a tight
@@ -91,6 +95,21 @@ BOT_CONFIG_DIRS = {"A": "/home/user/.claude-bot-a", "B": "/home/user/.claude-bot
 # env. Filenames are config-level so validate_config and the runner provisioner agree.
 API_KEY_FILENAME = "anthropic-api-key"
 API_KEY_HELPER_FILENAME = "api-key-helper.sh"
+
+# M4 verify: per-project command lives under STATE_DIR/verify/<slug> (operator-authored,
+# NEVER read from the repo/worktree — the agent must not author its own verify command).
+# The Bash-permitting exec-tier settings file is generated under STATE_DIR at executor
+# startup (base deny family + Bash allow), never committed.
+def verify_dir() -> "Path":
+    return STATE_DIR / "verify"
+
+
+def verify_command_path(slug: str) -> "Path":
+    return verify_dir() / slug
+
+
+EXEC_SETTINGS_PATH = os.environ.get(
+    "EXEC_SETTINGS_PATH", str(STATE_DIR / "exec-settings.json"))
 
 # Repo-tracked server-side security settings (permissions.deny family). Passed via
 # --settings on EVERY claude -p call. In the container this is the bind-mounted
@@ -167,12 +186,18 @@ APPROVER_TIER_ENABLED: bool = False
 # Advisory only: the evaluator's findings are posted above the diff gate; the human
 # ✅/❌ remains the sole merge authority.
 EVALUATOR_ENABLED: bool = False
+# M4 — post-task verification + exec-tier Bash (ENABLE_EXEC_BASH), OFF by default.
+# Same trust decision (agent-grade code execution), so one flag. LIVE only inside the
+# phase-2 executor (EXECUTOR_SOCKET set + its Discord-deny egress canary proven at
+# startup); in the single-container posture the gate is unproven and the tier stays
+# inert regardless of the flag — see runner.m4_live(). Fail-closed by construction.
+EXEC_BASH_ENABLED: bool = False
 
 # The env-derived globals load_config() owns — single source of truth so tests can
 # snapshot/restore them without a hand-maintained list drifting out of sync.
 _CONFIG_GLOBALS = ("CHANNEL_ID", "ALLOWED_USER_IDS", "USE_API_KEY", "BOTS",
                    "PROJECT_DIRS", "BYPASS_TIER_ENABLED", "APPROVER_TIER_ENABLED",
-                   "EVALUATOR_ENABLED")
+                   "EVALUATOR_ENABLED", "EXEC_BASH_ENABLED")
 
 
 def load_config() -> None:
@@ -180,7 +205,7 @@ def load_config() -> None:
     exist. Called once at startup; tests call it after monkeypatching os.environ.
     Ends by validating (fail-closed)."""
     global CHANNEL_ID, ALLOWED_USER_IDS, USE_API_KEY, BOTS, PROJECT_DIRS
-    global BYPASS_TIER_ENABLED, APPROVER_TIER_ENABLED, EVALUATOR_ENABLED
+    global BYPASS_TIER_ENABLED, APPROVER_TIER_ENABLED, EVALUATOR_ENABLED, EXEC_BASH_ENABLED
     CHANNEL_ID = int(os.environ["DISCORD_CHANNEL_ID"])
     ALLOWED_USER_IDS = {
         int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").split(",") if x.strip()
@@ -189,6 +214,7 @@ def load_config() -> None:
     BYPASS_TIER_ENABLED = os.environ.get("ENABLE_BYPASS_TIER", "").strip().lower() in ("1", "true", "yes", "on")
     APPROVER_TIER_ENABLED = os.environ.get("ENABLE_APPROVER_TIER", "").strip().lower() in ("1", "true", "yes", "on")
     EVALUATOR_ENABLED = os.environ.get("ENABLE_EXEC_EVALUATOR", "").strip().lower() in ("1", "true", "yes", "on")
+    EXEC_BASH_ENABLED = os.environ.get("ENABLE_EXEC_BASH", "").strip().lower() in ("1", "true", "yes", "on")
     BOTS = {
         n: {"token": os.environ[f"DISCORD_BOT_{n}_TOKEN"],
             "config_dir": BOT_CONFIG_DIRS[n],
@@ -209,8 +235,9 @@ def load_executor_config() -> None:
     must never see bot tokens or channel routing (that is the point of the split).
     Populates only what the chokepoint needs: auth mode, per-bot config dirs/keys,
     and the project whitelist used to validate requested cwds."""
-    global USE_API_KEY, BOTS, PROJECT_DIRS
+    global USE_API_KEY, BOTS, PROJECT_DIRS, EXEC_BASH_ENABLED
     USE_API_KEY = os.environ.get("USE_API_KEY", "").strip().lower() in ("1", "true", "yes", "on")
+    EXEC_BASH_ENABLED = os.environ.get("ENABLE_EXEC_BASH", "").strip().lower() in ("1", "true", "yes", "on")
     BOTS = {
         n: {"token": None,  # structurally absent, not merely unset
             "config_dir": BOT_CONFIG_DIRS[n],
