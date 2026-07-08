@@ -203,7 +203,14 @@ collapses egress from "anywhere" to "Anthropic or Discord", which reduces autono
 injection-driven exfil but does **not** contain the OAuth credential. Real containment is
 **phase 2**: split into a `discord-frontend` container (Discord egress only, bot tokens)
 and an `executor` container (Anthropic egress only, credentials) so each secret lives
-where the *other* secret's egress can't reach. Egress containment also does nothing
+where the *other* secret's egress can't reach. Phase 2 is **shipped in
+`docker-compose.example.yml`** (executor entrypoint `executor.py`; semantic-request IPC
+over a shared-volume unix socket — no argv/env crosses it, the executor validates every
+parameter; per-container filters `filter.anthropic`/`filter.discord`; each container
+runs its own canary asserting its own deny direction, including the executor proving
+Discord is unreachable from where the credential lives). The live deploy remains on
+phase 1 until the operator cutover smoke (both canaries green, `@`-mention round-trip,
+forced OAuth refresh through the executor proxy). Egress containment also does nothing
 against the **reply channel** itself — a trusted `bypass` user can have the agent print a
 secret into its own Discord reply; that residual is bounded only by §3 (who you grant
 `bypass`), not by the network.
@@ -261,15 +268,16 @@ single-file mount, so a container-side refresh cannot persist anyway).
   stripped from the subprocess env (§2), but any *other* environment variable
   present is still visible to a `bypass`-mode `printenv`. Keep host secrets out
   of the bridge's environment.
-- **API-key mode** (`USE_API_KEY=true`): that bot's own key is, by necessity,
-  injected into the subprocess env as `ANTHROPIC_API_KEY` — so a `bypass`-mode
-  `printenv` can read it. Only *that* bot's key is present (the other bot's key
-  and the whole auth/billing-override family — `ANTHROPIC_API_KEY_{A,B}`,
-  `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_*` — are
-  stripped). Unlike subscription mode (which keeps **no** key in the env), this
-  is an accepted trade-off: use a key with a **spend cap / scoped workspace** so
-  a leak is bounded. (A future milestone moves this to `apiKeyHelper` so the key
-  never enters the env at all.)
+- **API-key mode** (`USE_API_KEY=true`): the key does **not** enter the subprocess
+  env. At startup each bot's key is materialized as a `0600` file
+  (`<config-dir>/anthropic-api-key`) behind an executable `apiKeyHelper` wired into
+  that bot's config-dir `settings.json` (mechanism live-verified: the CLI consults
+  it); the whole `ANTHROPIC_API_KEY*` / auth/billing-override family is stripped
+  from the env in both modes, so `printenv` finds nothing. The key file itself
+  lives on a name-deny-guarded path (`Read` deny on the config dirs and on
+  `**/anthropic-api-key`) — name-based and evadable like the rest of §6, so still
+  use a key with a **spend cap / scoped workspace**. Subscription mode is untouched
+  by all of this: no helper is provisioned, and OAuth resolution is unchanged.
 
 ---
 

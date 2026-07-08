@@ -20,20 +20,19 @@
 - [x] 2.2 `bot.main` runs `run_egress_canary` before the settings canary when `EGRESS_PROXY_URL` is set: OPEN_EGRESS / OPEN_PROXY → SystemExit; ANTHROPIC_DOWN → backoff retry (reuses the canary loop shape). Skipped when no proxy configured (uncontained deploy).
 - [x] 2.3 Unit tests for all four classifications, incl. the allow-all-proxy state (tests/test_egress.py)
 
-## 3. apiKeyHelper (API-key mode — independent hardening) — DEFERRED
+## 3. apiKeyHelper (API-key mode — independent hardening) — DONE
 
-> **Deferred: needs live precedence verification.** apiKeyHelper is set in Claude Code
-> settings; adding it to the shared `--settings` file risks overriding **subscription
-> mode** (the live deployment's OAuth auth), which SPEC §11 already flags as "precedence
-> assumed, not verified". It only hardens API-key mode (the lesser, spend-cappable secret)
-> and is orthogonal to the OAuth credential this change is motivated by. Do it as a focused
-> follow-up with a live claude to confirm apiKeyHelper does not shadow OAuth auth.
+> Deferral resolved 2026-07-08: the shadowing risk was specific to putting apiKeyHelper
+> in the SHARED `--settings` file. Implementation avoids it by construction — the helper
+> lives in each bot's **config-dir** settings.json and is provisioned **only when
+> `USE_API_KEY` is set** (subscription mode writes nothing). Live-verified that a
+> config-dir apiKeyHelper is consulted by `claude -p` (fake key → "Invalid API key").
 
-- [ ] 3.1 Provision an `apiKeyHelper` script per bot config dir; key file outside all mounted project dirs (remains on the container fs — name-deny-guarded only)
-- [ ] 3.2 Remove `ANTHROPIC_API_KEY` injection from `build_subprocess_env`; keep the deny-list scrub of the whole key family
-- [ ] 3.3 Add the key file path to the credential-read deny family in settings.json
-- [ ] 3.4 Update `validate_config` API-key-mode check to validate the helper is present instead of the env key
-- [ ] 3.5 Tests: subprocess env has no `ANTHROPIC_API_KEY*`; subscription mode path unchanged
+- [x] 3.1 `runner.provision_api_key_helper` (called from bot.main, gated on USE_API_KEY): 0600 `anthropic-api-key` + executable `api-key-helper.sh` per config dir; config-dir settings.json merged, fail-loud on corruption
+- [x] 3.2 `ANTHROPIC_API_KEY` injection removed from `build_subprocess_env`; deny-list scrub of the whole family unchanged (subprocess env now key-free in BOTH modes)
+- [x] 3.3 `Read(//home/user/**/anthropic-api-key)` added to the settings.json deny family
+- [x] 3.4 `validate_config`: API-key mode accepts an env key OR a pre-dropped key file per bot; neither → SystemExit
+- [x] 3.5 Tests (test_apikey_helper.py, test_env_scrub.py): env key-free in both modes; provisioning (perms/exec/settings-merge/corrupt-refuse/file-seeded/no-source-refuse); validate_config file-seeded accept + no-source exit; subscription-mode zero side effects
 
 ## 4. Docs
 
@@ -43,7 +42,7 @@
 
 ## 5. Phase 2 (split containers — after bridge-restructure)
 
-- [ ] 5.1 Split compose into `discord-frontend` (Discord-only egress, bot tokens) and `executor` (Anthropic-only egress, credentials); IPC over unix socket on a shared volume
-- [ ] 5.2 Per-container proxy allow-lists (Discord hosts vs Anthropic hosts)
-- [ ] 5.3 **Per-container canaries**: each container runs its own three-probe fail-closed canary asserting its own deny direction — executor proves Discord unreachable *from the executor*; frontend proves Anthropic unreachable from the frontend
-- [ ] 5.4 Tests/smoke: full pytest; example.yml mirrors the split; live smoke (both canaries green, `@`-mention round-trip, forced OAuth refresh traverses executor proxy)
+- [x] 5.1 Split shipped: `docker-compose.example.yml` = `discord-frontend` (bot tokens, Discord-only egress, NO credentials/config-dirs/settings.json) + `executor` (`executor.py` entrypoint — credentials, Anthropic-only egress, NO Discord material; `load_executor_config` never reads it). IPC: semantic JSONL requests over a unix socket on the shared discord-state volume — no argv/env crosses the socket; the executor validates every parameter (`runner._validate_exec_request`: bot/mode whitelist, spf pinned under STATE_DIR, cwd pinned to project/worktree whitelist, timeout cap) so a compromised frontend cannot request arbitrary exec. Disconnect-kill contract for cancel/timeout. Both IPC halves live in runner.py so the AST boundary (argv assembly + spawn only in runner) holds by construction. spf files moved /tmp → STATE_DIR/sysprompt (cross-container); approver socket/mcp-config paths env-overridable onto the shared volume
+- [x] 5.2 Per-container proxy allow-lists: `egress-proxy/filter.anthropic` (api.anthropic.com only — the 1.1-pinned host) and `filter.discord`; one proxy image, `ARG FILTER` selects at build
+- [x] 5.3 Per-container canaries: `classify_egress` extended with a forbidden-peer probe set (`EGRESS_PEER_REACHABLE` = hard refuse; unproven peer deny = INCONCLUSIVE retry); shared `egress.canary_gate` used by bot.py (frontend: discord.com required, api.anthropic.com forbidden — only when EXECUTOR_SOCKET set) and executor.py (api.anthropic.com required, all Discord hosts forbidden)
+- [ ] 5.4 Tests/smoke: full pytest green (206; test_executor_ipc.py: validator boundary, real-socket converse+streaming round-trips, disconnect-kill with a live child process, compose secret-placement guarantees); example.yml mirrors the split + `docker compose config` valid. **REMAINING (operator): live smoke** — both canaries green, `@`-mention round-trip, forced OAuth refresh traverses the executor proxy (rerun scripts/expire-oauth-token.sh flow), then update the live gitignored compose

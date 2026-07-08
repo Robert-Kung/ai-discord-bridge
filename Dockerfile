@@ -17,7 +17,9 @@ RUN apt-get update \
 RUN pip install --no-cache-dir discord.py==2.4.0
 
 WORKDIR /app
-COPY bot.py approver_policy.py mcp_approver.py approver-allowlist.json settings.json /app/
+COPY bot.py executor.py approver_policy.py mcp_approver.py approver-allowlist.json settings.json /app/
 COPY bridge/ /app/bridge/
 
+# Default entrypoint = single-container frontend+executor. The phase-2 split
+# overrides `command:` to /app/executor.py for the executor service.
 CMD ["python3", "/app/bot.py"]
