@@ -39,6 +39,13 @@ async def main():
     # keeping only the awaiting-review ones — else uploaded content accumulates forever.
     jobs.gc_job_state({jid for ids in _keep.values() for jid in ids})
 
+    # API-key mode (egress-exec-isolation 3.x): materialize each bot's key as a
+    # config-dir file + apiKeyHelper BEFORE any claude call (the settings canary below
+    # is one). Subscription mode: skipped entirely — the OAuth path is never touched.
+    if config.USE_API_KEY:
+        for _cfg in config.BOTS.values():
+            runner.provision_api_key_helper(_cfg)
+
     # Fail-closed startup assertion: a dead approve tier (script missing) would only
     # surface the first time someone uses `!mode approve`; the default-mode canary
     # cannot catch it, so assert here.

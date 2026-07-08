@@ -6,6 +6,7 @@
       "Read(//home/user/.claude-bot-a/**)",
       "Read(//home/user/.claude-bot-b/**)",
       "Read(//home/user/**/.credentials.json)",
+      "Read(//home/user/**/anthropic-api-key)",
       "Bash(env)",
       "Bash(env:*)",
       "Bash(printenv)",

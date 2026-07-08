@@ -23,14 +23,14 @@ log = logging.getLogger("bridge.runner")
 
 
 def build_subprocess_env(cfg: dict, base_env: "dict | None" = None) -> dict:
-    """Env for a `claude -p` subprocess: strip the secret/auth-routing family, set
-    this bot's CLAUDE_CONFIG_DIR, and — API-key mode only — inject ONLY this bot's
-    own key. Pure: pass base_env in tests instead of monkeypatching os.environ."""
+    """Env for a `claude -p` subprocess: strip the secret/auth-routing family and set
+    this bot's CLAUDE_CONFIG_DIR. API-key mode no longer injects the key into the env —
+    the CLI reads it via the per-bot `apiKeyHelper` provisioned in the config dir
+    (see provision_api_key_helper), so `printenv` and env-dump vectors find nothing.
+    Pure: pass base_env in tests instead of monkeypatching os.environ."""
     src = os.environ if base_env is None else base_env
     env = {k: v for k, v in src.items() if k not in config._SUBPROCESS_ENV_DENY}
     env["CLAUDE_CONFIG_DIR"] = cfg["config_dir"]
-    if config.USE_API_KEY and cfg.get("api_key"):
-        env["ANTHROPIC_API_KEY"] = cfg["api_key"]
     # Egress containment (phase 1): route `claude`'s HTTPS through the allow-list proxy
     # and drop non-essential telemetry so those endpoints need not be opened. The proxy
     # env is plumbing, not the boundary — the boundary is the routeless internal network.
@@ -39,6 +39,42 @@ def build_subprocess_env(cfg: dict, base_env: "dict | None" = None) -> dict:
         env["HTTP_PROXY"] = config.EGRESS_PROXY_URL
         env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
     return env
+
+
+def provision_api_key_helper(cfg: dict) -> None:
+    """API-key mode ONLY (caller gates on config.USE_API_KEY): materialize this bot's
+    key as a 0600 file in its config dir, an executable apiKeyHelper that emits it, and
+    point the config-dir settings.json at the helper. Subscription mode never calls
+    this, so the OAuth auth path is untouched by construction (the deferred-task
+    precedence concern). Live-verified 2026-07-08: a config-dir settings.json
+    apiKeyHelper IS consulted by `claude -p`. Fail-loud: a config dir we cannot
+    provision means auth would resolve somewhere we did not choose."""
+    d = Path(cfg["config_dir"])
+    d.mkdir(parents=True, exist_ok=True)
+    key = cfg.get("api_key")
+    key_file = d / config.API_KEY_FILENAME
+    if key:  # env-seeded: (re)write the key file from .env
+        key_file.write_text(key + "\n")
+        key_file.chmod(0o600)
+    elif not key_file.exists():  # file-seeded: operator must have dropped it
+        raise SystemExit(
+            f"USE_API_KEY set but no key for this bot: neither an env key nor "
+            f"{key_file} exists — refusing to start with unresolved auth.")
+    helper = d / config.API_KEY_HELPER_FILENAME
+    helper.write_text(f'#!/bin/sh\nexec cat "$(dirname "$0")/{config.API_KEY_FILENAME}"\n')
+    helper.chmod(0o700)
+    settings_path = d / "settings.json"
+    settings: dict = {}
+    if settings_path.exists():
+        try:
+            settings = json.loads(settings_path.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            raise SystemExit(
+                f"cannot parse {settings_path} to install apiKeyHelper: {e} — "
+                "refusing to guess (fix or remove the file).") from e
+    settings["apiKeyHelper"] = str(helper)
+    settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+    log.info("apiKeyHelper provisioned for config dir %s", d)
 
 
 def build_claude_args(

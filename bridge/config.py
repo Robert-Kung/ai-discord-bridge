@@ -78,6 +78,12 @@ ANTHROPIC_API_HOST = "api.anthropic.com"
 # the bots do NOT run under the operator's own ~/.claude / ~/.claude-b account dirs.
 BOT_CONFIG_DIRS = {"A": "/home/user/.claude-bot-a", "B": "/home/user/.claude-bot-b"}
 
+# API-key mode auth material inside a bot config dir (egress-exec-isolation 3.x):
+# the key lives in a 0600 file read by an apiKeyHelper script, NOT in the subprocess
+# env. Filenames are config-level so validate_config and the runner provisioner agree.
+API_KEY_FILENAME = "anthropic-api-key"
+API_KEY_HELPER_FILENAME = "api-key-helper.sh"
+
 # Repo-tracked server-side security settings (permissions.deny family). Passed via
 # --settings on EVERY claude -p call. In the container this is the bind-mounted
 # ./settings.json; for host-direct runs it falls back to the repo copy.
@@ -195,9 +201,12 @@ def validate_config() -> None:
             "anyone in the channel drive the bots, including bypass-mode execution."
         )
     if USE_API_KEY:
-        missing = [n for n, c in BOTS.items() if not c.get("api_key")]
+        missing = [n for n, c in BOTS.items()
+                   if not c.get("api_key")
+                   and not (Path(c["config_dir"]) / API_KEY_FILENAME).exists()]
         if missing:
             raise SystemExit(
-                f"USE_API_KEY is set but ANTHROPIC_API_KEY_{'/'.join(missing)} is empty. "
-                "Provide a per-bot key, or unset USE_API_KEY to use subscription auth."
+                f"USE_API_KEY is set but bot(s) {'/'.join(missing)} have no key source: "
+                f"set ANTHROPIC_API_KEY_<bot> in .env, or drop an {API_KEY_FILENAME} "
+                "file in the bot's config dir; or unset USE_API_KEY for subscription auth."
             )
