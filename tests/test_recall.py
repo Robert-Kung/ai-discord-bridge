@@ -9,6 +9,9 @@ from bridge import config, memory, state
 def _summaries(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "SUMMARIES_DIR", tmp_path / "sum")
     monkeypatch.setattr(config, "PROJECT_NOTES_DIR", tmp_path / "notes")
+    # build_combined_system_prompt now writes the merged file under STATE_DIR/sysprompt
+    # (was /tmp) so the executor can read it over the shared volume; keep it in tmp here.
+    monkeypatch.setattr(config, "STATE_DIR", tmp_path / "state")
 
 
 # ── lineage frontmatter ─────────────────────────────────────────────────────
