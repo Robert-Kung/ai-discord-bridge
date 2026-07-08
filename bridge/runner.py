@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 from pathlib import Path
 from typing import Callable
@@ -190,6 +191,250 @@ async def run_settings_canary(bot_name: str = "B") -> str:
     return classify_canary(rc, stdout)
 
 
+# ── Executor IPC (egress-exec-isolation 5.x) ─────────────────────────────────
+# Split deploy: the frontend never spawns claude — it sends a SEMANTIC request over a
+# unix socket and the executor (the only container with credentials) assembles argv/env
+# and spawns. The request carries no argv and no env: a compromised frontend can only
+# ask for parameter combinations the validator below accepts, never arbitrary exec.
+# Both halves live in THIS module on purpose — the AST boundary test pins argv assembly
+# and subprocess launch to the runner, and the IPC server is exactly those two things.
+#
+# Wire protocol (JSONL over the socket, one connection per call):
+#   request  {"bot","api_mode","session_id","system_prompt_file","cwd","prompt",
+#             "timeout","approver","stream"}
+#   non-stream response  {"ok":true,"rc":int|null,"stdout":str,"stderr":str}
+#                        | {"ok":false,"error":str}
+#   stream response      {"ev":"line","data":str}* then {"ev":"exit","rc":int|null}
+#                        | {"ev":"error","error":str}
+# rc null = executor-side timeout (process group killed). Client disconnect (any
+# reason, incl. client-side timeout or job cancel) → the executor kills the group.
+
+_SESSION_ID_RE = re.compile(r"^[0-9a-zA-Z-]{8,64}$")
+
+
+def _validate_exec_request(req: dict) -> "str | None":
+    """Return an error string if the request is not a parameter combination we are
+    willing to run, else None. This is the executor's trust boundary with the frontend."""
+    if not isinstance(req, dict):
+        return "request is not an object"
+    if req.get("bot") not in config.BOTS:
+        return f"unknown bot {req.get('bot')!r}"
+    if req.get("api_mode") not in set(config.MODE_ALIASES.values()):
+        return f"disallowed api_mode {req.get('api_mode')!r}"
+    sid = req.get("session_id")
+    if sid is not None and not (isinstance(sid, str) and _SESSION_ID_RE.match(sid)):
+        return "malformed session_id"
+    spf = req.get("system_prompt_file")
+    if spf is not None:
+        p = Path(str(spf)).resolve()
+        if not str(p).startswith(str(config.STATE_DIR.resolve()) + os.sep):
+            return "system_prompt_file outside STATE_DIR"
+    cwd = req.get("cwd")
+    if not isinstance(cwd, str):
+        return "missing cwd"
+    rcwd = Path(cwd).resolve()
+    allowed = (rcwd == Path(config.DEFAULT_CWD).resolve()
+               or any(rcwd == p or str(rcwd).startswith(str(p) + os.sep)
+                      for p in config.PROJECT_DIRS)
+               or str(rcwd).startswith(str((config.STATE_DIR / "worktrees").resolve()) + os.sep))
+    if not allowed:
+        return f"cwd {cwd!r} not in the project/worktree whitelist"
+    t = req.get("timeout")
+    if not isinstance(t, (int, float)) or not (0 < t <= max(
+            config.EXEC_TIMEOUT, config.approve_call_timeout()) + 60):
+        return f"timeout {t!r} out of range"
+    if not isinstance(req.get("prompt"), str):
+        return "missing prompt"
+    if not isinstance(req.get("approver"), bool) or not isinstance(req.get("stream"), bool):
+        return "approver/stream must be booleans"
+    return None
+
+
+def _exec_request_to_spawn(req: dict) -> tuple[list, dict, str]:
+    """Assemble (argv, env, cwd) for a VALIDATED request — executor side, so argv/env
+    construction (and the credentials they imply) never exist in the frontend."""
+    cfg = config.BOTS[req["bot"]]
+    args = build_claude_args(
+        req["api_mode"], session_id=req.get("session_id"),
+        system_prompt_file=req.get("system_prompt_file"),
+        approver_mcp_config=config.APPROVER_MCP_CONFIG_PATH if req["approver"] else None,
+        stream=req["stream"])
+    env = build_subprocess_env(cfg)
+    if req["approver"]:
+        env["APPROVER_SOCKET"] = config.APPROVER_SOCKET_PATH
+    return args, env, req["cwd"]
+
+
+async def _handle_executor_conn(reader: asyncio.StreamReader,
+                                writer: asyncio.StreamWriter) -> None:
+    """One connection = one claude run. Any validation/spawn error is reported and the
+    connection closed; a client disconnect at any point kills the process group."""
+    def send(obj: dict) -> None:
+        writer.write((json.dumps(obj) + "\n").encode())
+
+    proc = None
+    try:
+        line = await asyncio.wait_for(reader.readline(), timeout=30)
+        try:
+            req = json.loads(line.decode("utf-8", "replace"))
+        except json.JSONDecodeError:
+            req = None
+        err = _validate_exec_request(req)
+        if err:
+            log.warning("executor: rejected request (%s)", err)
+            send({"ok": False, "error": err} if not (isinstance(req, dict) and req.get("stream"))
+                 else {"ev": "error", "error": err})
+            await writer.drain()
+            return
+        args, env, cwd = _exec_request_to_spawn(req)
+        timeout = float(req["timeout"])
+        log.info("executor: run bot=%s mode=%s stream=%s cwd=%s prompt_len=%d",
+                 req["bot"], req["api_mode"], req["stream"], cwd, len(req["prompt"]))
+        proc = await asyncio.create_subprocess_exec(
+            *args, env=env, cwd=cwd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+            limit=_STREAM_LIMIT,
+        )
+        # disconnect-kill contract: if the client goes away (cancel, crash, its own
+        # timeout), the run must not keep burning quota executor-side.
+        disconnect = asyncio.ensure_future(reader.read())
+
+        async def _guarded(coro):
+            run = asyncio.ensure_future(coro)
+            done, _ = await asyncio.wait({run, disconnect},
+                                         return_when=asyncio.FIRST_COMPLETED)
+            if run in done:
+                return run.result()
+            run.cancel()
+            raise ConnectionResetError("client disconnected")
+
+        try:
+            if req["stream"]:
+                try:
+                    proc.stdin.write(req["prompt"].encode())
+                    await _guarded(proc.stdin.drain())
+                    proc.stdin.close()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                try:
+                    async with asyncio.timeout(timeout):
+                        while True:
+                            raw = await _guarded(proc.stdout.readline())
+                            if not raw:
+                                break
+                            send({"ev": "line", "data": raw.decode("utf-8", "replace")})
+                            await _guarded(writer.drain())
+                        await asyncio.wait_for(proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    await kill_process_group(proc)
+                    send({"ev": "exit", "rc": None})
+                    await writer.drain()
+                    return
+                send({"ev": "exit", "rc": proc.returncode})
+                await writer.drain()
+            else:
+                rc, stdout, stderr = None, b"", b""
+                try:
+                    stdout, stderr = await _guarded(asyncio.wait_for(
+                        proc.communicate(input=req["prompt"].encode()), timeout=timeout))
+                    rc = proc.returncode
+                except asyncio.TimeoutError:
+                    await kill_process_group(proc)
+                send({"ok": True, "rc": rc,
+                      "stdout": stdout.decode("utf-8", "replace"),
+                      "stderr": stderr.decode("utf-8", "replace")})
+                await writer.drain()
+        finally:
+            disconnect.cancel()
+    except (ConnectionResetError, BrokenPipeError):
+        log.info("executor: client disconnected — killing the run")
+    except Exception:
+        log.exception("executor: connection handler failed")
+        try:
+            send({"ok": False, "error": "internal executor error"})
+            await writer.drain()
+        except Exception:
+            pass
+    finally:
+        if proc is not None:
+            await kill_process_group(proc)
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+
+async def serve_executor() -> None:
+    """Bind the executor unix socket and serve forever (executor.py entrypoint)."""
+    sock = config.EXECUTOR_SOCKET
+    if not sock:
+        raise SystemExit("serve_executor requires EXECUTOR_SOCKET to be set")
+    Path(sock).parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.unlink(sock)
+    except FileNotFoundError:
+        pass
+    server = await asyncio.start_unix_server(_handle_executor_conn, path=sock)
+    os.chmod(sock, 0o600)
+    log.info("executor serving on %s", sock)
+    async with server:
+        await server.serve_forever()
+
+
+class RemoteExecHandle:
+    """Cancellation handle for a remote streaming run: closing the IPC connection is
+    the kill (the executor's disconnect-kill contract). Quacks enough like a Process
+    for jobs.attach_proc/cancel_job."""
+    def __init__(self, writer: asyncio.StreamWriter):
+        self._writer = writer
+        self.returncode: "int | None" = None
+        self.pid = -1
+
+    async def remote_kill(self) -> None:
+        self.returncode = -15
+        try:
+            self._writer.close()
+        except Exception:
+            pass
+
+
+def _build_remote_request(bot_name: str, prompt: str, *, api_mode: str, sid: "str | None",
+                          system_prompt_file, cwd: str, timeout: float,
+                          approver: bool, stream: bool) -> dict:
+    return {"bot": bot_name, "api_mode": api_mode, "session_id": sid,
+            "system_prompt_file": str(system_prompt_file) if system_prompt_file else None,
+            "cwd": cwd, "prompt": prompt, "timeout": timeout,
+            "approver": approver, "stream": stream}
+
+
+async def _remote_run(req: dict) -> tuple["int | None", bytes, bytes]:
+    """Non-stream remote call. Mirrors _run_claude_subprocess's return contract:
+    (rc, stdout, stderr); rc None = timeout. IPC failure → rc 255 with the error in
+    stderr (surfaces as a normal call failure, never crashes the caller)."""
+    try:
+        reader, writer = await asyncio.open_unix_connection(config.EXECUTOR_SOCKET)
+    except OSError as e:
+        return (255, b"", f"executor unreachable: {e}".encode())
+    try:
+        writer.write((json.dumps(req) + "\n").encode())
+        await writer.drain()
+        line = await asyncio.wait_for(reader.readline(), timeout=req["timeout"] + 30)
+        resp = json.loads(line.decode("utf-8", "replace"))
+        if not resp.get("ok"):
+            return (255, b"", f"executor refused: {resp.get('error')}".encode())
+        return (resp["rc"], resp["stdout"].encode(), resp["stderr"].encode())
+    except (OSError, asyncio.TimeoutError, json.JSONDecodeError, KeyError) as e:
+        return (255, b"", f"executor IPC failure: {e}".encode())
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+
 # The permission/exec CHOKEPOINT (D3). Every agent invocation funnels through here;
 # it is the only caller of build_claude_args + _run_claude_subprocess. Layers do NOT
 # call it directly — they go through converse / execute below.
@@ -211,14 +456,6 @@ async def _call_claude(
     approver = mode == "approve"  # per-command MCP approval tier (runs in `default` mode)
 
     sid = sessions.load_session(bot_name, cwd) if use_session else None
-    args = build_claude_args(
-        api_mode, session_id=sid,
-        system_prompt_file=str(system_prompt_file) if system_prompt_file else None,
-        approver_mcp_config=config.APPROVER_MCP_CONFIG_PATH if approver else None)
-
-    env = build_subprocess_env(cfg)
-    if approver:
-        env["APPROVER_SOCKET"] = config.APPROVER_SOCKET_PATH
     log.info("[%s] call mode=%s session=%s cwd=%s prompt_len=%d",
              bot_name, api_mode, use_session, cwd, len(prompt))
 
@@ -226,8 +463,22 @@ async def _call_claude(
 
     # Serialize calls sharing the same cwd (A/B same project → no concurrent writes)
     async with state.cwd_locks[cwd]:
-        rc, stdout, stderr = await _run_claude_subprocess(
-            args, env, cwd=cwd, prompt=prompt, timeout=call_timeout)
+        if config.EXECUTOR_SOCKET:
+            # split deploy: semantic request over IPC — argv/env exist only executor-side
+            rc, stdout, stderr = await _remote_run(_build_remote_request(
+                bot_name, prompt, api_mode=api_mode, sid=sid,
+                system_prompt_file=system_prompt_file, cwd=cwd,
+                timeout=call_timeout, approver=approver, stream=False))
+        else:
+            args = build_claude_args(
+                api_mode, session_id=sid,
+                system_prompt_file=str(system_prompt_file) if system_prompt_file else None,
+                approver_mcp_config=config.APPROVER_MCP_CONFIG_PATH if approver else None)
+            env = build_subprocess_env(cfg)
+            if approver:
+                env["APPROVER_SOCKET"] = config.APPROVER_SOCKET_PATH
+            rc, stdout, stderr = await _run_claude_subprocess(
+                args, env, cwd=cwd, prompt=prompt, timeout=call_timeout)
 
     if rc is None:
         return (f"⏱️ 響應超時（{call_timeout}s）", False)
@@ -374,9 +625,14 @@ def stream_ctx_tokens(usage: dict) -> int:
             + src.get("cache_creation_input_tokens", 0))
 
 
-async def kill_process_group(proc: "asyncio.subprocess.Process", grace: float = 5.0) -> None:
+async def kill_process_group(proc, grace: float = 5.0) -> None:
     """SIGTERM the process GROUP (grandchildren die too — spawned with start_new_session),
-    wait a grace period, then SIGKILL, then reap. Safe to call on an already-dead proc."""
+    wait a grace period, then SIGKILL, then reap. Safe to call on an already-dead proc.
+    A RemoteExecHandle (split deploy) is killed by closing its IPC connection instead —
+    the executor's disconnect-kill contract does the group kill on its side."""
+    if hasattr(proc, "remote_kill"):
+        await proc.remote_kill()
+        return
     if proc.returncode is not None:
         return
     try:
@@ -444,13 +700,25 @@ async def run_streaming_exec(
     cfg = config.BOTS[bot_name]
     api_mode = config.MODE_ALIASES.get(mode, mode)
     sid = sessions.load_session(bot_name, project)
+    log.info("[%s] exec-job start mode=%s cwd=%s project=%s prompt_len=%d",
+             bot_name, api_mode, cwd, project, len(prompt))
+
+    if config.EXECUTOR_SOCKET:
+        async with state.cwd_locks[project]:
+            final, outcome = await _remote_stream_exec(
+                _build_remote_request(bot_name, prompt, api_mode=api_mode, sid=sid,
+                                      system_prompt_file=system_prompt_file, cwd=cwd,
+                                      timeout=timeout, approver=False, stream=True),
+                on_trace=on_trace, on_proc=on_proc, should_abort=should_abort)
+        if outcome is not None:
+            return (None, outcome)
+        return _finish_stream_result(final, bot_name, project)
+
     args = build_claude_args(
         api_mode, session_id=sid,
         system_prompt_file=str(system_prompt_file) if system_prompt_file else None,
         stream=True)
     env = build_subprocess_env(cfg)
-    log.info("[%s] exec-job start mode=%s cwd=%s project=%s prompt_len=%d",
-             bot_name, api_mode, cwd, project, len(prompt))
 
     async with state.cwd_locks[project]:
         proc = await asyncio.create_subprocess_exec(
@@ -508,7 +776,14 @@ async def run_streaming_exec(
     if final is None:
         # cancelled (killed mid-stream) or the process died without a result event
         return (None, EXEC_FAILED)
+    return _finish_stream_result(final, bot_name, project)
 
+
+def _finish_stream_result(final: "dict | None", bot_name: str, project: str) -> tuple["str | None", str]:
+    """Shared result-event bookkeeping for the local and remote streaming paths:
+    session save + last-iteration token accounting keyed by PROJECT identity."""
+    if final is None:
+        return (None, EXEC_FAILED)
     reply = final.get("result") or "(空回覆)"
     new_sid = final.get("session_id")
     if new_sid:
@@ -518,3 +793,72 @@ async def run_streaming_exec(
         state.session_ctx_tokens[(bot_name, project)] = ctx
         log.info("[%s] exec-job context now ~%dk tokens (project=%s)", bot_name, ctx // 1000, project)
     return (reply, EXEC_DONE)
+
+
+async def _remote_stream_exec(
+    req: dict,
+    *,
+    on_trace: "Callable[[str], None] | None",
+    on_proc: "Callable | None",
+    should_abort: "Callable[[], bool] | None",
+) -> tuple["dict | None", "str | None"]:
+    """Streaming exec over the executor IPC. Returns (final_event, outcome_override):
+    outcome_override is EXEC_TIMEOUT / EXEC_FAILED for early exits, or None meaning
+    'use final_event' (which may itself be None → EXEC_FAILED upstream). Cancellation:
+    the caller's kill path closes the connection (RemoteExecHandle), and the executor
+    kills the process group on disconnect."""
+    try:
+        reader, writer = await asyncio.open_unix_connection(config.EXECUTOR_SOCKET)
+    except OSError as e:
+        log.error("executor unreachable for streaming exec: %s", e)
+        return (None, EXEC_FAILED)
+    handle = RemoteExecHandle(writer)
+    if on_proc:
+        on_proc(handle)
+    if should_abort and should_abort():
+        await handle.remote_kill()
+        return (None, EXEC_FAILED)
+    final: "dict | None" = None
+    try:
+        writer.write((json.dumps(req) + "\n").encode())
+        await writer.drain()
+        # executor enforces the subprocess timeout; this outer margin only covers a
+        # hung/dead executor, so the frontend can never wait forever on the socket.
+        async with asyncio.timeout(req["timeout"] + 60):
+            while True:
+                raw = await reader.readline()
+                if not raw:
+                    break
+                try:
+                    msg = json.loads(raw.decode("utf-8", "replace"))
+                except json.JSONDecodeError:
+                    continue
+                if msg.get("ev") == "error":
+                    log.error("executor refused streaming exec: %s", msg.get("error"))
+                    return (None, EXEC_FAILED)
+                if msg.get("ev") == "exit":
+                    if msg.get("rc") is None and final is None:
+                        return (None, EXEC_TIMEOUT)
+                    break
+                if msg.get("ev") == "line":
+                    event = parse_stream_event(msg.get("data", ""))
+                    if event is None:
+                        continue
+                    if is_result_event(event):
+                        final = event
+                    elif on_trace:
+                        line = stream_trace_line(event)
+                        if line:
+                            on_trace(line)
+    except asyncio.TimeoutError:
+        log.error("executor IPC stalled past the exec timeout — abandoning the run")
+        return (None, EXEC_TIMEOUT)
+    except (OSError, ConnectionResetError):
+        return (None, EXEC_FAILED)
+    finally:
+        handle.returncode = 0 if final is not None else handle.returncode
+        try:
+            writer.close()
+        except Exception:
+            pass
+    return (final, None)

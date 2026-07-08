@@ -67,8 +67,10 @@ def test_bot_claude_md_has_no_shared_import_or_pii():
 def test_only_project_plan_index_mounted_from_memory():
     vols = _volumes(COMPOSE_EXAMPLE)
     mem_sources = [s for (s, d, m) in vols if "/.claude-shared/memory" in s]
-    # exactly the single project_plan.md file, never the memory/ directory
-    assert mem_sources == ["/home/user/.claude-shared/memory/project_plan.md"], mem_sources
+    # only the single project_plan.md file (once per app container in the split
+    # deploy), never the memory/ directory
+    assert mem_sources and set(mem_sources) == {
+        "/home/user/.claude-shared/memory/project_plan.md"}, mem_sources
     # the directory itself is not mounted
     assert not any(s.rstrip("/") == "/home/user/.claude-shared/memory" for s, _, _ in vols)
 

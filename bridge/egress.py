@@ -27,7 +27,11 @@ EGRESS_OK = "ok"
 EGRESS_OPEN = "open_egress"        # direct route out is still present → refuse
 EGRESS_OPEN_PROXY = "open_proxy"   # proxy TUNNELS a non-allow-listed host → refuse
 EGRESS_INCONCLUSIVE = "inconclusive"      # can't prove default-deny → retry, never OK
-EGRESS_ANTHROPIC_DOWN = "anthropic_down"  # transient → retry
+EGRESS_ANTHROPIC_DOWN = "anthropic_down"  # required host unreachable — transient → retry
+# Phase 2 (5.3): a host belonging to the OTHER container's egress set is tunnelable from
+# here — the split's core guarantee is broken (e.g. Discord reachable from the executor,
+# where the credential lives) → refuse to serve, same severity as OPEN_PROXY.
+EGRESS_PEER_REACHABLE = "peer_reachable"
 
 # Proxy CONNECT outcomes — kept distinct so probe 2 asserts the SPECIFIC deny signal
 # (403/407), not mere non-reachability. A 502/timeout means the proxy allowed the tunnel
@@ -40,19 +44,28 @@ PROXY_INCONCLUSIVE = "inconclusive"  # 502/504/timeout/closed — proves nothing
 
 def classify_egress(control_direct_reachable: bool,
                     control_via_proxy: str,
-                    anthropic_via_proxy: str) -> str:
-    """Pure decision over the three probe outcomes. `control_via_proxy` and
-    `anthropic_via_proxy` are PROXY_* statuses (not bools). Order matters: a live direct
-    route is most severe (no isolation), then an allow-all proxy, then an unprovable
-    default-deny, then Anthropic reachability."""
+                    anthropic_via_proxy: str,
+                    forbidden_via_proxy: "tuple[str, ...]" = ()) -> str:
+    """Pure decision over the probe outcomes. `control_via_proxy`, `anthropic_via_proxy`
+    (the REQUIRED host) and each `forbidden_via_proxy` entry are PROXY_* statuses (not
+    bools). Order matters: a live direct route is most severe (no isolation), then an
+    allow-all proxy, then a reachable peer-container host (5.3 — the split's own deny
+    direction), then an unprovable default-deny, then required-host reachability."""
     if control_direct_reachable:
         return EGRESS_OPEN
     if control_via_proxy == PROXY_TUNNELED:
         return EGRESS_OPEN_PROXY
+    for status in forbidden_via_proxy:
+        if status == PROXY_TUNNELED:
+            return EGRESS_PEER_REACHABLE
     if control_via_proxy != PROXY_DENIED:
         # 502/timeout to the control host: the proxy did not explicitly deny it, so we
         # cannot prove the allow-list is default-deny. Fail closed (retry), never OK.
         return EGRESS_INCONCLUSIVE
+    for status in forbidden_via_proxy:
+        if status != PROXY_DENIED:
+            # can't prove the peer host is denied either → not containment yet
+            return EGRESS_INCONCLUSIVE
     if anthropic_via_proxy != PROXY_TUNNELED:
         return EGRESS_ANTHROPIC_DOWN
     return EGRESS_OK
@@ -113,17 +126,73 @@ async def _proxy_connect_status(proxy_url: str, host: str, port: int, timeout: f
             pass
 
 
-async def run_egress_canary(timeout: float = 5.0) -> str:
-    """Run the three probes against the configured proxy and classify. Requires
-    config.EGRESS_PROXY_URL to be set (the caller only invokes this when it is)."""
+async def run_egress_canary(timeout: float = 5.0,
+                            required_host: "str | None" = None,
+                            forbidden_hosts: "tuple[str, ...]" = ()) -> str:
+    """Run the probes against the configured proxy and classify. Requires
+    config.EGRESS_PROXY_URL to be set (the caller only invokes this when it is).
+    `required_host` defaults to the Anthropic API host (phase-1 / executor posture);
+    `forbidden_hosts` is the peer container's egress set (phase 2, 5.3) — each must be
+    explicitly DENIED by this container's proxy."""
     proxy = config.EGRESS_PROXY_URL
     control = config.EGRESS_CANARY_CONTROL_HOST
-    anthropic = config.ANTHROPIC_API_HOST
+    required = required_host or config.ANTHROPIC_API_HOST
     control_direct = await _direct_reachable(control, 443, timeout)
     control_via_proxy = await _proxy_connect_status(proxy, control, 443, timeout)
-    anthropic_via_proxy = await _proxy_connect_status(proxy, anthropic, 443, timeout)
-    status = classify_egress(control_direct, control_via_proxy, anthropic_via_proxy)
-    log.info("egress canary: direct(%s)=%s proxy(%s)=%s proxy(%s)=%s → %s",
+    required_via_proxy = await _proxy_connect_status(proxy, required, 443, timeout)
+    forbidden_via_proxy = tuple(
+        [await _proxy_connect_status(proxy, h, 443, timeout) for h in forbidden_hosts])
+    status = classify_egress(control_direct, control_via_proxy, required_via_proxy,
+                             forbidden_via_proxy)
+    log.info("egress canary: direct(%s)=%s proxy(%s)=%s proxy(%s)=%s forbidden=%s → %s",
              control, control_direct, control, control_via_proxy,
-             anthropic, anthropic_via_proxy, status)
+             required, required_via_proxy,
+             dict(zip(forbidden_hosts, forbidden_via_proxy)), status)
     return status
+
+
+async def canary_gate(required_host: "str | None" = None,
+                      forbidden_hosts: "tuple[str, ...]" = ()) -> None:
+    """Shared fail-closed startup gate (bot.py frontend + executor.py): loop the canary
+    with backoff; a posture violation (OPEN_EGRESS / OPEN_PROXY / PEER_REACHABLE) is a
+    hard SystemExit, anything transient retries in-process (never a container crash-loop
+    — the canary_oauth_crashloop lesson). No-op when no proxy is configured."""
+    if not config.EGRESS_PROXY_URL:
+        return
+    backoff = config.CANARY_RETRY_BASE
+    attempts = 0
+    while True:
+        status = await run_egress_canary(
+            required_host=required_host, forbidden_hosts=forbidden_hosts)
+        if status == EGRESS_OK:
+            log.info("egress canary passed (required=%s forbidden=%s proxy=%s)",
+                     required_host or config.ANTHROPIC_API_HOST, list(forbidden_hosts),
+                     config.EGRESS_PROXY_URL)
+            return
+        if status in (EGRESS_OPEN, EGRESS_OPEN_PROXY, EGRESS_PEER_REACHABLE):
+            detail = {
+                EGRESS_OPEN: "a direct route out still exists (internal network not in force)",
+                EGRESS_OPEN_PROXY: "the proxy tunnels a non-allow-listed host (not default-deny)",
+                EGRESS_PEER_REACHABLE: "a peer container's host is reachable from HERE — the "
+                                       "split's deny direction is broken",
+            }[status]
+            raise SystemExit(
+                f"egress canary failed ({status}) — {detail}. Refusing to serve so a "
+                "bypassed agent can't exfiltrate.")
+        # transient (proxy starting) vs permanent (allow-list typo): after several
+        # failures escalate the message instead of looping silently on a lie
+        # (the canary_oauth_crashloop diagnosability lesson).
+        attempts += 1
+        if attempts >= 5:
+            hint = (f"check the proxy allow-list includes {required_host or config.ANTHROPIC_API_HOST}"
+                    if status == EGRESS_ANTHROPIC_DOWN
+                    else "the control/forbidden host got no explicit deny — check the proxy "
+                         "is up and EGRESS_CANARY_CONTROL_HOST resolves")
+            log.error("egress canary still failing after %d attempts (status=%s) — likely "
+                      "a PERMANENT misconfig, not transient: %s. Still retrying in %ds "
+                      "(fail-closed, not serving).", attempts, status, hint, backoff)
+        else:
+            log.error("egress canary not yet green (status=%s; proxy still starting?). "
+                      "Retrying in %ds (in-process, fail-closed).", status, backoff)
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, config.CANARY_RETRY_MAX)
