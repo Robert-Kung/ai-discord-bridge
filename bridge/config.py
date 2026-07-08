@@ -96,18 +96,27 @@ BOT_CONFIG_DIRS = {"A": "/home/user/.claude-bot-a", "B": "/home/user/.claude-bot
 API_KEY_FILENAME = "anthropic-api-key"
 API_KEY_HELPER_FILENAME = "api-key-helper.sh"
 
-# M4 verify: per-project command lives under STATE_DIR/verify/<slug> (operator-authored,
-# NEVER read from the repo/worktree — the agent must not author its own verify command).
-# The Bash-permitting exec-tier settings file is generated under STATE_DIR at executor
-# startup (base deny family + Bash allow), never committed.
+# M4 verify: per-project command, operator-authored, NEVER read from the repo/worktree.
+# It must ALSO be unreachable by the Bash-enabled exec agent's writes — the exec tier runs
+# in the executor which mounts discord-state rw, so the verify config lives in its OWN
+# directory that the deployment mounts READ-ONLY into the executor (see the example
+# compose). Default sits under SHARED_DIR (not STATE_DIR) so it is never on the rw
+# discord-state volume; override with VERIFY_CONFIG_DIR.
+VERIFY_CONFIG_DIR = Path(os.environ.get(
+    "VERIFY_CONFIG_DIR", str(SHARED_DIR / "discord-verify")))
+
+
 def verify_dir() -> "Path":
-    return STATE_DIR / "verify"
+    return VERIFY_CONFIG_DIR
 
 
 def verify_command_path(slug: str) -> "Path":
-    return verify_dir() / slug
+    return VERIFY_CONFIG_DIR / slug
 
 
+# The Bash-permitting exec-tier settings file (base deny family + Bash allow). Generated
+# fresh before EVERY exec spawn (not just at startup) so a prior job's tamper — the exec
+# agent can write this rw path — cannot persist into the next job's policy.
 EXEC_SETTINGS_PATH = os.environ.get(
     "EXEC_SETTINGS_PATH", str(STATE_DIR / "exec-settings.json"))
 

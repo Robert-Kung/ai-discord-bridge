@@ -44,9 +44,21 @@ async def main() -> None:
         await runner.settings_canary_gate()
     # M4 tier (verify + exec-tier Bash) is LIVE here only when opted in — the phase-2
     # posture is proven by the Discord-deny egress canary above. Generate the
-    # Bash-permitting exec settings now (base deny family + Bash allow).
+    # Bash-permitting exec settings and prove they STILL deny (claude silently ignores
+    # an invalid --settings file; without this the base canary would pass while the
+    # Bash-job settings dropped every deny). Fail-closed on a dropped deny.
     if runner.m4_live():
         runner.write_exec_settings()
+        skip = os.environ.get("BRIDGE_SKIP_CANARY", "").strip().lower() in ("1", "true", "yes", "on")
+        if not skip:
+            status = await runner.run_settings_canary(settings_path=config.EXEC_SETTINGS_PATH)
+            if status == runner.CANARY_DENY_DROPPED:
+                raise SystemExit(
+                    "exec-tier settings canary FAILED — the Bash-permitting exec settings "
+                    "loaded but the deny family did NOT fire. Refusing to serve the M4 tier.")
+            if status != runner.CANARY_OK:
+                log.warning("exec-tier settings canary inconclusive (%s) — proceeding; the "
+                            "base canary already proved the deny family loads.", status)
         log.info("M4 tier LIVE: post-task verify + exec-tier Bash enabled (executor)")
     await runner.serve_executor()
 

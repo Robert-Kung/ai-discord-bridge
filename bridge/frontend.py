@@ -363,8 +363,8 @@ async def _drive_exec_job(job, message: discord.Message, bot_name: str, prompt: 
         jobs.save_diff(job, full)
         # M4 post-task verification (phase-2 gated): run the per-project verify command
         # in the executor (contained egress + stripped env) and post the outcome above
-        # the diff gate. Only when the tier is live in a split deploy.
-        if config.EXEC_BASH_ENABLED and config.EXECUTOR_SOCKET:
+        # the diff gate. runner.m4_live() is the single source of the gate condition.
+        if runner.m4_live():
             await _post_verify(job, channel, cwd)
         if config.EVALUATOR_ENABLED:
             await _post_evaluator_review(job, channel, bot_name, stat, full)
@@ -424,8 +424,9 @@ async def _post_verify(job, channel, project: str) -> None:
             return
         head = "✅ 通過" if passed else "❌ 失敗"
         body = f"🧪 **[job `{job.id}` verify · {head}]**"
-        if tail.strip():
-            body += f"\n```\n{tail.strip()[-1500:]}\n```"
+        clean = tail.strip()[-1500:].replace("```", "`­``")  # neutralize fence-breaking
+        if clean:
+            body += f"\n```\n{clean}\n```"
         for c in chunk_message(body):
             await channel.send(c)
     except Exception:  # noqa: BLE001 — verify must never block the human gate
