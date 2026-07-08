@@ -208,13 +208,35 @@ against the **reply channel** itself — a trusted `bypass` user can have the ag
 secret into its own Discord reply; that residual is bounded only by §3 (who you grant
 `bypass`), not by the network.
 
-**Operator cutover (do this in order):** before switching the live `docker-compose.yml`
-onto the internal network, **empirically pin the OAuth-refresh host** — run the bridge with
-the proxy and its deny-log on, force a token refresh, and confirm the refresh traverses the
-proxy (add its host to `egress-proxy/filter` if it is not `console.anthropic.com`). A wrong
-allow-list guess passes the startup canary but silently loops on `CANNOT_RUN` hours later
-when the token expires. The `docker-compose.example.yml` shows the full wired topology; the
-proxy's `LogLevel Connect` gives the grep-able deny lines to watch.
+**Operator cutover — pinning the OAuth-refresh host (do this in order).** The refresh
+endpoint is not documented anywhere authoritative; a wrong allow-list guess passes the
+startup canary but silently loops on `CANNOT_RUN` hours later when the token expires. So
+the allow-list must be pinned to **observed** hosts, and the observation must happen at
+cutover time — not be assumed. Note the canary is fail-closed: you cannot run the live
+bridge "proxy on, network open" to observe safely, so the forced refresh below runs **on
+the host through the published proxy port** — same proxy binary, same filter, same
+observation, but the credential file is writable there (in-container it is a `:ro`
+single-file mount, so a container-side refresh cannot persist anyway).
+
+1. Wire the live `docker-compose.yml` per `docker-compose.example.yml` (proxy sidecar,
+   `internal: true` network, `EGRESS_PROXY_URL`), with the proxy port published on
+   `127.0.0.1:8888` for step 3.
+2. Force-expire one account's OAuth timestamp (tokens untouched, backup kept):
+   `scripts/expire-oauth-token.sh ~/.claude-b`
+3. `docker compose up -d --build`; confirm the three-probe egress canary is green in the
+   bridge log. Then trigger the refresh through the proxy from the host:
+   `HTTPS_PROXY=http://127.0.0.1:8888 CLAUDE_CONFIG_DIR=$HOME/.claude-b claude -p ping`
+4. Read the proxy log: `docker logs ai-discord-bridge-egress-proxy` (`LogLevel Connect`
+   lists every CONNECT target; a filter rejection logs the denied host). Record every
+   host the refresh touched. If one was denied: add it to `egress-proxy/filter`,
+   `docker compose up -d --build egress-proxy` (the filter is baked at image build),
+   re-run steps 2–3 until the refresh completes cleanly.
+5. Pin: delete unused guesses from `egress-proxy/filter` (drop `console.anthropic.com`
+   if it was never contacted), record the observed hosts below with a date.
+6. Sanity: `@`-mention both bots in Discord (normal calls traverse the proxy), and watch
+   the next natural expiry window for the `CANNOT_RUN` loop signature.
+
+> **Observed refresh host(s):** _pending cutover — fill in here._
 
 **Limits — read these (the honest residual after the preflight gates):**
 
