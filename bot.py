@@ -79,27 +79,11 @@ async def main():
     if skip_canary:
         log.warning("BRIDGE_SKIP_CANARY set — starting WITHOUT proving the deny family "
                     "loaded. Offline-dev only; never use this in a real deployment.")
-    if not skip_canary:
-        # OK → proceed; DENY_DROPPED → refuse (config bug, retry won't fix);
-        # CANNOT_RUN → in-process backoff retry (auth lapse; SystemExit would crash-loop).
-        backoff = config.CANARY_RETRY_BASE
-        while True:
-            status = await runner.run_settings_canary()
-            if status == runner.CANARY_OK:
-                log.info("settings canary passed: --settings deny family is in force")
-                break
-            if status == runner.CANARY_DENY_DROPPED:
-                raise SystemExit(
-                    "settings canary failed — claude ran but the must-be-denied action "
-                    "was NOT denied: the --settings permissions.deny family is not in "
-                    "force (schema drift / unloadable settings). Refusing to start. "
-                    "Set BRIDGE_SKIP_CANARY=1 only for offline dev."
-                )
-            log.error("settings canary could not run — claude is unavailable / not logged "
-                      "in. The bot will NOT serve until auth recovers; retrying in %ds "
-                      "(in-process, no restart loop).", backoff)
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, config.CANARY_RETRY_MAX)
+    # The settings canary spawns claude LOCALLY. In a split deploy the frontend has no
+    # credentials and no Anthropic egress, so it must NOT run the canary here — the
+    # executor proves the deny family on its side (executor.py). Single container: run it.
+    if not skip_canary and not config.EXECUTOR_SOCKET:
+        await runner.settings_canary_gate()
 
     for name in config.BOTS:
         state.clients[name] = make_client(name)

@@ -42,6 +42,42 @@ def test_phase1_signature_unchanged():
     assert egress.classify_egress(True, DENY, TUN) == egress.EGRESS_OPEN
 
 
+# ── split-mode startup: the settings canary runs on the executor, not the frontend ─
+def test_settings_canary_gate_semantics(monkeypatch):
+    """OK → returns; DENY_DROPPED → SystemExit (config bug); CANNOT_RUN → retries.
+    This is the proof the executor runs at startup; the frontend must not (no
+    credentials / no Anthropic egress → it would loop forever and never serve)."""
+    monkeypatch.setattr(config, "CANARY_RETRY_BASE", 0)
+    monkeypatch.setattr(config, "CANARY_RETRY_MAX", 0)
+
+    async def ok():
+        return runner.CANARY_OK
+    monkeypatch.setattr(runner, "run_settings_canary", ok)
+    asyncio.run(runner.settings_canary_gate())  # returns cleanly
+
+    async def dropped():
+        return runner.CANARY_DENY_DROPPED
+    monkeypatch.setattr(runner, "run_settings_canary", dropped)
+    with pytest.raises(SystemExit):
+        asyncio.run(runner.settings_canary_gate())
+
+    seq = iter([runner.CANARY_CANNOT_RUN, runner.CANARY_CANNOT_RUN, runner.CANARY_OK])
+
+    async def flaky():
+        return next(seq)
+    monkeypatch.setattr(runner, "run_settings_canary", flaky)
+    asyncio.run(runner.settings_canary_gate())  # retries through CANNOT_RUN, then OK
+
+
+def test_frontend_skips_settings_canary_in_split_mode():
+    """Source guard: bot.main only runs the settings canary when NOT in split mode."""
+    import inspect
+    import bot
+    src = inspect.getsource(bot.main)
+    assert "not config.EXECUTOR_SOCKET" in src
+    assert "settings_canary_gate" in src
+
+
 # ── the split's secret-placement guarantees (5.1), from the reviewed template ─
 import re as _re
 
