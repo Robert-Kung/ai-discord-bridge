@@ -236,7 +236,16 @@ single-file mount, so a container-side refresh cannot persist anyway).
 6. Sanity: `@`-mention both bots in Discord (normal calls traverse the proxy), and watch
    the next natural expiry window for the `CANNOT_RUN` loop signature.
 
-> **Observed refresh host(s):** _pending cutover — fill in here._
+> **Observed refresh host(s) — cutover run 2026-07-08 (UTC 02:24–02:25):** the forced
+> refresh contacted **`api.anthropic.com` only** and persisted a fresh token
+> (`expiresAt` +8h, file rewritten mid-run). `console.anthropic.com` was **never
+> attempted** — the guess was wrong; it has been removed from `egress-proxy/filter`.
+> Two hosts were denied during the run and the call still succeeded, i.e. they are
+> confirmed non-essential and stay denied by design:
+> `mcp-proxy.anthropic.com` (claude.ai-hosted MCP connectors; the CLI retries it
+> noisily — expected log spam, not a fault) and
+> `http-intake.logs.us5.datadoghq.com` (CLI telemetry — exactly the class of egress
+> this proxy exists to stop).
 
 **Limits — read these (the honest residual after the preflight gates):**
 
