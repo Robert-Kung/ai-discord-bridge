@@ -73,10 +73,24 @@ EGRESS_PROXY_URL = os.environ.get("EGRESS_PROXY_URL") or None
 # A host that MUST be unreachable (direct and via the proxy) if containment holds.
 EGRESS_CANARY_CONTROL_HOST = os.environ.get("EGRESS_CANARY_CONTROL_HOST", "example.com")
 ANTHROPIC_API_HOST = "api.anthropic.com"
+DISCORD_HOSTS = ("discord.com", "gateway.discord.gg", "cdn.discordapp.com")
+
+# ── Phase 2 split (egress-exec-isolation 5.x) ───────────────────────────
+# When set, this process is PART OF A SPLIT DEPLOY: bot.py (frontend) becomes an IPC
+# client — every claude spawn is delegated over this unix socket; executor.py binds it
+# and is the only place a claude subprocess is created. Unset → single-container mode
+# (local spawn, phase-1 behavior). The socket lives on the shared discord-state volume.
+EXECUTOR_SOCKET = os.environ.get("EXECUTOR_SOCKET") or None
 
 # Static (env-free) bot identity → config dir. Dedicated MINIMAL config dirs (D4):
 # the bots do NOT run under the operator's own ~/.claude / ~/.claude-b account dirs.
 BOT_CONFIG_DIRS = {"A": "/home/user/.claude-bot-a", "B": "/home/user/.claude-bot-b"}
+
+# API-key mode auth material inside a bot config dir (egress-exec-isolation 3.x):
+# the key lives in a 0600 file read by an apiKeyHelper script, NOT in the subprocess
+# env. Filenames are config-level so validate_config and the runner provisioner agree.
+API_KEY_FILENAME = "anthropic-api-key"
+API_KEY_HELPER_FILENAME = "api-key-helper.sh"
 
 # Repo-tracked server-side security settings (permissions.deny family). Passed via
 # --settings on EVERY claude -p call. In the container this is the bind-mounted
@@ -92,7 +106,11 @@ BRIDGE_SETTINGS_PATH = os.environ.get(
 APPROVER_SCRIPT = str(_REPO_ROOT / "mcp_approver.py")
 APPROVER_ALLOWLIST_PATH = os.environ.get("APPROVER_ALLOWLIST", str(_REPO_ROOT / "approver-allowlist.json"))
 APPROVER_SOCKET_PATH = os.environ.get("APPROVER_SOCKET_PATH", "/tmp/ai-discord-bridge-approver.sock")
-APPROVER_MCP_CONFIG_PATH = "/tmp/ai-discord-bridge-approver-mcp.json"  # written at startup
+# Written at startup by the frontend; READ by the claude subprocess, which runs in the
+# executor container in a split deploy — so the path must be overridable onto the shared
+# volume there (single-container default keeps /tmp).
+APPROVER_MCP_CONFIG_PATH = os.environ.get(
+    "APPROVER_MCP_CONFIG_PATH", "/tmp/ai-discord-bridge-approver-mcp.json")
 
 
 def approver_socket_timeout() -> int:
@@ -186,6 +204,34 @@ def load_config() -> None:
     validate_config()
 
 
+def load_executor_config() -> None:
+    """Executor-container config load (phase 2): NO Discord anything — the executor
+    must never see bot tokens or channel routing (that is the point of the split).
+    Populates only what the chokepoint needs: auth mode, per-bot config dirs/keys,
+    and the project whitelist used to validate requested cwds."""
+    global USE_API_KEY, BOTS, PROJECT_DIRS
+    USE_API_KEY = os.environ.get("USE_API_KEY", "").strip().lower() in ("1", "true", "yes", "on")
+    BOTS = {
+        n: {"token": None,  # structurally absent, not merely unset
+            "config_dir": BOT_CONFIG_DIRS[n],
+            "api_key": os.environ.get(f"ANTHROPIC_API_KEY_{n}")}
+        for n in BOT_CONFIG_DIRS
+    }
+    PROJECT_DIRS = [
+        Path(p.strip()).resolve()
+        for p in os.environ.get("PROJECT_DIRS", "").split(",") if p.strip()
+    ]
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if USE_API_KEY:
+        missing = [n for n, c in BOTS.items()
+                   if not c.get("api_key")
+                   and not (Path(c["config_dir"]) / API_KEY_FILENAME).exists()]
+        if missing:
+            raise SystemExit(
+                f"USE_API_KEY is set but bot(s) {'/'.join(missing)} have no key source "
+                f"(env key or config-dir {API_KEY_FILENAME}) — refusing to start.")
+
+
 def validate_config() -> None:
     """Fail-closed checks — raise SystemExit rather than run wide open."""
     if not ALLOWED_USER_IDS:
@@ -195,9 +241,12 @@ def validate_config() -> None:
             "anyone in the channel drive the bots, including bypass-mode execution."
         )
     if USE_API_KEY:
-        missing = [n for n, c in BOTS.items() if not c.get("api_key")]
+        missing = [n for n, c in BOTS.items()
+                   if not c.get("api_key")
+                   and not (Path(c["config_dir"]) / API_KEY_FILENAME).exists()]
         if missing:
             raise SystemExit(
-                f"USE_API_KEY is set but ANTHROPIC_API_KEY_{'/'.join(missing)} is empty. "
-                "Provide a per-bot key, or unset USE_API_KEY to use subscription auth."
+                f"USE_API_KEY is set but bot(s) {'/'.join(missing)} have no key source: "
+                f"set ANTHROPIC_API_KEY_<bot> in .env, or drop an {API_KEY_FILENAME} "
+                "file in the bot's config dir; or unset USE_API_KEY for subscription auth."
             )

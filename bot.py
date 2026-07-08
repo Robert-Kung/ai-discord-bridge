@@ -39,6 +39,15 @@ async def main():
     # keeping only the awaiting-review ones — else uploaded content accumulates forever.
     jobs.gc_job_state({jid for ids in _keep.values() for jid in ids})
 
+    # API-key mode (egress-exec-isolation 3.x): materialize each bot's key as a
+    # config-dir file + apiKeyHelper BEFORE any claude call (the settings canary below
+    # is one). Subscription mode: skipped entirely — the OAuth path is never touched.
+    # Split deploy: the EXECUTOR provisions (it owns the config dirs + spawns claude);
+    # the frontend must not — it has no key material at all.
+    if config.USE_API_KEY and not config.EXECUTOR_SOCKET:
+        for _cfg in config.BOTS.values():
+            runner.provision_api_key_helper(_cfg)
+
     # Fail-closed startup assertion: a dead approve tier (script missing) would only
     # surface the first time someone uses `!mode approve`; the default-mode canary
     # cannot catch it, so assert here.
@@ -48,46 +57,16 @@ async def main():
             f"{config.APPROVER_SCRIPT}. Refusing to start with a dead approve tier."
         )
 
-    # Egress containment (phase 1): when a proxy is configured, prove the network
-    # posture before anything else — a live direct route (OPEN_EGRESS) or an allow-all
-    # proxy (OPEN_PROXY) is a hard failure (refuse to serve); Anthropic unreachable is
-    # transient (backoff retry, same shape as the settings canary's CANNOT_RUN). When no
-    # proxy is configured (uncontained single-container deploy) this is skipped.
-    if config.EGRESS_PROXY_URL:
-        backoff = config.CANARY_RETRY_BASE
-        attempts = 0
-        while True:
-            status = await egress.run_egress_canary()
-            if status == egress.EGRESS_OK:
-                log.info("egress canary passed: network egress is contained (proxy=%s)",
-                         config.EGRESS_PROXY_URL)
-                break
-            if status in (egress.EGRESS_OPEN, egress.EGRESS_OPEN_PROXY):
-                raise SystemExit(
-                    f"egress canary failed ({status}) — the container's network posture is "
-                    "wrong: a non-allow-listed control host is reachable "
-                    f"({'directly — the internal network still has a route out' if status == egress.EGRESS_OPEN else 'via the proxy — the allow-list is not default-deny'}). "
-                    "Refusing to serve so a bypassed agent can't exfiltrate."
-                )
-            # ANTHROPIC_DOWN / INCONCLUSIVE → fail-closed retry (proxy still starting, or a
-            # transient blip). After several failures it is probably NOT transient — a
-            # permanent allow-list typo (missing api.anthropic.com, or the control host
-            # unreachable via the proxy) — so escalate the message instead of looping
-            # silently on a lie (the canary_oauth_crashloop diagnosability lesson).
-            attempts += 1
-            if attempts >= 5:
-                hint = ("check egress-proxy/filter includes api.anthropic.com"
-                        if status == egress.EGRESS_ANTHROPIC_DOWN
-                        else "the control host is not reachable via the proxy — check the "
-                             "proxy is up and EGRESS_CANARY_CONTROL_HOST resolves")
-                log.error("egress canary still failing after %d attempts (status=%s) — this "
-                          "is likely a PERMANENT misconfig, not transient: %s. Still retrying "
-                          "in %ds (fail-closed, not serving).", attempts, status, hint, backoff)
-            else:
-                log.error("egress canary not yet green (status=%s; proxy still starting?). "
-                          "Retrying in %ds (in-process, fail-closed).", status, backoff)
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, config.CANARY_RETRY_MAX)
+    # Egress containment: prove the network posture before anything else (fail-closed;
+    # skipped when no proxy is configured). Split deploy (EXECUTOR_SOCKET set): this
+    # process is the DISCORD FRONTEND — its proxy must reach Discord and must NOT reach
+    # Anthropic (5.3 deny direction; the executor asserts the mirror image). Single
+    # container: the phase-1 posture (Anthropic required, no forbidden set).
+    if config.EXECUTOR_SOCKET:
+        await egress.canary_gate(required_host="discord.com",
+                                 forbidden_hosts=(config.ANTHROPIC_API_HOST,))
+    else:
+        await egress.canary_gate()
 
     # OV1 — prove the --settings deny family is actually in force before serving.
     skip_canary = os.environ.get("BRIDGE_SKIP_CANARY", "").strip().lower() in ("1", "true", "yes", "on")
@@ -100,27 +79,11 @@ async def main():
     if skip_canary:
         log.warning("BRIDGE_SKIP_CANARY set — starting WITHOUT proving the deny family "
                     "loaded. Offline-dev only; never use this in a real deployment.")
-    if not skip_canary:
-        # OK → proceed; DENY_DROPPED → refuse (config bug, retry won't fix);
-        # CANNOT_RUN → in-process backoff retry (auth lapse; SystemExit would crash-loop).
-        backoff = config.CANARY_RETRY_BASE
-        while True:
-            status = await runner.run_settings_canary()
-            if status == runner.CANARY_OK:
-                log.info("settings canary passed: --settings deny family is in force")
-                break
-            if status == runner.CANARY_DENY_DROPPED:
-                raise SystemExit(
-                    "settings canary failed — claude ran but the must-be-denied action "
-                    "was NOT denied: the --settings permissions.deny family is not in "
-                    "force (schema drift / unloadable settings). Refusing to start. "
-                    "Set BRIDGE_SKIP_CANARY=1 only for offline dev."
-                )
-            log.error("settings canary could not run — claude is unavailable / not logged "
-                      "in. The bot will NOT serve until auth recovers; retrying in %ds "
-                      "(in-process, no restart loop).", backoff)
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, config.CANARY_RETRY_MAX)
+    # The settings canary spawns claude LOCALLY. In a split deploy the frontend has no
+    # credentials and no Anthropic egress, so it must NOT run the canary here — the
+    # executor proves the deny family on its side (executor.py). Single container: run it.
+    if not skip_canary and not config.EXECUTOR_SOCKET:
+        await runner.settings_canary_gate()
 
     for name in config.BOTS:
         state.clients[name] = make_client(name)
