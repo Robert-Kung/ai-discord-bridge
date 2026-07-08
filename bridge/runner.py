@@ -178,7 +178,9 @@ async def _run_claude_subprocess(
 
 async def run_settings_canary(bot_name: str = "B") -> str:
     """Live pre-flight: run a tiny `claude -p` that attempts a denied command and
-    classify the outcome (CANARY_OK / CANARY_DENY_DROPPED / CANARY_CANNOT_RUN)."""
+    classify the outcome (CANARY_OK / CANARY_DENY_DROPPED / CANARY_CANNOT_RUN).
+    Spawns claude LOCALLY, so it must run where claude actually runs — the single
+    container, or the EXECUTOR in a split deploy (never the credential-less frontend)."""
     cfg = config.BOTS[bot_name]
     args = build_claude_args("default")
     env = build_subprocess_env(cfg)
@@ -189,6 +191,30 @@ async def run_settings_canary(bot_name: str = "B") -> str:
         log.error("settings canary could not run (%s)", e)
         return CANARY_CANNOT_RUN
     return classify_canary(rc, stdout)
+
+
+async def settings_canary_gate() -> None:
+    """Fail-closed startup gate shared by bot.py (single container) and executor.py
+    (split deploy). OK → return; DENY_DROPPED → SystemExit (config bug, retry won't fix);
+    CANNOT_RUN → in-process backoff retry (auth lapse — a SystemExit here would hand
+    docker a crash-loop, the canary_oauth_crashloop lesson)."""
+    backoff = config.CANARY_RETRY_BASE
+    while True:
+        status = await run_settings_canary()
+        if status == CANARY_OK:
+            log.info("settings canary passed: --settings deny family is in force")
+            return
+        if status == CANARY_DENY_DROPPED:
+            raise SystemExit(
+                "settings canary failed — claude ran but the must-be-denied action was "
+                "NOT denied: the --settings permissions.deny family is not in force "
+                "(schema drift / unloadable settings). Refusing to start. "
+                "Set BRIDGE_SKIP_CANARY=1 only for offline dev.")
+        log.error("settings canary could not run — claude is unavailable / not logged in. "
+                  "Not serving until auth recovers; retrying in %ds (in-process, no restart "
+                  "loop).", backoff)
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, config.CANARY_RETRY_MAX)
 
 
 # ── Executor IPC (egress-exec-isolation 5.x) ─────────────────────────────────

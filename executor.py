@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 from bridge import config, egress, runner
 
@@ -37,6 +38,10 @@ async def main() -> None:
             runner.provision_api_key_helper(cfg)
     await egress.canary_gate(required_host=config.ANTHROPIC_API_HOST,
                              forbidden_hosts=config.DISCORD_HOSTS)
+    # The executor is where claude actually spawns, so it owns the settings-canary proof
+    # of the deny family (the frontend can't — no credentials / no Anthropic egress).
+    if os.environ.get("BRIDGE_SKIP_CANARY", "").strip().lower() not in ("1", "true", "yes", "on"):
+        await runner.settings_canary_gate()
     await runner.serve_executor()
 
 
