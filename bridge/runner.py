@@ -73,6 +73,10 @@ def provision_api_key_helper(cfg: dict) -> None:
             raise SystemExit(
                 f"cannot parse {settings_path} to install apiKeyHelper: {e} — "
                 "refusing to guess (fix or remove the file).") from e
+        if not isinstance(settings, dict):  # valid JSON but a list/scalar
+            raise SystemExit(
+                f"{settings_path} is not a JSON object (got {type(settings).__name__}) — "
+                "cannot install apiKeyHelper; fix or remove the file.")
     settings["apiKeyHelper"] = str(helper)
     settings_path.write_text(json.dumps(settings, indent=2) + "\n")
     log.info("apiKeyHelper provisioned for config dir %s", d)
@@ -259,10 +263,10 @@ def _validate_exec_request(req: dict) -> "str | None":
     if not isinstance(cwd, str):
         return "missing cwd"
     rcwd = Path(cwd).resolve()
+    wt_root = (config.STATE_DIR / "worktrees").resolve()
     allowed = (rcwd == Path(config.DEFAULT_CWD).resolve()
-               or any(rcwd == p or str(rcwd).startswith(str(p) + os.sep)
-                      for p in config.PROJECT_DIRS)
-               or str(rcwd).startswith(str((config.STATE_DIR / "worktrees").resolve()) + os.sep))
+               or any(rcwd == p or rcwd.is_relative_to(p) for p in config.PROJECT_DIRS)
+               or rcwd.is_relative_to(wt_root))
     if not allowed:
         return f"cwd {cwd!r} not in the project/worktree whitelist"
     t = req.get("timeout")
@@ -294,11 +298,19 @@ def _exec_request_to_spawn(req: dict) -> tuple[list, dict, str]:
 async def _handle_executor_conn(reader: asyncio.StreamReader,
                                 writer: asyncio.StreamWriter) -> None:
     """One connection = one claude run. Any validation/spawn error is reported and the
-    connection closed; a client disconnect at any point kills the process group."""
+    connection closed; a client disconnect at any point kills the process group.
+
+    Disconnect-kill via a single watchdog: `reader.read(1)` completes only on EOF (the
+    client closed — cancel/crash/its own timeout) or a stray byte (a protocol-violating
+    client), and either way we kill the process group. read(1) is bounded, so a hostile
+    client that floods the socket can't grow executor memory (read(-1) would)."""
+    is_stream = False
+
     def send(obj: dict) -> None:
         writer.write((json.dumps(obj) + "\n").encode())
 
     proc = None
+    watcher = None
     try:
         line = await asyncio.wait_for(reader.readline(), timeout=30)
         try:
@@ -308,14 +320,15 @@ async def _handle_executor_conn(reader: asyncio.StreamReader,
         err = _validate_exec_request(req)
         if err:
             log.warning("executor: rejected request (%s)", err)
-            send({"ok": False, "error": err} if not (isinstance(req, dict) and req.get("stream"))
-                 else {"ev": "error", "error": err})
+            send({"ev": "error", "error": err} if (isinstance(req, dict) and req.get("stream"))
+                 else {"ok": False, "error": err})
             await writer.drain()
             return
+        is_stream = req["stream"]
         args, env, cwd = _exec_request_to_spawn(req)
         timeout = float(req["timeout"])
         log.info("executor: run bot=%s mode=%s stream=%s cwd=%s prompt_len=%d",
-                 req["bot"], req["api_mode"], req["stream"], cwd, len(req["prompt"]))
+                 req["bot"], req["api_mode"], is_stream, cwd, len(req["prompt"]))
         proc = await asyncio.create_subprocess_exec(
             *args, env=env, cwd=cwd,
             stdin=asyncio.subprocess.PIPE,
@@ -324,35 +337,32 @@ async def _handle_executor_conn(reader: asyncio.StreamReader,
             start_new_session=True,
             limit=_STREAM_LIMIT,
         )
-        # disconnect-kill contract: if the client goes away (cancel, crash, its own
-        # timeout), the run must not keep burning quota executor-side.
-        disconnect = asyncio.ensure_future(reader.read())
 
-        async def _guarded(coro):
-            run = asyncio.ensure_future(coro)
-            done, _ = await asyncio.wait({run, disconnect},
-                                         return_when=asyncio.FIRST_COMPLETED)
-            if run in done:
-                return run.result()
-            run.cancel()
-            raise ConnectionResetError("client disconnected")
+        async def _watch_disconnect(p):
+            try:
+                await reader.read(1)  # EOF (disconnect) or a stray byte
+            except Exception:
+                pass
+            await kill_process_group(p)  # client gone → don't keep burning quota
+
+        watcher = asyncio.ensure_future(_watch_disconnect(proc))
 
         try:
-            if req["stream"]:
+            if is_stream:
                 try:
                     proc.stdin.write(req["prompt"].encode())
-                    await _guarded(proc.stdin.drain())
+                    await proc.stdin.drain()
                     proc.stdin.close()
                 except (BrokenPipeError, ConnectionResetError):
                     pass
                 try:
                     async with asyncio.timeout(timeout):
                         while True:
-                            raw = await _guarded(proc.stdout.readline())
+                            raw = await proc.stdout.readline()
                             if not raw:
-                                break
+                                break  # proc exited (EOF), incl. watchdog-killed on disconnect
                             send({"ev": "line", "data": raw.decode("utf-8", "replace")})
-                            await _guarded(writer.drain())
+                            await writer.drain()
                         await asyncio.wait_for(proc.wait(), timeout=5)
                 except asyncio.TimeoutError:
                     await kill_process_group(proc)
@@ -364,8 +374,8 @@ async def _handle_executor_conn(reader: asyncio.StreamReader,
             else:
                 rc, stdout, stderr = None, b"", b""
                 try:
-                    stdout, stderr = await _guarded(asyncio.wait_for(
-                        proc.communicate(input=req["prompt"].encode()), timeout=timeout))
+                    stdout, stderr = await asyncio.wait_for(
+                        proc.communicate(input=req["prompt"].encode()), timeout=timeout)
                     rc = proc.returncode
                 except asyncio.TimeoutError:
                     await kill_process_group(proc)
@@ -374,13 +384,16 @@ async def _handle_executor_conn(reader: asyncio.StreamReader,
                       "stderr": stderr.decode("utf-8", "replace")})
                 await writer.drain()
         finally:
-            disconnect.cancel()
+            if watcher is not None:
+                watcher.cancel()
     except (ConnectionResetError, BrokenPipeError):
         log.info("executor: client disconnected — killing the run")
     except Exception:
         log.exception("executor: connection handler failed")
         try:
-            send({"ok": False, "error": "internal executor error"})
+            # match the in-flight request's wire shape so the client actually surfaces it
+            send({"ev": "error", "error": "internal executor error"} if is_stream
+                 else {"ok": False, "error": "internal executor error"})
             await writer.drain()
         except Exception:
             pass
@@ -403,7 +416,10 @@ async def serve_executor() -> None:
         os.unlink(sock)
     except FileNotFoundError:
         pass
-    server = await asyncio.start_unix_server(_handle_executor_conn, path=sock)
+    # limit=_STREAM_LIMIT: a request line carries the whole prompt, which can be large
+    # (M3 attachments etc.); the asyncio default 64 KiB would raise on it.
+    server = await asyncio.start_unix_server(
+        _handle_executor_conn, path=sock, limit=_STREAM_LIMIT)
     os.chmod(sock, 0o600)
     log.info("executor serving on %s", sock)
     async with server:
@@ -441,7 +457,8 @@ async def _remote_run(req: dict) -> tuple["int | None", bytes, bytes]:
     (rc, stdout, stderr); rc None = timeout. IPC failure → rc 255 with the error in
     stderr (surfaces as a normal call failure, never crashes the caller)."""
     try:
-        reader, writer = await asyncio.open_unix_connection(config.EXECUTOR_SOCKET)
+        reader, writer = await asyncio.open_unix_connection(
+            config.EXECUTOR_SOCKET, limit=_STREAM_LIMIT)
     except OSError as e:
         return (255, b"", f"executor unreachable: {e}".encode())
     try:
@@ -452,7 +469,9 @@ async def _remote_run(req: dict) -> tuple["int | None", bytes, bytes]:
         if not resp.get("ok"):
             return (255, b"", f"executor refused: {resp.get('error')}".encode())
         return (resp["rc"], resp["stdout"].encode(), resp["stderr"].encode())
-    except (OSError, asyncio.TimeoutError, json.JSONDecodeError, KeyError) as e:
+    # ValueError also covers LimitOverrunError (a response line past _STREAM_LIMIT);
+    # degrade to the (255, …) contract rather than crash the caller.
+    except (OSError, asyncio.TimeoutError, ValueError, KeyError) as e:
         return (255, b"", f"executor IPC failure: {e}".encode())
     finally:
         try:
@@ -834,7 +853,8 @@ async def _remote_stream_exec(
     the caller's kill path closes the connection (RemoteExecHandle), and the executor
     kills the process group on disconnect."""
     try:
-        reader, writer = await asyncio.open_unix_connection(config.EXECUTOR_SOCKET)
+        reader, writer = await asyncio.open_unix_connection(
+            config.EXECUTOR_SOCKET, limit=_STREAM_LIMIT)
     except OSError as e:
         log.error("executor unreachable for streaming exec: %s", e)
         return (None, EXEC_FAILED)
@@ -879,10 +899,10 @@ async def _remote_stream_exec(
     except asyncio.TimeoutError:
         log.error("executor IPC stalled past the exec timeout — abandoning the run")
         return (None, EXEC_TIMEOUT)
-    except (OSError, ConnectionResetError):
+    # ValueError covers a stream line past _STREAM_LIMIT (LimitOverrunError).
+    except (OSError, ConnectionResetError, ValueError):
         return (None, EXEC_FAILED)
     finally:
-        handle.returncode = 0 if final is not None else handle.returncode
         try:
             writer.close()
         except Exception:

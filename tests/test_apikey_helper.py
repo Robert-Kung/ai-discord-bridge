@@ -54,6 +54,17 @@ def test_provision_corrupt_settings_fails_loud(tmp_path):
         runner.provision_api_key_helper(cfg)
 
 
+def test_provision_non_object_settings_fails_loud(tmp_path):
+    """Valid JSON but a list/scalar → SystemExit, not a raw TypeError traceback
+    (which under docker is an opaque crash-loop). Review finding."""
+    cfg = _cfg(tmp_path)
+    d = tmp_path / "botcfg"
+    d.mkdir()
+    (d / "settings.json").write_text('["not", "an", "object"]')
+    with pytest.raises(SystemExit):
+        runner.provision_api_key_helper(cfg)
+
+
 def test_provision_file_seeded_key_accepted(tmp_path):
     """No env key, but the operator dropped the key file: keep it, wire the helper."""
     cfg = {"config_dir": str(tmp_path / "botcfg"), "api_key": None}
