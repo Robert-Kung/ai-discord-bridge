@@ -232,6 +232,53 @@ def test_remote_streaming_exec_round_trip(split_env):
     assert state.session_ctx_tokens[("A", proj)] == 7
 
 
+def test_remote_streaming_survives_large_line(split_env, monkeypatch, tmp_path):
+    """A single stream-json line far past asyncio's 64 KiB default must round-trip
+    (the executor frames against _STREAM_LIMIT=16 MiB; the IPC connections must too).
+    Regression for the review's highest-severity finding."""
+    proj = split_env
+    big = "Z" * 200_000  # > 64 KiB, one line
+    bindir = tmp_path / "bin"
+    (bindir / "claude").write_text(textwrap.dedent(f'''\
+        #!/usr/bin/env python3
+        import sys, json
+        sys.stdin.read()
+        print(json.dumps({{"type":"result","result":{big!r},
+                          "session_id":"s-big","usage":{{"input_tokens":1}}}}), flush=True)
+    '''))
+    os.chmod(bindir / "claude", 0o755)
+
+    async def go():
+        return await runner.run_streaming_exec(
+            "A", "x", mode="edit", cwd=proj, project=proj,
+            on_trace=lambda l: None, on_proc=lambda p: None,
+            should_abort=lambda: False, timeout=30)
+
+    reply, outcome = asyncio.run(_with_server(go()))
+    assert outcome == runner.EXEC_DONE and reply == big
+
+
+def test_remote_converse_survives_large_reply(split_env, monkeypatch, tmp_path):
+    """Non-stream path: a reply packing >64 KiB into one JSON line must not crash
+    _remote_run's 'never crashes the caller' contract."""
+    proj = split_env
+    big = "Q" * 200_000
+    bindir = tmp_path / "bin"
+    (bindir / "claude").write_text(textwrap.dedent(f'''\
+        #!/usr/bin/env python3
+        import sys, json
+        sys.stdin.read()
+        print(json.dumps({{"result":{big!r},"session_id":"s-big2","usage":{{"input_tokens":1}}}}))
+    '''))
+    os.chmod(bindir / "claude", 0o755)
+
+    async def go():
+        return await runner.converse("A", "x", cwd=proj)
+
+    reply, ok = asyncio.run(_with_server(go()))
+    assert ok and reply == big
+
+
 def test_remote_rejection_surfaces_as_failure(split_env, tmp_path):
     async def go():
         return await runner.converse("A", "hello", cwd=str(tmp_path / "not-whitelisted"))

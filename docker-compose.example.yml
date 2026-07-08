@@ -62,10 +62,24 @@ services:
         condition: service_healthy
     # Explicit environment — NEVER env_file here: .env also carries the Discord
     # tokens, which must not exist in this container.
+    #
+    # ⚠️ Two tunables are CROSS-PROCESS COUPLED and must be set IDENTICALLY here and
+    # on discord-frontend, or exec jobs get rejected: EXEC_TIMEOUT and CLAUDE_TIMEOUT
+    # (the frontend sends a per-call timeout; the executor's _validate_exec_request
+    # bounds it by its OWN copy of these). The `${VAR:-default}` interpolation below
+    # reads them from the compose-dir .env so both services stay in lockstep — keep
+    # the defaults matching bridge/config.py. Other non-secret tunables (flush
+    # thresholds, MAX_BOT_TURNS) only matter to the frontend; set them there.
     environment:
       HOME: /home/user
       EGRESS_PROXY_URL: http://proxy-anthropic:8888
       EXECUTOR_SOCKET: /home/user/.claude-shared/discord-state/executor.sock
+      EXEC_TIMEOUT: ${EXEC_TIMEOUT:-1800}
+      CLAUDE_TIMEOUT: ${CLAUDE_TIMEOUT:-300}
+      # M4 approver tier: the frontend serves the socket + writes the mcp-config on the
+      # shared volume; the executor spawns claude and must point at the SAME paths.
+      APPROVER_SOCKET_PATH: /home/user/.claude-shared/discord-state/approver.sock
+      APPROVER_MCP_CONFIG_PATH: /home/user/.claude-shared/discord-state/approver-mcp.json
       # cwd whitelist for validating requested run dirs — MUST match the project
       # bind mounts below (and the frontend's PROJECT_DIRS).
       PROJECT_DIRS: >-
@@ -121,6 +135,14 @@ services:
       DISCORD_BOT_B_TOKEN: ${DISCORD_BOT_B_TOKEN}
       DISCORD_CHANNEL_ID: ${DISCORD_CHANNEL_ID}
       ALLOWED_USER_IDS: ${ALLOWED_USER_IDS}
+      # Coupled with the executor (see its note) — keep these two identical there.
+      EXEC_TIMEOUT: ${EXEC_TIMEOUT:-1800}
+      CLAUDE_TIMEOUT: ${CLAUDE_TIMEOUT:-300}
+      # Opt-in tiers default OFF unless passed here (they gate frontend routing). The
+      # split dropped env_file, so a flag set only in .env would silently revert.
+      ENABLE_BYPASS_TIER: ${ENABLE_BYPASS_TIER:-}
+      ENABLE_APPROVER_TIER: ${ENABLE_APPROVER_TIER:-}
+      ENABLE_EXEC_EVALUATOR: ${ENABLE_EXEC_EVALUATOR:-}
       # cwd whitelist: !cd only accepts these paths (each must contain .git).
       # MUST match the project bind mounts below and the executor's copy.
       PROJECT_DIRS: >-
