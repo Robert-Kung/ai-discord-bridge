@@ -361,6 +361,11 @@ async def _drive_exec_job(job, message: discord.Message, bot_name: str, prompt: 
         committed = True  # branch now holds real work — never auto-discard it below
         stat, full = await worktree.job_diff(cwd, job.base, job.id)
         jobs.save_diff(job, full)
+        # M4 post-task verification (phase-2 gated): run the per-project verify command
+        # in the executor (contained egress + stripped env) and post the outcome above
+        # the diff gate. Only when the tier is live in a split deploy.
+        if config.EXEC_BASH_ENABLED and config.EXECUTOR_SOCKET:
+            await _post_verify(job, channel, cwd)
         if config.EVALUATOR_ENABLED:
             await _post_evaluator_review(job, channel, bot_name, stat, full)
             if job.status == jobs.CANCELLED:  # !cancel arrived during the review
@@ -400,6 +405,31 @@ async def _drive_exec_job(job, message: discord.Message, bot_name: str, prompt: 
                         await worktree.discard_job(cwd, job.id)
                     except Exception:
                         pass
+
+
+async def _post_verify(job, channel, project: str) -> None:
+    """M4: ask the executor to run the per-project verify command in the job's worktree,
+    and post the outcome above the diff gate. Absent config → an explicit 'not
+    configured' (never a green claim); any failure degrades to a note, never blocks the
+    gate. The worktree still exists here (removed only at gate resolution)."""
+    try:
+        workdir = job.worktree
+        if not workdir:
+            return
+        configured, passed, tail = await runner.request_verify(project, workdir)
+        if not configured:
+            await channel.send(
+                f"🧪 job `{job.id}`：未設定 verify（`discord-state/verify/` 無此專案）"
+                "——無自動驗證結果，請自行判斷 diff")
+            return
+        head = "✅ 通過" if passed else "❌ 失敗"
+        body = f"🧪 **[job `{job.id}` verify · {head}]**"
+        if tail.strip():
+            body += f"\n```\n{tail.strip()[-1500:]}\n```"
+        for c in chunk_message(body):
+            await channel.send(c)
+    except Exception:  # noqa: BLE001 — verify must never block the human gate
+        log.exception("verify step failed for job %s — proceeding to the diff gate", job.id)
 
 
 async def _post_evaluator_review(job, channel, author_bot: str, stat: str, full: str) -> None:

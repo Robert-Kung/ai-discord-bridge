@@ -42,6 +42,12 @@ async def main() -> None:
     # of the deny family (the frontend can't — no credentials / no Anthropic egress).
     if os.environ.get("BRIDGE_SKIP_CANARY", "").strip().lower() not in ("1", "true", "yes", "on"):
         await runner.settings_canary_gate()
+    # M4 tier (verify + exec-tier Bash) is LIVE here only when opted in — the phase-2
+    # posture is proven by the Discord-deny egress canary above. Generate the
+    # Bash-permitting exec settings now (base deny family + Bash allow).
+    if runner.m4_live():
+        runner.write_exec_settings()
+        log.info("M4 tier LIVE: post-task verify + exec-tier Bash enabled (executor)")
     await runner.serve_executor()
 
 
