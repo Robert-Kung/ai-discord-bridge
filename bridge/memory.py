@@ -130,7 +130,12 @@ def build_combined_system_prompt(channel_id: int, cwd: str, bot_name: str) -> Pa
             "當使用者提到更早的決定/討論、而上方摘要沒涵蓋時，先用 Grep/Read 搜尋這個目錄再回答。")
     if not parts:
         return None
-    tmp = Path("/tmp") / f"_sysprompt_{channel_id}_{bot_name}.md"
+    # Under STATE_DIR (not /tmp): in a split deploy the claude subprocess runs in the
+    # executor container and reads this file through the shared volume; the executor
+    # also validates that any requested system-prompt path lives under STATE_DIR.
+    spdir = config.STATE_DIR / "sysprompt"
+    spdir.mkdir(parents=True, exist_ok=True)
+    tmp = spdir / f"{channel_id}_{bot_name}.md"
     tmp.write_text("\n\n---\n\n".join(parts))
     return tmp
 

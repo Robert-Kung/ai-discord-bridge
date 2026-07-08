@@ -203,7 +203,14 @@ collapses egress from "anywhere" to "Anthropic or Discord", which reduces autono
 injection-driven exfil but does **not** contain the OAuth credential. Real containment is
 **phase 2**: split into a `discord-frontend` container (Discord egress only, bot tokens)
 and an `executor` container (Anthropic egress only, credentials) so each secret lives
-where the *other* secret's egress can't reach. Egress containment also does nothing
+where the *other* secret's egress can't reach. Phase 2 is **shipped in
+`docker-compose.example.yml`** (executor entrypoint `executor.py`; semantic-request IPC
+over a shared-volume unix socket — no argv/env crosses it, the executor validates every
+parameter; per-container filters `filter.anthropic`/`filter.discord`; each container
+runs its own canary asserting its own deny direction, including the executor proving
+Discord is unreachable from where the credential lives). The live deploy remains on
+phase 1 until the operator cutover smoke (both canaries green, `@`-mention round-trip,
+forced OAuth refresh through the executor proxy). Egress containment also does nothing
 against the **reply channel** itself — a trusted `bypass` user can have the agent print a
 secret into its own Discord reply; that residual is bounded only by §3 (who you grant
 `bypass`), not by the network.

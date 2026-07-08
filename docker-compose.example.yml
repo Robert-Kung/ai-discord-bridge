@@ -9,92 +9,141 @@
 # shared CLAUDE.md). The bots authenticate via the single credential file
 # bind-mounted below — no re-login, same subscription billing.
 #
-# EGRESS CONTAINMENT (phase 1): the bridge runs on a routeless `internal: true`
-# network and reaches the world ONLY through the default-deny egress-proxy sidecar
-# (see ./egress-proxy). The startup egress canary refuses to serve unless a
-# non-allow-listed control host is unreachable both directly and via the proxy.
-# Phase 1 is a scaffold: the allow-list still includes Discord hosts (webhooks are a
-# usable exfil sink) — real credential containment arrives in phase 2 (split
-# executor/frontend containers). See SECURITY.md §6/§7.
+# EGRESS CONTAINMENT (phase 2, egress-exec-isolation 5.x): TWO app containers,
+# each on its own routeless `internal: true` network behind its own default-deny
+# CONNECT proxy:
+#
+#   discord-frontend — discord.py + all bridge logic EXCEPT spawning claude.
+#     Holds the Discord bot tokens. Egress: Discord hosts only. Has NO Claude
+#     credentials, no bot config dirs, no settings.json.
+#   executor — the only place `claude -p` runs. Holds the Claude credentials.
+#     Egress: api.anthropic.com only (the empirically pinned refresh+API host).
+#     Has NO Discord tokens, no channel id, no user whitelist.
+#
+# Each secret now lives in a container whose egress cannot reach the place the
+# OTHER secret is useful. IPC: a unix socket on the shared discord-state volume;
+# the frontend sends semantic run-requests (never argv/env — the executor
+# validates every parameter). Each container proves ITS OWN deny direction at
+# startup with a fail-closed canary (frontend: Anthropic unreachable; executor:
+# Discord unreachable) — see SECURITY.md §6.
 services:
-  egress-proxy:
-    build: ./egress-proxy
-    container_name: ai-discord-bridge-egress-proxy
+  proxy-discord:
+    build:
+      context: ./egress-proxy
+      args: { FILTER: filter.discord }
+    container_name: ai-discord-bridge-proxy-discord
     restart: unless-stopped
-    # Straddles the internal (routeless) network and an outbound bridge network:
-    # it is the only member with a route out.
-    networks:
-      - egress_internal
-      - egress_outbound
-    healthcheck:
+    networks: [frontend_internal, egress_outbound]
+    healthcheck: &proxy_health
       test: ["CMD-SHELL", "netstat -tln 2>/dev/null | grep -q ':8888 ' || exit 1"]
       interval: 10s
       timeout: 3s
       retries: 5
       start_period: 5s
 
-  ai-discord-bridge:
-    build: .
-    container_name: ai-discord-bridge
+  proxy-anthropic:
+    build:
+      context: ./egress-proxy
+      args: { FILTER: filter.anthropic }
+    container_name: ai-discord-bridge-proxy-anthropic
     restart: unless-stopped
-    env_file: .env
+    networks: [executor_internal, egress_outbound]
+    healthcheck: *proxy_health
+
+  executor:
+    build: .
+    command: ["python3", "/app/executor.py"]
+    container_name: ai-discord-bridge-executor
+    restart: unless-stopped
     user: "1000:1000"
-    # Routeless internal network only — no direct path out; egress is via the proxy.
-    networks:
-      - egress_internal
+    networks: [executor_internal]
     depends_on:
-      egress-proxy:
+      proxy-anthropic:
         condition: service_healthy
+    # Explicit environment — NEVER env_file here: .env also carries the Discord
+    # tokens, which must not exist in this container.
     environment:
       HOME: /home/user
-      # Egress containment: all HTTPS leaves via the allow-list proxy. discord.py
-      # takes this as proxy=; `claude -p` gets it as HTTPS_PROXY (set by the bridge).
-      # Unset this (and drop the internal network) to run uncontained (canary skipped).
-      EGRESS_PROXY_URL: http://egress-proxy:8888
-      # cwd whitelist: !cd only accepts these paths (each must contain .git).
-      # MUST match the project bind mounts below. Comma-separated, absolute paths.
+      EGRESS_PROXY_URL: http://proxy-anthropic:8888
+      EXECUTOR_SOCKET: /home/user/.claude-shared/discord-state/executor.sock
+      # cwd whitelist for validating requested run dirs — MUST match the project
+      # bind mounts below (and the frontend's PROJECT_DIRS).
       PROJECT_DIRS: >-
         /home/user/your-project-a,/home/user/your-project-b
+      # API-key mode only (interpolated from .env; empty in subscription mode)
+      USE_API_KEY: ${USE_API_KEY:-}
+      ANTHROPIC_API_KEY_A: ${ANTHROPIC_API_KEY_A:-}
+      ANTHROPIC_API_KEY_B: ${ANTHROPIC_API_KEY_B:-}
     volumes:
-      # ── Bot identity: dedicated MINIMAL config dirs (D4) ──────────────────
-      # These carry no operator personal data and do NOT @import a shared
-      # CLAUDE.md. The operator's own ~/.claude / ~/.claude-b account dirs are
-      # deliberately NOT mounted — the execution path must not reach them.
+      # Bot identity + LIVE OAUTH CREDENTIALS — the executor is the only app
+      # container that mounts these (see SECURITY.md §1/§6 for the trade-offs).
       - /home/user/.claude-bot-a:/home/user/.claude-bot-a
       - /home/user/.claude-bot-b:/home/user/.claude-bot-b
-      # ⚠️ LIVE OAUTH CREDENTIALS — the highest-value secret in this deployment.
-      # Single-file bind-mount each account's credential file into its bot dir
-      # (no re-login, same billing). These files ARE reachable by the execution
-      # path: the bot runs `claude -p`, which can shell out — there is no OS
-      # sandbox in this container (see SECURITY.md). Tool-layer `permissions.deny`
-      # (settings.json) blocks the obvious read paths, but deny-by-name is not
-      # airtight. Mount only the single file, never the whole account dir.
       - /home/user/.claude/.credentials.json:/home/user/.claude-bot-a/.credentials.json:ro
       - /home/user/.claude-b/.credentials.json:/home/user/.claude-bot-b/.credentials.json:ro
       # Server-side security settings (deny family), passed via --settings.
       - ./settings.json:/home/user/.claude-bridge-settings.json:ro
-      # ── Shared bridge state: EXPLICIT allow-list only ────────────────────
-      # NOT the whole ~/.claude-shared — that holds the operator PII / infra /
-      # internal-plan trove (memory/, the shared CLAUDE.md, sibling logs). Mount
-      # only the bot's own operational state + the plan landing zone.
+      # Shared bridge state: the IPC socket, sessions, jobs, worktrees, and the
+      # combined system-prompt files the frontend writes for each call.
+      - /home/user/.claude-shared/discord-state:/home/user/.claude-shared/discord-state
+      # The conversation-layer agent itself reads these (plan-mode Grep/Read):
+      # summaries (cross-session recall), plans landing zone, the thin index file.
+      - /home/user/.claude-shared/discord-summaries:/home/user/.claude-shared/discord-summaries
+      - /home/user/.claude-shared/discord-project-notes:/home/user/.claude-shared/discord-project-notes
+      - /home/user/.claude-shared/plans:/home/user/.claude-shared/plans
+      - /home/user/.claude-shared/memory/project_plan.md:/home/user/.claude-shared/memory/project_plan.md:ro
+      # Project dirs: claude runs here (worktrees link back to these .git dirs).
+      - /home/user/your-project-a:/home/user/your-project-a
+      - /home/user/your-project-b:/home/user/your-project-b
+
+  discord-frontend:
+    build: .
+    container_name: ai-discord-bridge
+    restart: unless-stopped
+    user: "1000:1000"
+    networks: [frontend_internal]
+    depends_on:
+      proxy-discord:
+        condition: service_healthy
+      executor:
+        condition: service_started
+    # Explicit environment — NEVER env_file here: .env may carry API keys, which
+    # must not exist in the container that can reach Discord.
+    environment:
+      HOME: /home/user
+      EGRESS_PROXY_URL: http://proxy-discord:8888
+      EXECUTOR_SOCKET: /home/user/.claude-shared/discord-state/executor.sock
+      # M4 approver: socket + mcp-config must live on the shared volume — the
+      # frontend serves/writes them, the claude subprocess (executor side) connects.
+      APPROVER_SOCKET_PATH: /home/user/.claude-shared/discord-state/approver.sock
+      APPROVER_MCP_CONFIG_PATH: /home/user/.claude-shared/discord-state/approver-mcp.json
+      DISCORD_BOT_A_TOKEN: ${DISCORD_BOT_A_TOKEN}
+      DISCORD_BOT_B_TOKEN: ${DISCORD_BOT_B_TOKEN}
+      DISCORD_CHANNEL_ID: ${DISCORD_CHANNEL_ID}
+      ALLOWED_USER_IDS: ${ALLOWED_USER_IDS}
+      # cwd whitelist: !cd only accepts these paths (each must contain .git).
+      # MUST match the project bind mounts below and the executor's copy.
+      PROJECT_DIRS: >-
+        /home/user/your-project-a,/home/user/your-project-b
+    volumes:
+      # NO bot config dirs, NO credentials, NO settings.json — this container
+      # never spawns claude. Shared bridge state + memory layers only.
       - /home/user/.claude-shared/discord-state:/home/user/.claude-shared/discord-state
       - /home/user/.claude-shared/discord-summaries:/home/user/.claude-shared/discord-summaries
       - /home/user/.claude-shared/discord-project-notes:/home/user/.claude-shared/discord-project-notes
       - /home/user/.claude-shared/plans:/home/user/.claude-shared/plans
-      # The thin summary INDEX only — a single file, never the memory/ dir, so a
-      # newly added memory/ sibling (infrastructure.md, user_profile.md, …) does
-      # not silently become reachable.
       - /home/user/.claude-shared/memory/project_plan.md:/home/user/.claude-shared/memory/project_plan.md:ro
-      # ── Project dirs: mount ONLY the projects the bots may reach ──────────
-      # Everything else in $HOME (.ssh, .gnupg, Documents, ...) stays invisible
-      # in the container = mount-level isolation.
+      # Project dirs: the frontend runs the git side (worktree add/commit/diff/merge).
       - /home/user/your-project-a:/home/user/your-project-a
       - /home/user/your-project-b:/home/user/your-project-b
 
 networks:
-  # Routeless: containers on this network have NO direct path to the internet.
-  egress_internal:
+  # Routeless internal networks: one per app container — neither has any direct
+  # path out, and neither can see the other's proxy.
+  frontend_internal:
     internal: true
-  # Only the proxy joins this one — its single route out.
+  executor_internal:
+    internal: true
+  # Only the two proxies join this one — their single route out.
   egress_outbound:
     driver: bridge
