@@ -7,7 +7,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates gnupg \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
+    # git: the exec loop is worktree-based — the frontend runs
+    # worktree add/commit/diff/merge, and exec-tier jobs run inside a
+    # `git worktree` checkout. Without it, startup GC and every exec job fail.
+    && apt-get install -y --no-install-recommends nodejs git \
     && npm install -g @anthropic-ai/claude-code \
     && apt-get purge -y --auto-remove curl gnupg \
     && apt-get clean \
