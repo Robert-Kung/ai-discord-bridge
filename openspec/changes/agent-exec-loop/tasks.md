@@ -43,5 +43,5 @@
 
 ## 6. Wrap-up
 
-- [ ] 6.1 Full pytest suite green; `docker compose build` + import smoke; live smoke of a real edit → diff → merge round-trip
-- [ ] 6.2 Update SPEC.md / README / SECURITY.md with the job commands, diff-review flow, and the milestone-4 gate rationale
+- [ ] 6.1 Full pytest suite green; `docker compose build` + import smoke; live smoke of a real edit → diff → merge round-trip (operator; needs the egress-5.4 split cutover first)
+- [x] 6.2 Update SPEC.md / README / SECURITY.md with the job commands, diff-review flow, and the milestone-4 gate rationale — SPEC v4 rewrite (dual-container topology, exec loop §6, tier table, env reference), README/README.zh refresh (exec loop, split compose, stale claims fixed), SECURITY.zh synced to the English M4 state, .env.example exec-loop vars + apiKeyHelper correction
