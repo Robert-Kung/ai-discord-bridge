@@ -157,3 +157,36 @@ def test_gc_removes_stale_branches_but_keeps_awaiting(project):
         branches = await worktree.list_bridge_branches(project)
         assert branches == ["keep1"]
     asyncio.run(go())
+
+
+def test_commit_and_merge_without_ambient_git_identity(tmp_path, monkeypatch):
+    """The container has no gitconfig (live-smoke find 2026-07-09): merge_job's --no-ff
+    merge commit must carry the same inline _COMMITTER identity commit_job uses.
+    user.useConfigOnly forces git to refuse auto-detection, and the env isolation
+    hides the developer's own global gitconfig — together they reproduce the container
+    deterministically on any host."""
+    from pathlib import Path
+    # isolate from the host's global/system gitconfig (the container has neither) —
+    # without this the developer's own user.name silently rescues the merge and the
+    # test cannot fail (mutation-verified)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    repo = tmp_path / "proj"
+    repo.mkdir()
+    _run(repo, "git", "init", "-q", "-b", "main")
+    # NO user.name/user.email — and forbid auto-detection like a bare container
+    _run(repo, "git", "config", "user.useConfigOnly", "true")
+    (repo / "a.txt").write_text("hello\n")
+    _run(repo, "git", "add", "-A")
+    _run(repo, "git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init")
+    monkeypatch.setattr(config, "STATE_DIR", tmp_path / "state")
+    project = str(repo)
+
+    async def go():
+        wt, _, base = await worktree.create_job_worktree(project, "noid1")
+        Path(wt, "new.txt").write_text("added\n")
+        assert await worktree.commit_job(wt, "noid1", "edit", base) is True
+        result, detail = await worktree.merge_job(project, "noid1", base)
+        assert result == "merged", detail
+        assert Path(project, "new.txt").read_text() == "added\n"
+    asyncio.run(go())
