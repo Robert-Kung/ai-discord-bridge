@@ -1,3 +1,4 @@
 ^gateway\.discord\.gg$
+^[a-z0-9.-]*\.discord\.gg$
 ^discord\.com$
 ^cdn\.discordapp\.com$
