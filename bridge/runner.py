@@ -901,9 +901,16 @@ async def run_streaming_exec(
 
     PROJECT IDENTITY vs SUBPROCESS CWD (M2): `cwd` is where the subprocess runs (a git
     worktree for a diff-gated job); `project` is the stable project path that keys the
-    session, the cwd lock, and the token accounting. They differ for a worktree job —
-    otherwise every job would burn a fresh session, litter discord-state, and lose the
-    project's summary/notes memory. `project` defaults to `cwd` (M1 / non-git dirs).
+    cwd lock and the job identity. `project` defaults to `cwd` (M1 / non-git dirs).
+
+    WORKTREE JOBS ARE SESSIONLESS (live-smoke find 2026-07-09): claude stores and
+    resolves a session under the cwd it ran in, and a worktree cwd is ephemeral — a sid
+    minted inside one job's worktree is unresumable from the next job's worktree (the
+    resumed call comes back empty, zero changes) and saving it under the project would
+    poison the project's conversation-layer pointer the same way. So when cwd != project
+    we neither pass --resume nor persist the resulting sid/ctx; cross-job context comes
+    from the prompt injection (channel context + summary/notes), not the session.
+    Direct-on-live jobs (cwd == project) keep the M1 resume behavior.
 
     `on_trace(line)` is called (sync, best-effort) for each tool-use action for the live
     status trace; `on_proc(proc)` is called once the subprocess exists so the caller can
@@ -918,7 +925,8 @@ async def run_streaming_exec(
     project = cwd if project is None else project
     cfg = config.BOTS[bot_name]
     api_mode = config.MODE_ALIASES.get(mode, mode)
-    sid = sessions.load_session(bot_name, project)
+    worktree_job = cwd != project
+    sid = None if worktree_job else sessions.load_session(bot_name, project)
     log.info("[%s] exec-job start mode=%s cwd=%s project=%s prompt_len=%d",
              bot_name, api_mode, cwd, project, len(prompt))
 
@@ -931,7 +939,8 @@ async def run_streaming_exec(
                 on_trace=on_trace, on_proc=on_proc, should_abort=should_abort)
         if outcome is not None:
             return (None, outcome)
-        return _finish_stream_result(final, bot_name, project)
+        return _finish_stream_result(final, bot_name, project,
+                                     persist_session=not worktree_job)
 
     args = build_claude_args(
         api_mode, session_id=sid,
@@ -995,22 +1004,28 @@ async def run_streaming_exec(
     if final is None:
         # cancelled (killed mid-stream) or the process died without a result event
         return (None, EXEC_FAILED)
-    return _finish_stream_result(final, bot_name, project)
+    return _finish_stream_result(final, bot_name, project,
+                                 persist_session=not worktree_job)
 
 
-def _finish_stream_result(final: "dict | None", bot_name: str, project: str) -> tuple["str | None", str]:
-    """Shared result-event bookkeeping for the local and remote streaming paths:
-    session save + last-iteration token accounting keyed by PROJECT identity."""
+def _finish_stream_result(final: "dict | None", bot_name: str, project: str,
+                          *, persist_session: bool = True) -> tuple["str | None", str]:
+    """Shared result-event bookkeeping for the local and remote streaming paths.
+    `persist_session=False` for worktree jobs: their session lives (and dies) with the
+    ephemeral worktree cwd — saving its sid/ctx under the project would poison the
+    conversation-layer pointer with an unresumable session (see run_streaming_exec)."""
     if final is None:
         return (None, EXEC_FAILED)
     reply = final.get("result") or "(空回覆)"
-    new_sid = final.get("session_id")
-    if new_sid:
-        sessions.save_session(bot_name, new_sid, project)
-    ctx = stream_ctx_tokens(final.get("usage") or {})
-    if ctx:
-        state.session_ctx_tokens[(bot_name, project)] = ctx
-        log.info("[%s] exec-job context now ~%dk tokens (project=%s)", bot_name, ctx // 1000, project)
+    if persist_session:
+        new_sid = final.get("session_id")
+        if new_sid:
+            sessions.save_session(bot_name, new_sid, project)
+        ctx = stream_ctx_tokens(final.get("usage") or {})
+        if ctx:
+            state.session_ctx_tokens[(bot_name, project)] = ctx
+            log.info("[%s] exec-job context now ~%dk tokens (project=%s)",
+                     bot_name, ctx // 1000, project)
     return (reply, EXEC_DONE)
 
 
