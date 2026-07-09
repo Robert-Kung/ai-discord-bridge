@@ -2,49 +2,62 @@
 
 > English version: [README.md](README.md) ｜ 設計規格： [SPEC.md](SPEC.md) ｜ 威脅模型： [SECURITY.zh.md](SECURITY.zh.md)
 
-自架的雙 AI Discord 夥伴——一個可運作的、個人規模的參考實作，示範四層記憶模型與
-A↔B 辯論編排模式（基於 Claude Code）。
+自架的雙 AI Discord 夥伴——一個可運作的、個人規模的參考實作，示範四層記憶模型、
+A↔B 辯論編排，以及一個**受審查門控的執行迴圈**（基於 Claude Code）。
 
-> **狀態**：個人實驗 / MVP。單頻道、無測試套件、無支援 SLA。歡迎 fork 與改造——但別
-> 期待維護或回 issue。
+> **狀態**：個人實驗。單頻道、無支援 SLA。歡迎 fork 與改造——但別期待維護或回 issue。
+> 安全關鍵邏輯由 230 個 pytest 測試覆蓋並在 CI 執行。
 
 > ⚠️ **安全**：這個工具讓白名單內的 Discord 使用者以你的主機使用者身分、在你掛載的
-> 目錄裡執行程式碼（`bypass` 模式 = 任意執行）。**部署前請先讀
-> [SECURITY.zh.md](SECURITY.zh.md)**——對這類專案，威脅模型與加固清單不是可選讀物。
+> 目錄裡執行程式碼。**部署前請先讀 [SECURITY.zh.md](SECURITY.zh.md)**——對這類專案，
+> 威脅模型與加固清單不是可選讀物。
 
-它是一個 **Claude Code 的 control plane**：兩個 Discord bot（Bot-A、Bot-B）跑在同一個
-Docker 容器內；一次 @-mention 變成一個 `claude -p --resume <sid>` 呼叫，疊上頻道脈絡、
-四層記憶、per-channel 權限模式。價值在於當作 **dual-agent 編排 / 記憶分層 / Discord
-control plane** 的參考實作——不是即裝即用的產品。每個 bot 綁定自己的 Claude Code 設定
-目錄（`~/.claude/`、`~/.claude-b/`）；認證/計費選項見下方 [認證模式](#認證模式)。
+它是一個 **Claude Code 的 control plane**：兩個 Discord bot（Bot-A、Bot-B）；一次
+@-mention 變成一個 `claude -p --resume <sid>` 呼叫，疊上頻道脈絡、四層記憶、per-channel
+權限模式。執行模式的任務以**背景 job 跑在 throwaway git worktree**，貼出 diff 等你核可
+才會碰到你的 checkout。價值在於當作 **dual-agent 編排 / 記憶分層 / egress 圍堵 /
+Discord control plane** 的參考實作——不是即裝即用的產品。每隻 bot 跑在專用精簡設定目錄
+（`~/.claude-bot-{a,b}`），帳號憑證檔以單檔 bind-mount 進去；認證/計費選項見下方
+[認證模式](#認證模式)。
 
 ## 架構亮點
 
 - **四層記憶**：per-session `.jsonl` → per-(channel, cwd) 中期摘要 → per-cwd 專案筆記
-  → 全域長期 profile（容器內唯讀）
-- **flush-before-compaction**：由 `!flush`、訊息門檻、`!cd` 切專案觸發——在 Claude 的
-  context window 自動壓縮前先保存決策
+  → 全域長期 profile（容器內只掛薄索引、唯讀）
+- **flush-before-compaction**：由 `!flush`、訊息門檻、token 門檻、`!cd` 切專案觸發——
+  在 Claude 的 context window 自動壓縮前先保存決策
 - **雙 agent 辯論**：`!discuss <主題>`——A、B 在共享滾動 transcript 上輪流發言，獨立的
   turn budget 不會餓死一般的 @-mention
-- **權限分層**：per-channel 的 `plan` / `edit` / `bypass` 模式；`bypass` 需明確白名單；
-  fail-closed 授權 + prompt injection 隔離 + 憑證讀取 deny（見 [SECURITY.zh.md](SECURITY.zh.md)）
+- **受審查門控的執行迴圈**：執行模式任務變成背景 job（`!jobs` / `!cancel`）即時串流進度；
+  改動落在 throwaway git worktree，完成後貼 diff 等你 ✅ 合併 / ❌ 丟棄（逾時後
+  `!merge` / `!discard`）。可選的每專案 **post-task verify** 與**另一帳號 advisory 審查**
+  會貼在審查門上方。
+- **權限分層**：per-channel 的 `plan` / `edit` / `approve` / `bypass`；`approve` 是逐指令
+  人工核可 tier（MCP approver），`bypass` 未 opt-in 時結構性不可達；fail-closed 授權 +
+  prompt injection 隔離 + canary 驗證過的憑證讀取 deny family（見 [SECURITY.zh.md](SECURITY.zh.md)）
+- **egress 圍堵（雙容器 split）**：`discord-frontend`（只能連 Discord，持 bot token）與
+  `executor`（只能連 Anthropic，持 Claude 憑證）各自跑在 routeless internal 網路、
+  各配一個 default-deny proxy——每個 secret 所在容器的網路都到不了另一個 secret 的
+  用武之地。開機 canary fail-closed 證明各自的 deny 方向。
 
 ## 事前準備
 
-- 兩個 Claude Code 帳號（Pro 或 Max），分別登入主機的 `~/.claude/` 與 `~/.claude-b/`
+- 兩個 Claude Code 帳號（Pro 或 Max），在 host 登入
 - 兩個 Discord bot token（每帳號一個）
+- 專用精簡 bot 設定目錄 `~/.claude-bot-{a,b}`——一次性設定見 [SECURITY.zh.md](SECURITY.zh.md) §9
 
 <a id="認證模式"></a>
 ### 認證模式
 
 - **API key 模式**（`USE_API_KEY=true` + per-bot `ANTHROPIC_API_KEY_A`/`_B`）——**公開 /
-  forker 使用的建議路徑。** 走 Developer Platform 計費,對自動化 bot 而言是更乾淨的
-  ToS 立足點。⚠️ 其計費路由**尚未對真 key 實證**（見 [SPEC.md](SPEC.md) §9）——依賴前請
-  用**有額度上限**的 key 驗一次,且注意 key 會在 subprocess 環境裡（[SECURITY.zh.md](SECURITY.zh.md) §6）。
-- **訂閱模式**（預設,掛載的 `~/.claude{,-b}` 憑證）——保留給作者個人/本機環境。用訂閱
-  憑證跑自動化 bot 是較灰色的 ToS 地帶,所以把它當*相容預設,而非推薦*。此模式下
-  `claude -p` 消耗 **Agent SDK credits**（預付池:Pro $20 / Max 5× $100 / Max 20× $200;
-  用盡即硬停）。把 `MAX_BOT_TURNS` 設保守以控制花費。
+  forker 使用的建議路徑。** 走 Developer Platform 計費，對自動化 bot 而言是更乾淨的
+  ToS 立足點。key **不進 subprocess 環境**：啟動時 materialize 成 0600 檔、由
+  `apiKeyHelper` script 供給（見 [SECURITY.zh.md](SECURITY.zh.md) §6）。⚠️ 其計費*路由*
+  **尚未對真 key 實證**（見 [SPEC.md](SPEC.md) §10）——依賴前請用**有額度上限**的 key 驗一次。
+- **訂閱模式**（預設，各帳號的 `.credentials.json` 以唯讀單檔掛進 bot 設定目錄）——保留給
+  作者個人/本機環境。用訂閱憑證跑自動化 bot 是較灰色的 ToS 地帶，所以把它當*相容預設，
+  而非推薦*。此模式下 `claude -p` 消耗 **Agent SDK credits**（預付池：Pro $20 / Max 5×
+  $100 / Max 20× $200；用盡即硬停）。把 `MAX_BOT_TURNS` 設保守以控制花費。
 
 ## Discord 設定
 
@@ -55,7 +68,7 @@ control plane** 的參考實作——不是即裝即用的產品。每個 bot �
    - Bot 分頁 → Add Bot → 複製 **Token**
    - Privileged Gateway Intents → 開啟 `MESSAGE CONTENT INTENT`
    - OAuth2 → URL Generator → scopes 勾 `bot`，permissions 勾 `Send Messages` +
-     `Read Message History`
+     `Read Message History` + `Add Reactions` + `Attach Files`
    - 用產生的 URL 把 bot 邀進你的 server
 4. 在 Discord client 開「開發者模式」（Settings → Advanced）
 5. 右鍵 `#ai-chat` → 複製頻道 ID
@@ -72,8 +85,10 @@ cp .env.example .env
 #   ALLOWED_USER_IDS   （你的 Discord user ID）
 ```
 
-把 `docker-compose.example.yml` 複製成 `docker-compose.yml`，並把 volume 掛載改成你實際
-的專案目錄。
+把 `docker-compose.example.yml` 複製成 `docker-compose.yml`，並把專案 bind mount 與
+`PROJECT_DIRS`（**兩個 service 都要**）改成你實際的專案目錄。樣板是**雙容器 split**
+（frontend / executor / 兩個 egress proxy）；請讀檔頭註解——有幾個環境變數是跨行程
+耦合的，兩個 service 必須設一致。
 
 ## 啟動
 
@@ -84,13 +99,17 @@ docker compose logs -f
 
 ## 驗證你的部署（smoke test）
 
-單元測試（`pip install -r requirements-dev.txt && pytest`）涵蓋安全關鍵邏輯——fail-closed 授權、`!cd` 路徑/逃逸防護、信任過濾、subprocess env 去敏——並在 CI 跑。它們不碰真 Discord/Claude，所以端到端接線用手動確認：
+單元測試（`pip install -r requirements-dev.txt && pytest`，230 個）涵蓋安全關鍵邏輯——
+fail-closed 授權、`!cd` 路徑/逃逸防護、信任過濾、env 去敏、exec loop 的 job/worktree/verify
+機制、egress canary 邏輯——並在 CI 跑。它們不碰真 Discord/Claude，所以端到端接線用手動確認：
 
 1. `docker compose config`——compose 檔可解析、mount 路徑解得開。
 2. **fail-closed 授權**：把 `ALLOWED_USER_IDS` 清空啟動 → 容器須立刻退出（`refusing to start`）。再設回你的 id。
-3. **bot 在線**：`docker compose logs` 顯示 A、B 都 `logged in as ...`。
-4. **用白名單帳號**在頻道：`!help`、`!state`、`!mode plan`、`!cd <你的專案>`，然後 `@Bot-A hello` → A 回應。
-5. **API key 模式**（若啟用）：`USE_API_KEY=true` 但 key 留空 → 容器須拒絕啟動。
+3. **canary 全綠**：log 顯示 egress canary（split 下每容器各自跑）與 settings-deny canary 都在服務前通過。
+4. **bot 在線**：`docker compose logs` 顯示 A、B 都 `logged in as ...`。
+5. **用白名單帳號**在頻道：`!help`、`!state`、`!mode plan`、`!cd <你的專案>`，然後 `@Bot-A hello` → A 回應。
+6. **exec round-trip**：`!mode edit`，請 bot 做個小改動 → 背景 job 串流進度、貼 diff、你按 ✅ 合併（❌ 丟棄）。
+7. **API key 模式**（若啟用）：`USE_API_KEY=true` 但 key 留空 → 容器須拒絕啟動。
 
 ## 用法
 
@@ -103,40 +122,54 @@ docker compose logs -f
 | A 在回覆中 @-mention `@Bot-B` | B 回應（辯論模式） |
 | 你發任何訊息 | 重置 A↔B 輪數計數器 |
 
+`plan` 模式（預設）下 mention 是一般對話呼叫。`edit` / `approve` / `bypass` 模式下則變成
+**背景 exec job**：工作在 throwaway git worktree 進行、進度串流到狀態訊息、完成的 diff
+等你 ✅/❌。觸發訊息上的附件會被收進 job 當未受信任的 context。
+
 **指令**（前綴 `!`，只由 Bot-A 處理以避免雙觸發）：
 
 | 指令 | 效果 |
 |------|------|
-| `!cd /path/to/project` | 切工作目錄；先 flush 前一專案脈絡 |
-| `!flush` | 手動 flush——存中期摘要 + 專案筆記 |
+| `!cd <專案>` | 切工作目錄（限白名單 git 專案）；先 flush 前一專案脈絡 |
+| `!mode plan\|edit\|bypass\|approve` | 設此頻道的權限模式（`bypass`/`approve` 需各自的 opt-in tier） |
+| `!jobs` | 列出背景 exec job（執行中 / 待審） |
+| `!cancel <id>` | 取消執行中的 job（終止整個 process group） |
+| `!merge <id>` / `!discard <id>` | 合併 / 丟棄某個待審 diff |
 | `!discuss <主題>` | 結構化 A↔B 辯論（共享滾動 transcript） |
-| `!mode plan\|edit\|bypass` | 設此頻道的權限模式 |
+| `!flush` | 手動 flush——存中期摘要 + 專案筆記 |
 | `!reset a\|b` | 清掉某 bot 的 session（摘要保留） |
-| `!state` | 顯示頻道狀態、buffer、摘要狀態 |
+| `!state` | 顯示頻道狀態、cwd、context tokens、帳號用量 |
 
-> 完整指令表（含 session 機制與權限欄）見 [SPEC.md](SPEC.md) §5。
+> 完整指令表（含 session 機制與權限欄）見 [SPEC.md](SPEC.md) §5；執行層見 §6。
 
 A↔B 輪數計數器在 `MAX_BOT_TURNS`（預設 6）硬停。
 
 ## 為什麼 bind mount 用相同絕對路徑
 
-`~/.claude/skills` 是 symlink 指向 `~/.claude-shared/skills/`，且 `CLAUDE.md` 用
-`@/home/user/.claude-shared/CLAUDE.md`（絕對路徑 import）。容器必須掛到**相同絕對路徑**
-`/home/user/.claude{,-b,-shared}`，否則 symlink 與 `@import` 會無聲失效。
+容器內的設定與狀態路徑錨定在 `/home/user/...`，且 exec job 的 worktree 以絕對路徑連回
+各專案的 `.git`。專案目錄與 `~/.claude-shared` 的狀態子目錄必須掛到與 host **相同的
+絕對路徑**（樣板 compose 就是這樣寫的）——否則 `!cd` 白名單、worktree 合併、共用
+volume 上的 IPC socket 都會無聲失效。
 
-`memory/` 子目錄以**唯讀**掛載，避免 bot 容器與互動式 host session 互相寫競態。
+`memory/project_plan.md` 索引與 M4 的 `discord-verify/` 設定目錄刻意以**唯讀**掛載——
+後者正是讓 post-task verify 訊號無法被受檢 agent 偽造的關鍵（[SECURITY.zh.md](SECURITY.zh.md) §4）。
 
 ## 已知限制
 
-1. **單頻道**——MVP 寫死單一頻道 ID，多頻道路由在 backlog。
-2. **OAuth refresh 競態**——bot 與 host 可能在 token refresh 上競態。實務罕見；MVP 接受。
-3. **無附檔**、無 thread/reply 巢狀、無 slash command——皆未來 backlog。
-4. **測試有限**——單元測涵蓋安全關鍵純邏輯（授權、路徑/信任防護、env 去敏）並在 CI 跑;無對真 Discord/Claude 的整合測（那部分靠手動 smoke test）。
+1. **單頻道**——寫死單一頻道 ID；turn 計數器是全域的。多頻道路由在 backlog。
+2. **OAuth refresh 競態**——bot 與 host 可能在 token refresh 上競態。實務罕見；split 部署
+   下容器內憑證是唯讀掛載，由 host 保鮮。
+3. **重啟遺失記憶體狀態**——進行中的 plan 確認、buffer、turn 計數會重置；session、摘要、
+   待審 job 都持久。「已 commit 但 diff 還沒貼出」邊界上的 job 會在重啟 GC 被收走
+   （已知 finding，目前接受）。
+4. **無 thread/reply 巢狀、無 slash command**——未來 backlog。
+5. **測試是單元層級**——套件在 CI 覆蓋安全關鍵與 exec loop 邏輯；無對真 Discord/Claude
+   的整合測（那部分靠上面的手動 smoke test）。
 
 ## 無支援
 
 這是個人日常使用的專案，不是維護中的 library。歡迎 PR，但無法保證 review 或即時回應。
-壞掉的話，整個實作都在 `bot.py`。
+壞掉的話，實作在 `bridge/`（入口：`bot.py`、`executor.py`）。
 
 ## 授權
 
