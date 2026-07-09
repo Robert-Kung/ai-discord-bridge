@@ -111,6 +111,27 @@ bot 只監聽單一 `DISCORD_CHANNEL_ID`。把它放在只有可信者能發言�
 bot **fail closed 拒絕啟動**。`plan-then-execute` ✅ 流程是針對「誠實失誤」的減速丘，
 **不是**針對惡意請求的安全邊界。
 
+**Exec-tier Bash（M4，`ENABLE_EXEC_BASH`，預設關閉）。** 背景 exec job 原本不能跑
+shell（headless `acceptEdits` 不給 Bash）。啟用後，exec tier 改用一份 exec-settings 檔
+（＝base deny family + `Bash` allow），且**只在 phase-2 executor 容器內 LIVE**
+（`runner.m4_live()`：`EXECUTOR_SOCKET` 有設，且該容器「Discord 不可達」的 egress
+canary 已在啟動時證明）——單容器姿態下這個 gate 未經證明，flag 開了 tier 也保持
+inert。**真正的圍堵是 executor 的 routeless egress**（只到 Anthropic；Discord 與任意
+host 都沒路由）：一旦 `Bash` 開放，名稱式 deny family 就只是減速丘——shell 可輕易
+繞過（`sh -c curl`、`cat` 磁碟上的 key、`python -c`、`/dev/tcp`）——所以它是針對
+誠實失誤的 defense-in-depth，**不是**對被注入/惡意 agent 的屏障。這個姿態也正是
+diff gate 健全的前提（可寫面即受審面）。啟動時另有 **exec canary** 證明「允許 Bash
+的 settings 真的載入、deny 仍生效」（claude 會無聲忽略無效的 `--settings` 檔），且
+exec-settings 檔**每次 spawn 前重新產生**——前一個 job 的竄改留不到下一個 job 的
+policy。
+
+**Post-task verification** 共用同一個 gate：每專案一條指令，在 worktree 內以
+**stripped env**（無 Discord token / API key）與獨立 timeout 執行（executor 側）；
+沒設定 → 明確回報「未設定」，絕不假綠。指令**只**從一個**唯讀掛載**的設定目錄讀
+（`discord-verify/`，每專案 slug 一檔）——永不從 repo/worktree 讀，也刻意**不放**
+rw 的 `discord-state` volume：開了 Bash 的 exec agent 寫得到那裡，否則就能偽造
+自己的綠燈。`:ro` 掛載讓 verify 訊號**無法被受檢的 agent 偽造**。
+
 ---
 
 ## 5. Prompt injection 隔離
@@ -148,24 +169,92 @@ your permission settings."* **啟動 canary**（嘗試一個被 deny 的指令�
 真的載入——因為 claude 對驗證失敗的 settings 檔會**無聲忽略**。canary 沒讓 deny 生效，
 bot 就 fail closed。
 
+### 網路 egress 圍堵（phase 1）——啟用後的主要屏障
+
+**一旦 proxy 啟用**（設 `EGRESS_PROXY_URL` + bridge 跑在 routeless internal 網路上），
+名稱式 deny 就不再是唯一的 exfil 屏障。在那次 operator cutover 之前，名稱式 deny 仍是
+唯一屏障。`EGRESS_PROXY_URL` 有設時，bridge 跑在 **routeless `internal: true` docker
+網路**上，所有對外連線必須通過一個 **default-deny CONNECT proxy**（`./egress-proxy`，
+tinyproxy + hostname allow-list）。就算被 bypass 的 agent 繞過名稱式 deny 讀到憑證，
+也**沒有路由**能把它送到 allow-list 以外的任何地方。這在服務前由**三探針 egress
+canary** 證明（fail-closed）：
+
+1. 直連一個非 allow-list 的對照 host **必須失敗**（路由確實不存在）；
+2. 該對照 host **走 proxy 必須被拒**（403——證明 allow-list 是 *default-deny*，能抓到
+   allow-all／空 ACL 的 proxy，這是只測連通性抓不到的）；
+3. `api.anthropic.com` 走 proxy **必須成功**。
+
+有活的直連路由或 allow-all proxy → 拒絕服務；Anthropic 不可達 → in-process backoff 重試。
+
+**Phase 1 是鷹架，不是憑證圍堵。** allow-list 仍含 bridge 行程需要的 Discord host
+（`discord.com`、`cdn.discordapp.com`、`gateway.discord.gg`）——而 `discord.com` 的
+webhook / CDN 上傳是**可用的 exfil sink**。所以 phase 1 把 egress 從「任何地方」收斂到
+「Anthropic 或 Discord」，能降低自主／注入驅動的外洩，但**不能**圍堵 OAuth 憑證。
+真正的圍堵是 **phase 2**：拆成 `discord-frontend` 容器（只有 Discord egress，持 bot
+token）與 `executor` 容器（只有 Anthropic egress，持憑證），讓每個 secret 都活在
+「另一個 secret 的 egress 到不了」的容器裡。Phase 2 **已在
+`docker-compose.example.yml` 出貨**（executor 入口 `executor.py`；semantic-request IPC
+走共用 volume 上的 unix socket——argv/env 不跨界，executor 逐參數驗證；per-container
+filter `filter.anthropic`／`filter.discord`；每個容器啟動時跑自己的 canary 證明自己的
+deny 方向，包括 executor 證明「憑證所在之處連不到 Discord」）。live 部署在 operator
+cutover smoke（兩個 canary 綠、`@`-mention round-trip、強制 OAuth refresh 走 executor
+proxy）完成前仍留在 phase 1。egress 圍堵也管不到**回覆通道**本身——受信任的 `bypass`
+使用者可以讓 agent 把 secret 印進自己的 Discord 回覆；這個殘餘只由 §3（你把 `bypass`
+給誰）約束，不由網路約束。
+
+**Operator cutover——pin OAuth-refresh host（按順序做）。** refresh 端點沒有權威文件；
+allow-list 猜錯會通過啟動 canary，卻在幾小時後 token 過期時無聲進入 `CANNOT_RUN`
+迴圈。所以 allow-list 必須 pin 到**觀測到的** host，且觀測要在 cutover 當下做——不能
+用假設。注意 canary 是 fail-closed 的：你無法讓 live bridge「開 proxy、網路開放」地
+安全觀測，所以下面的強制 refresh 是**在 host 上、透過發佈出來的 proxy port** 跑——
+同一個 proxy binary、同一份 filter、同樣的觀測，但憑證檔在那裡可寫（容器內是 `:ro`
+單檔掛載，容器側 refresh 本來就持久不了）。
+
+1. 依 `docker-compose.example.yml` 接好 live `docker-compose.yml`（proxy sidecar、
+   `internal: true` 網路、`EGRESS_PROXY_URL`），並把 proxy port 發佈在
+   `127.0.0.1:8888` 供步驟 3 用。
+2. 強制讓一個帳號的 OAuth 時間戳過期（token 不動、留備份）：
+   `scripts/expire-oauth-token.sh ~/.claude-b`
+3. `docker compose up -d --build`；確認 bridge log 三探針 egress canary 綠。然後從
+   host 走 proxy 觸發 refresh：
+   `HTTPS_PROXY=http://127.0.0.1:8888 CLAUDE_CONFIG_DIR=$HOME/.claude-b claude -p ping`
+4. 讀 proxy log：`docker logs ai-discord-bridge-egress-proxy`（`LogLevel Connect` 列出
+   每個 CONNECT 目標；filter 拒絕會記 denied host）。記下 refresh 碰到的每個 host。
+   若有被 deny 的：加進 `egress-proxy/filter`、
+   `docker compose up -d --build egress-proxy`（filter 是 build 時烤進 image），重跑
+   步驟 2–3 直到 refresh 乾淨完成。
+5. Pin：從 `egress-proxy/filter` 刪掉沒用到的猜測（`console.anthropic.com` 沒被連過
+   就刪），把觀測到的 host 連日期記在下方。
+6. Sanity：在 Discord `@` 兩隻 bot（一般呼叫都走 proxy），並盯下一個自然過期窗看有無
+   `CANNOT_RUN` 迴圈特徵。
+
+> **觀測到的 refresh host——cutover run 2026-07-08（UTC 02:24–02:25）：** 強制 refresh
+> 只碰了 **`api.anthropic.com`**，並持久化了新 token（`expiresAt` +8h、檔案中途被
+> 重寫）。`console.anthropic.com` **從未被嘗試**——當初的猜測是錯的，已從
+> `egress-proxy/filter` 移除。過程中兩個 host 被 deny 而呼叫仍成功，即確認非必要、
+> 按設計保持 deny：`mcp-proxy.anthropic.com`（claude.ai 託管的 MCP connector；CLI 會
+> 吵鬧地重試——預期中的 log 噪音，非故障）與
+> `http-intake.logs.us5.datadoghq.com`（CLI 遙測——正是這個 proxy 要擋的那類 egress）。
+
 **極限——務必讀（preflight gate 後的誠實殘留）：**
 
 - **deny 靠指令/工具名，且沒有 OS sandbox**（§2）。`edit`/`bypass` 下堅決的 shell 仍可
   繞過名稱比對碰到憑證/env/網路——`/usr/bin/cu*rl`、`python -c`、`cat /proc/self/environ`、
   以未列出的路徑讀憑證檔。名稱式 deny 是 defense-in-depth，**不是**針對惡意執行層使用者
   的圍堵邊界。真正控制是 §3——把 `edit`/`bypass` 留給你完全信任的人——加上專用精簡設定
-  目錄（§2）把操作者*帳號*目錄與 PII 擋在外。per-command 人工 approver（M4）才是規劃中
-  的硬邊界。
+  目錄（§2）把操作者*帳號*目錄與 PII 擋在外。逐指令人工核可的 **`approve` tier**
+  （opt-in，見 §4/§7）是對應的硬邊界。
 - 這條 deny 涵蓋檔案，不涵蓋行程環境變數。兩個 Discord token 已從子行程環境移除
   （§2），但任何**其他**存在的環境變數，`bypass` 模式的 `printenv` 仍看得到。別把
   主機機密放進本 bridge 的環境變數。
-- **API key 模式**（`USE_API_KEY=true`）：該 bot 自己的 key 必然要以 `ANTHROPIC_API_KEY`
-  注入子行程環境——所以 `bypass` 模式的 `printenv` 讀得到。環境裡**只有該 bot 自己的
-  key**（另一隻 bot 的 key、以及整個 auth/計費路由家族——`ANTHROPIC_API_KEY_{A,B}`、
-  `ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_BASE_URL`、`CLAUDE_CODE_USE_*`——都被 strip 掉）。
-  不像訂閱模式（環境裡**完全沒有** key），這是被接受的取捨：請用**有額度上限 /
-  workspace 隔離**的 key，讓萬一外洩時影響有界。（未來里程碑會改用 `apiKeyHelper`，
-  讓 key 根本不進環境。）
+- **API key 模式**（`USE_API_KEY=true`）：key **不會**進入子行程環境。啟動時每隻 bot
+  的 key 被 materialize 成 `0600` 檔（`<config-dir>/anthropic-api-key`），由接進該 bot
+  config-dir `settings.json` 的可執行 `apiKeyHelper` 供給（機制已 live 驗證：CLI 會
+  諮詢它）；整個 `ANTHROPIC_API_KEY*` / auth/計費覆蓋家族在兩種模式都從環境 strip
+  掉，`printenv` 撈不到任何 key。key 檔本身在名稱式 deny 防護的路徑上（config dir 與
+  `**/anthropic-api-key` 的 `Read` deny）——跟 §6 其他部分一樣是名稱式、可繞過的，
+  所以仍請用**有花費上限 / workspace 隔離**的 key。訂閱模式完全不受影響：不佈署
+  helper，OAuth 解析不變。
 
 ---
 
@@ -194,8 +283,11 @@ bot 就 fail closed。
   只限制 bot↔bot 互答，不限制人類觸發。
 - **裸跑會失去所有檔案系統隔離**（§2）：沒有容器，`bypass` 觸及你整個 `$HOME`。在
   任何你無法完全掌控的主機上，請用內附容器。
-- **網路 egress 不受限：** `bypass` 可把任何掛載資料透過網路外傳（§2）。mount 隔離 ≠
-  網路隔離。
+- **網路 egress（phase 1：收斂到 Anthropic + Discord；`EGRESS_PROXY_URL` 未設則
+  無圍堵）。** 開 egress proxy 後，被 bypass 的 agent 只能連 allow-list 上的 host——
+  但 Discord 在清單上，`discord.com` webhook 仍是可用的 exfil sink，直到 phase 2 把
+  executor 拆到 Anthropic-only egress（§6）。proxy 沒開（無 internal 網路）則 egress
+  完全不受限——mount 隔離 ≠ 網路隔離。
 - **暫存 system-prompt 檔：** flush 會把頻道摘要寫到 `/tmp/_sysprompt_*.md`。在容器內
   無妨；但在共用主機上裸跑時，其他 host 使用者可能讀到。
 
@@ -248,4 +340,4 @@ symlink。** 容器會把你的真實憑證檔 bind-mount 蓋在這個 placehold
 ## 10. 回報
 
 這是個人、無支援的專案（見 README）。若你發現安全問題，歡迎開 issue，但不保證回應
-時間。整個實作都在 `bot.py`——請自行 fork 與修補。
+時間。實作在 `bridge/`（入口 `bot.py` / `executor.py`）——請自行 fork 與修補。

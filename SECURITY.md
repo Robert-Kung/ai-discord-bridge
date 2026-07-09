@@ -288,7 +288,8 @@ single-file mount, so a container-side refresh cannot persist anyway).
   containment boundary against a hostile execution-tier user. The real control is
   §3 — keep `edit`/`bypass` to people you fully trust — plus the dedicated minimal
   config dir (§2) which keeps the operator's *account* dir and PII out of reach.
-  The per-command human approver (M4) is the planned hard boundary.
+  The per-command human-approval **`approve` tier** (opt-in, §4/§7) is the
+  corresponding hard boundary.
 - The deny covers files, not the process environment. The two Discord tokens are
   stripped from the subprocess env (§2), but any *other* environment variable
   present is still visible to a `bypass`-mode `printenv`. Keep host secrets out
@@ -407,4 +408,5 @@ credential only resolves inside the container via the bind mount.)
 
 This is a personal, no-support project (see the README). If you find a security
 issue, opening an issue is welcome, but there is no guaranteed response time. The
-entire implementation is in `bot.py` — fork and fix as needed.
+implementation lives in `bridge/` (entrypoints: `bot.py`, `executor.py`) — fork
+and fix as needed.
