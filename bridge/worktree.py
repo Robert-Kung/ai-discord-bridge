@@ -116,7 +116,12 @@ async def merge_job(project: str, job_id: str, base: str) -> tuple[str, str]:
         return ("diverged", f"base {base[:8]} is not an ancestor of the current HEAD "
                             "(the live branch has diverged since the job started)")
     branch = branch_name(job_id)
-    rc, out, err = await _git(project, "merge", "--no-ff", "-m", f"Merge bridge job {job_id}", branch)
+    # --no-ff creates a merge commit, which needs a committer identity. The container
+    # has no gitconfig (live-smoke find 2026-07-09: auto-detect fails in-container and
+    # the failure was misreported as a conflict), so pass the same inline identity
+    # commit_job uses.
+    rc, out, err = await _git(project, *_COMMITTER, "merge", "--no-ff", "-m",
+                              f"Merge bridge job {job_id}", branch)
     if rc == 0:
         return ("merged", out.strip())
     await _git(project, "merge", "--abort")
