@@ -2,8 +2,10 @@
 
 Drives the REAL code (worktree create → run_streaming_exec in the worktree → commit →
 diff → merge) — the coverage the pure-helper tests can't give. Confirms the two safety
-properties that matter: the live tree changes ONLY on merge, and the session is keyed by
-project identity, not the worktree.
+properties that matter: the live tree changes ONLY on merge, and worktree jobs are
+SESSIONLESS (real claude keys sessions by cwd; a sid minted in an ephemeral worktree is
+unresumable and must never be saved as the project's conversation-layer pointer —
+live-smoke find 2026-07-09).
 """
 import asyncio
 import os
@@ -31,33 +33,47 @@ def repo_and_fake_claude(tmp_path, monkeypatch):
     _run(repo, "git", "add", "-A")
     _run(repo, "git", "commit", "-qm", "init")
 
-    # fake claude: append to a.txt + add newfile.txt in its cwd, emit stream-json
+    # fake claude: append to a.txt + add newfile.txt in its cwd, emit stream-json.
+    # Also records its argv so tests can assert whether --resume was passed.
     bindir = tmp_path / "bin"
     bindir.mkdir()
-    (bindir / "claude").write_text(textwrap.dedent('''\
+    argv_log = tmp_path / "claude-argv.txt"
+    (bindir / "claude").write_text(textwrap.dedent(f'''\
         #!/usr/bin/env python3
         import sys, json, os
+        with open({str(argv_log)!r}, "a") as f:
+            f.write(json.dumps(sys.argv[1:]) + "\\n")
         sys.stdin.read()
         with open(os.path.join(os.getcwd(), "a.txt"), "a") as f:
             f.write("agent-line\\n")
         with open(os.path.join(os.getcwd(), "newfile.txt"), "w") as f:
             f.write("new\\n")
-        print(json.dumps({"type":"assistant","message":{"content":[
-            {"type":"tool_use","name":"Edit","input":{"file_path":"a.txt"}}]}}), flush=True)
-        print(json.dumps({"type":"result","result":"edited","session_id":"s-int",
-                          "usage":{"input_tokens":4}}), flush=True)
+        print(json.dumps({{"type":"assistant","message":{{"content":[
+            {{"type":"tool_use","name":"Edit","input":{{"file_path":"a.txt"}}}}]}}}}), flush=True)
+        print(json.dumps({{"type":"result","result":"edited","session_id":"s-int",
+                          "usage":{{"input_tokens":4}}}}), flush=True)
     '''))
     os.chmod(bindir / "claude", 0o755)
     monkeypatch.setenv("PATH", str(bindir) + os.pathsep + os.environ["PATH"])
     monkeypatch.setattr(config, "STATE_DIR", tmp_path / "state")
+    (tmp_path / "state").mkdir()  # prod: load_config() creates it
     monkeypatch.setattr(config, "BOTS", {"A": {"token": "x", "config_dir": str(tmp_path / "cfg"), "api_key": None}})
-    return str(repo)
+    return str(repo), argv_log
+
+
+def _argv_calls(argv_log):
+    import json
+    if not argv_log.exists():
+        return []
+    return [json.loads(l) for l in argv_log.read_text().splitlines()]
 
 
 def test_full_exec_path_live_tree_changes_only_on_merge(repo_and_fake_claude):
-    project = repo_and_fake_claude
+    project, argv_log = repo_and_fake_claude
 
     async def go():
+        # a pre-existing conversation-layer session for the PROJECT must survive the job
+        sessions.save_session("A", "s-conversation", project)
         wt, branch, base = await worktree.create_job_worktree(project, "int1")
         before = (Path(project) / "a.txt").read_text()
         reply, outcome = await runner.run_streaming_exec(
@@ -68,10 +84,14 @@ def test_full_exec_path_live_tree_changes_only_on_merge(repo_and_fake_claude):
         # ISOLATION: live tree untouched by the run
         assert (Path(project) / "a.txt").read_text() == before
         assert not (Path(project) / "newfile.txt").exists()
-        # PROJECT IDENTITY: session keyed by project, not the worktree path
-        assert sessions.load_session("A", project) == "s-int"
+        # SESSIONLESS WORKTREE JOB: no --resume passed (a project sid is unresumable
+        # from the worktree cwd), and the worktree-born sid is NOT persisted anywhere —
+        # the project's conversation pointer survives un-poisoned.
+        (argv,) = _argv_calls(argv_log)
+        assert "--resume" not in argv
+        assert sessions.load_session("A", project) == "s-conversation"
         assert sessions.load_session("A", wt) is None
-        assert state.session_ctx_tokens[("A", project)] == 4
+        assert ("A", project) not in state.session_ctx_tokens
 
         changed = await worktree.commit_job(wt, "int1", "edit it", base)
         assert changed
@@ -90,8 +110,27 @@ def test_full_exec_path_live_tree_changes_only_on_merge(repo_and_fake_claude):
     asyncio.run(go())
 
 
+def test_direct_job_keeps_resume_semantics(repo_and_fake_claude):
+    """M1 path (cwd == project, no worktree): the session IS resumed and persisted."""
+    project, argv_log = repo_and_fake_claude
+
+    async def go():
+        sessions.save_session("A", "s-direct", project)
+        reply, outcome = await runner.run_streaming_exec(
+            "A", "edit it", mode="edit", cwd=project,
+            on_trace=lambda l: None, on_proc=lambda p: None,
+            should_abort=lambda: False, timeout=30)
+        assert outcome == runner.EXEC_DONE
+        (argv,) = _argv_calls(argv_log)
+        assert "--resume" in argv and argv[argv.index("--resume") + 1] == "s-direct"
+        assert sessions.load_session("A", project) == "s-int"
+        assert state.session_ctx_tokens[("A", project)] == 4
+
+    asyncio.run(go())
+
+
 def test_discard_never_touches_live_tree(repo_and_fake_claude):
-    project = repo_and_fake_claude
+    project, _ = repo_and_fake_claude
 
     async def go():
         wt, branch, base = await worktree.create_job_worktree(project, "int2")
