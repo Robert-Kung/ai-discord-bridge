@@ -133,6 +133,31 @@ a settings file that fails validation) — if the deny does not fire, the bot
 speed-bump for honest mistakes, **not** a security boundary against a malicious
 request.
 
+**Exec-tier Bash (M4, `ENABLE_EXEC_BASH`, off by default).** Background exec jobs
+otherwise cannot run shell (headless `acceptEdits` grants no Bash). When enabled, the
+exec tier runs with an exec-settings file = the base deny family + `Bash` allowed, and
+is **LIVE only inside the phase-2 executor container** (`runner.m4_live()`:
+`EXECUTOR_SOCKET` set, whose Discord-deny egress canary is proven at startup) — in the
+single-container posture the gate is unproven and the tier stays inert regardless of
+the flag. **The real containment is the executor's routeless egress** (Anthropic-only;
+Discord and arbitrary hosts unreachable): once `Bash` is allowed, the name-based deny
+family is only a speed-bump — a shell trivially evades it (`sh -c curl`, `cat` the
+on-disk key, `python -c`, `/dev/tcp`) — so it is defense-in-depth for honest mistakes,
+**not** a barrier against an injected/malicious agent. That posture is also what makes
+the diff gate sound (the writable surface IS the reviewed surface). A startup **exec
+canary** proves the Bash-permitting settings actually load with the deny still firing
+(claude silently ignores an invalid `--settings` file), and the exec-settings file is
+**regenerated before every spawn** so a prior job cannot tamper the next job's policy.
+
+**Post-task verification** shares the same gate: a per-project command runs in the
+worktree with a **stripped env** (no Discord token / API key) and its own timeout,
+executor-side; absent config → an explicit "not configured", never a fake green. The
+command is read **only** from a **read-only-mounted** config dir (`discord-verify/`,
+one file per project-slug) — never the repo/worktree, and deliberately **not** the
+rw `discord-state` volume, because the Bash-enabled exec agent can write there and
+would otherwise forge its own green. The `:ro` mount makes the verify signal
+un-forgeable by the agent it checks.
+
 ---
 
 ## 5. Prompt-injection isolation

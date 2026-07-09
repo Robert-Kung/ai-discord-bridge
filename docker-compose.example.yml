@@ -76,6 +76,12 @@ services:
       EXECUTOR_SOCKET: /home/user/.claude-shared/discord-state/executor.sock
       EXEC_TIMEOUT: ${EXEC_TIMEOUT:-1800}
       CLAUDE_TIMEOUT: ${CLAUDE_TIMEOUT:-300}
+      # M4 (post-task verify + exec-tier Bash) — LIVE only in this executor (proven
+      # phase-2 posture). Set on both services; it stays inert single-container.
+      ENABLE_EXEC_BASH: ${ENABLE_EXEC_BASH:-}
+      # M4 verify timeout — cross-process coupled with the frontend's IPC wait; keep
+      # identical on both services (the frontend waits VERIFY_TIMEOUT+30 for the result).
+      VERIFY_TIMEOUT: ${VERIFY_TIMEOUT:-600}
       # M4 approver tier: the frontend serves the socket + writes the mcp-config on the
       # shared volume; the executor spawns claude and must point at the SAME paths.
       APPROVER_SOCKET_PATH: /home/user/.claude-shared/discord-state/approver.sock
@@ -97,6 +103,12 @@ services:
       - /home/user/.claude-b/.credentials.json:/home/user/.claude-bot-b/.credentials.json:ro
       # Server-side security settings (deny family), passed via --settings.
       - ./settings.json:/home/user/.claude-bridge-settings.json:ro
+      # M4 verify config — one file per project (name = the project's cwd-slug), each
+      # holding the shell verify command. Mounted READ-ONLY: the exec agent runs with
+      # Bash + rw discord-state, so a verify command kept on a writable volume could be
+      # forged by the agent into a fake green. :ro makes it un-forgeable. Operator
+      # authors these on the host; create the dir even if empty.
+      - /home/user/.claude-shared/discord-verify:/home/user/.claude-shared/discord-verify:ro
       # Shared bridge state: the IPC socket, sessions, jobs, worktrees, and the
       # combined system-prompt files the frontend writes for each call.
       - /home/user/.claude-shared/discord-state:/home/user/.claude-shared/discord-state
@@ -143,6 +155,9 @@ services:
       ENABLE_BYPASS_TIER: ${ENABLE_BYPASS_TIER:-}
       ENABLE_APPROVER_TIER: ${ENABLE_APPROVER_TIER:-}
       ENABLE_EXEC_EVALUATOR: ${ENABLE_EXEC_EVALUATOR:-}
+      # M4: the frontend reads this to decide whether to request post-task verify.
+      ENABLE_EXEC_BASH: ${ENABLE_EXEC_BASH:-}
+      VERIFY_TIMEOUT: ${VERIFY_TIMEOUT:-600}  # keep identical to the executor's
       # cwd whitelist: !cd only accepts these paths (each must contain .git).
       # MUST match the project bind mounts below and the executor's copy.
       PROJECT_DIRS: >-
