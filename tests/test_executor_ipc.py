@@ -109,7 +109,7 @@ def test_executor_container_has_no_discord_material():
     ex = _service_block("executor")
     for needle in ("DISCORD_BOT", "DISCORD_CHANNEL_ID", "ALLOWED_USER_IDS", "env_file"):
         assert needle not in ex, f"executor must not carry {needle}"
-    assert ".credentials.json" in ex and "EXECUTOR_SOCKET" in ex
+    assert ".claude-bot-creds" in ex and "EXECUTOR_SOCKET" in ex
     assert "proxy-anthropic" in ex  # its egress is the Anthropic-only proxy
 
 

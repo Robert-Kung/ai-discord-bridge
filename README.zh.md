@@ -17,7 +17,7 @@ A↔B 辯論編排，以及一個**受審查門控的執行迴圈**（基於 Cla
 權限模式。執行模式的任務以**背景 job 跑在 throwaway git worktree**，貼出 diff 等你核可
 才會碰到你的 checkout。價值在於當作 **dual-agent 編排 / 記憶分層 / egress 圍堵 /
 Discord control plane** 的參考實作——不是即裝即用的產品。每隻 bot 跑在專用精簡設定目錄
-（`~/.claude-bot-{a,b}`），帳號憑證檔以單檔 bind-mount 進去；認證/計費選項見下方
+（`~/.claude-bot-{a,b}`），帳號憑證以 cron 同步的唯讀 staged 副本掛進去（[SECURITY.zh.md](SECURITY.zh.md) §9）；認證/計費選項見下方
 [認證模式](#認證模式)。
 
 ## 架構亮點
@@ -44,7 +44,7 @@ Discord control plane** 的參考實作——不是即裝即用的產品。每�
 
 - 兩個 Claude Code 帳號（Pro 或 Max），在 host 登入
 - 兩個 Discord bot token（每帳號一個）
-- 專用精簡 bot 設定目錄 `~/.claude-bot-{a,b}`——一次性設定見 [SECURITY.zh.md](SECURITY.zh.md) §9
+- 專用精簡 bot 設定目錄 `~/.claude-bot-{a,b}` + 憑證 staging 目錄與同步 cron——一次性設定見 [SECURITY.zh.md](SECURITY.zh.md) §9
 
 <a id="認證模式"></a>
 ### 認證模式
@@ -54,7 +54,7 @@ Discord control plane** 的參考實作——不是即裝即用的產品。每�
   ToS 立足點。key **不進 subprocess 環境**：啟動時 materialize 成 0600 檔、由
   `apiKeyHelper` script 供給（見 [SECURITY.zh.md](SECURITY.zh.md) §6）。⚠️ 其計費*路由*
   **尚未對真 key 實證**（見 [SPEC.md](SPEC.md) §10）——依賴前請用**有額度上限**的 key 驗一次。
-- **訂閱模式**（預設，各帳號的 `.credentials.json` 以唯讀單檔掛進 bot 設定目錄）——保留給
+- **訂閱模式**（預設，各帳號的 `.credentials.json` 以 cron 同步的唯讀 staged 副本進容器——[SECURITY.zh.md](SECURITY.zh.md) §9）——保留給
   作者個人/本機環境。用訂閱憑證跑自動化 bot 是較灰色的 ToS 地帶，所以把它當*相容預設，
   而非推薦*。此模式下 `claude -p` 消耗 **Agent SDK credits**（預付池：Pro $20 / Max 5×
   $100 / Max 20× $200；用盡即硬停）。把 `MAX_BOT_TURNS` 設保守以控制花費。

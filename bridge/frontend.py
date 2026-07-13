@@ -419,7 +419,7 @@ async def _post_verify(job, channel, project: str) -> None:
         configured, passed, tail = await runner.request_verify(project, workdir)
         if not configured:
             await channel.send(
-                f"🧪 job `{job.id}`：未設定 verify（`discord-state/verify/` 無此專案）"
+                f"🧪 job `{job.id}`：未設定 verify（`discord-verify/` 無此專案的設定檔）"
                 "——無自動驗證結果，請自行判斷 diff")
             return
         head = "✅ 通過" if passed else "❌ 失敗"

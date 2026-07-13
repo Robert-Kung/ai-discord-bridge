@@ -19,7 +19,7 @@
 
 兩個帳號是 dual-account 設定的延伸——但 bot **不再直接跑在** `~/.claude{,-b}`：
 每隻 bot 有專用精簡 config dir（`~/.claude-bot-{a,b}`，無 PII、無 `@import`），
-只把各帳號的單一 `.credentials.json` bind-mount 進去（免重登、計費不變，見 SECURITY §2/§9）。
+各帳號的 `.credentials.json` 以 cron 同步的唯讀 staged 副本供給（免重登、計費不變；單檔直掛會被 refresh 的 rename 換 inode 弄到永久過期——見 SECURITY §9）。
 
 ### 設計目標
 - 在手機 / 任何 Discord client 跟兩個 AI 協作、博弈思想、輸出方案
@@ -157,8 +157,8 @@ ai-discord-bridge/
 ├── plans/                               plan 落地區
 └── memory/project_plan.md               唯一掛進容器的 memory 檔（:ro 薄索引）
 
-~/.claude-bot-a / ~/.claude-bot-b        bot 專用精簡 config dir（executor 才掛；
-                                         各帳號 .credentials.json 單檔 :ro mount 進來）
+~/.claude-bot-a / ~/.claude-bot-b        bot 專用精簡 config dir（executor 才掛；憑證為 symlink）
+~/.claude-bot-creds/{a,b}/               憑證 staging 目錄（host cron 同步、executor :ro 掛載）
 ~/.claude/projects/... ~/.claude-b/...   host 端 session jsonl（bot 容器不掛）
 ```
 
