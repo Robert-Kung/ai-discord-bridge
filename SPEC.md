@@ -155,10 +155,11 @@ ai-discord-bridge/
 ├── discord-summaries/<ch>/<cwd-slug>/   記憶中期層（latest.md + 歷史快照）
 ├── discord-project-notes/<cwd-slug>/    記憶專案層（notes.md + 快照）
 ├── plans/                               plan 落地區
-└── memory/project_plan.md               唯一掛進容器的 memory 檔（:ro 薄索引）
+└── memory/project_plan.md               薄索引；經 ~/.claude-bot-plan/ staged 副本 :ro 進容器
 
 ~/.claude-bot-a / ~/.claude-bot-b        bot 專用精簡 config dir（executor 才掛；憑證為 symlink）
 ~/.claude-bot-creds/{a,b}/               憑證 staging 目錄（host cron 同步、executor :ro 掛載）
+~/.claude-bot-plan/                      plan 索引 staging 目錄（同 cron；兩容器 :ro 掛在 memory/ 路徑）
 ~/.claude/projects/... ~/.claude-b/...   host 端 session jsonl（bot 容器不掛）
 ```
 

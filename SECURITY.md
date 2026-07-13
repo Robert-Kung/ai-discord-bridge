@@ -46,8 +46,8 @@ Everything else in `$HOME` (`.ssh`, `.gnupg`, `Documents`, unrelated repos, …)
   `@import` any shared `CLAUDE.md`.
 - **The shared dir is mounted by explicit allow-list, not wholesale.** Only the
   bot's own state (`discord-state/`, `discord-summaries/`, `discord-project-notes/`),
-  the `plans/` landing zone, and the single thin-index file
-  `memory/project_plan.md` are mounted. The `~/.claude-shared/memory/` directory
+  the `plans/` landing zone, and a read-only **staged copy** of the thin index
+  `memory/project_plan.md` (same staging rationale as the credentials, §9) are mounted. The `~/.claude-shared/memory/` directory
   (the operator PII / infra trove: `infrastructure.md`, `user_profile.md`,
   `agent_*.md`, …) and the shared `CLAUDE.md` are **not** mounted — a new file
   added to `memory/` does not silently become reachable.
@@ -370,7 +370,7 @@ single-file mount, so a container-side refresh cannot persist anyway).
       `CLAUDE.md` (no PII, no `@import` of a shared `CLAUDE.md`); never point them
       at your personal account dir.
 - [ ] Keep `memory/project_plan.md` a thin summary+links index — it is the one
-      memory file mounted into the container; put no secrets/infra in it.
+      memory file staged into the container; put no secrets/infra in it.
 - [ ] Deploy via the bundled container — do **not** bare-run `bot.py` on a host
       you don't fully control (you'd lose the mount isolation in §2).
 - [ ] Keep no unrelated secrets in the bridge's environment (a `bypass` user can
@@ -396,8 +396,8 @@ for n in a b; do
   # the bot dir's credential is a SYMLINK into the staging dir — see note
   ln -sfn /home/user/.claude-bot-creds/$n/.credentials.json ~/.claude-bot-$n/.credentials.json
 done
-scripts/sync-bot-credentials.sh          # seed the staging copies once
-crontab -l | { cat; echo '* * * * * $HOME/ai-discord-bridge/scripts/sync-bot-credentials.sh'; } | crontab -
+scripts/sync-bot-mounts.sh          # seed the staging copies once
+crontab -l | { cat; echo '* * * * * $HOME/ai-discord-bridge/scripts/sync-bot-mounts.sh'; } | crontab -
 ```
 
 **Why a staging dir instead of bind-mounting the real credential file:** the claude
@@ -406,7 +406,7 @@ single-file bind mount pins the old inode, so the container's credential goes
 **permanently stale after the first host-side refresh** and every call 401s
 (observed live 2026-07-13: the container was still serving the token from four days
 earlier). A directory mount resolves names on every open, so the cron'd
-`scripts/sync-bot-credentials.sh` (atomic copy+rename into `~/.claude-bot-creds/`)
+`scripts/sync-bot-mounts.sh` (atomic copy+rename into `~/.claude-bot-creds/`)
 keeps the container's view current within a minute of any refresh.
 
 **The symlink must point into `~/.claude-bot-creds/` — never into `~/.claude` /
