@@ -439,7 +439,7 @@ rm ~/.claude-shared/discord-state/A__*.json
 - API 計費優先序實證（spend-capped key 對帳 console）
 - restart 邊界 orphan 分支的保守 GC（上表限制 4）
 - 多頻道路由 + per-channel turn budget
-- `Call_Center ` 專案（目錄名結尾有空格）改名後再納入白名單
+- 目錄名含結尾空格的舊專案：改名去空格後再納入白名單
 
 ---
 

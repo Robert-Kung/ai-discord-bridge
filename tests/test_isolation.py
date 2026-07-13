@@ -57,10 +57,12 @@ def test_bot_claude_md_has_no_shared_import_or_pii():
     # no @import of any shared CLAUDE.md (that is how operator infra/topology leaks in)
     assert "@/home/user/.claude-shared/CLAUDE.md" not in text
     assert "@import" not in text.lower()
-    # no operator personal data
-    assert "@" not in text or "mention" in text.lower()  # only the '@'-mention rule may use '@'
-    for pii in ("bot-b@example.invalid", "bot-a@example.invalid", "cswap slot"):
-        assert pii not in text
+    # no operator personal data: no email address of ANY kind (stronger than a
+    # literal canary list — which would itself publish the operator's addresses),
+    # and no operator-tooling references
+    import re
+    assert not re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", text), "bot CLAUDE.md must contain no email address"
+    assert "cswap" not in text
 
 
 # ── 1.8 — only the thin index is reachable, not the memory/ trove ───────────
