@@ -138,9 +138,13 @@ def test_project_notes_write_rotates_prior_snapshot(tmp_path, monkeypatch):
 
 
 def test_project_plan_index_is_read_only_to_container():
+    # the plan index arrives as a staged copy: the ~/.claude-bot-plan staging dir
+    # is presented read-only AT the memory/ path (single-file mounts go inode-stale
+    # on atomic replacement — live find 2026-07-13)
     compose = (REPO / "docker-compose.example.yml").read_text()
-    m = [ln for ln in compose.splitlines() if "memory/project_plan.md" in ln]
-    assert m and all(ln.rstrip().endswith(":ro") for ln in m), "project_plan.md must be mounted :ro"
+    m = [ln for ln in compose.splitlines()
+         if ".claude-bot-plan:/home/user/.claude-shared/memory" in ln]
+    assert m and all(ln.rstrip().endswith(":ro") for ln in m), "staged plan index must be mounted :ro"
 
 
 # ── inter-agent discussion uses Discord @-mention, never `sibling` ──────────

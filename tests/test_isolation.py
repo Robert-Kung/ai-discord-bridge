@@ -5,7 +5,7 @@ in-repo minimal bot CLAUDE.md honour the isolation cuts:
   • bots run under dedicated minimal config dirs, not the operator account dirs
   • the operator's whole ~/.claude(-b) account dirs are NOT mounted (Issue 1)
   • credentials arrive via the :ro staging-dir mount (bot-dir symlink resolves in-container)
-  • only the thin project_plan.md index is mounted from memory/, never the dir
+  • only a staged copy of the thin project_plan.md index is presented at memory/, never the real dir
 We parse the example template (committed; the real docker-compose.yml is gitignored)
 with a tiny text parser so CI needs no PyYAML.
 """
@@ -64,15 +64,18 @@ def test_bot_claude_md_has_no_shared_import_or_pii():
 
 
 # ── 1.8 — only the thin index is reachable, not the memory/ trove ───────────
-def test_only_project_plan_index_mounted_from_memory():
+def test_only_staged_plan_index_presented_at_memory_path():
     vols = _volumes(COMPOSE_EXAMPLE)
-    mem_sources = [s for (s, d, m) in vols if "/.claude-shared/memory" in s]
-    # only the single project_plan.md file (once per app container in the split
-    # deploy), never the memory/ directory
-    assert mem_sources and set(mem_sources) == {
-        "/home/user/.claude-shared/memory/project_plan.md"}, mem_sources
-    # the directory itself is not mounted
-    assert not any(s.rstrip("/") == "/home/user/.claude-shared/memory" for s, _, _ in vols)
+    # nothing mounts FROM the real memory/ dir (single-file mounts go inode-stale
+    # on atomic replacement — live find 2026-07-13; and mounting the dir would
+    # expose the PII/infra trove). The thin index arrives as a staged copy:
+    # host staging dir presented AT the memory/ path, once per app container.
+    assert not any("/.claude-shared/memory" in s for (s, d, m) in vols)
+    staged = [(s, m) for (s, d, m) in vols if d == "/home/user/.claude-shared/memory"]
+    assert len(staged) == 2, staged
+    for src, mode in staged:
+        assert src == "/home/user/.claude-bot-plan"
+        assert mode == "ro"
 
 
 def test_memory_siblings_and_shared_claude_md_not_mounted():
