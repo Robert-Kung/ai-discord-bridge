@@ -18,8 +18,8 @@ before you deploy, and treat the defaults as the floor, not the ceiling.
 When the container is running, an `@`-mention in the configured channel turns
 into a `claude -p` subprocess on your host, with:
 
-- **Your Claude Code OAuth credentials**, single-file bind-mounted into a
-  dedicated minimal config dir per bot (`~/.claude-bot-{a,b}`) — see §2/§6.
+- **Your Claude Code OAuth credentials**, staged copies mounted read-only into a
+  dedicated minimal config dir per bot (`~/.claude-bot-{a,b}`) — see §2/§6/§9.
 - **The project directories you bind-mount** — read/write.
 - **A permission mode** (`plan` / `edit` / `bypass`) that decides how much that
   subprocess can do without asking. `plan` is the default; **`bypass` is an
@@ -38,10 +38,12 @@ Everything else in `$HOME` (`.ssh`, `.gnupg`, `Documents`, unrelated repos, …)
 `bypass` mode cannot reach a path that was never mounted.
 
 - **Bots run under dedicated minimal config dirs** (`~/.claude-bot-{a,b}`), NOT
-  your own `~/.claude` / `~/.claude-b`. Those account dirs are **no longer
-  mounted at all**; only each account's single `.credentials.json` is bind-mounted
-  in (no re-login, same billing). The minimal `CLAUDE.md` carries no operator PII
-  and does **not** `@import` any shared `CLAUDE.md`.
+  your own `~/.claude` / `~/.claude-b`. Those account dirs are **not mounted at
+  all**; each account's `.credentials.json` reaches the container as a
+  cron-synced staged copy in the read-only `~/.claude-bot-creds/` mount (no
+  re-login, same billing — see §9 for why a direct single-file mount cannot
+  work). The minimal `CLAUDE.md` carries no operator PII and does **not**
+  `@import` any shared `CLAUDE.md`.
 - **The shared dir is mounted by explicit allow-list, not wholesale.** Only the
   bot's own state (`discord-state/`, `discord-summaries/`, `discord-project-notes/`),
   the `plans/` landing zone, and the single thin-index file
@@ -384,25 +386,37 @@ single-file mount, so a container-side refresh cannot persist anyway).
 ## 9. Bot config dir setup
 
 Before first run, create the two dedicated minimal config dirs the bots authenticate
-under (they are bind-mounted by `docker-compose.yml`):
+under, plus the credential **staging directory** the executor mounts read-only:
 
 ```sh
 for n in a b; do
-  mkdir -p ~/.claude-bot-$n
+  mkdir -p ~/.claude-bot-$n ~/.claude-bot-creds/$n
   cp /path/to/repo/bot-config/CLAUDE.md ~/.claude-bot-$n/CLAUDE.md   # minimal, no PII, no @import
   printf '{}' > ~/.claude-bot-$n/settings.json
-  : > ~/.claude-bot-$n/.credentials.json                            # EMPTY placeholder — see note
+  # the bot dir's credential is a SYMLINK into the staging dir — see note
+  ln -sfn /home/user/.claude-bot-creds/$n/.credentials.json ~/.claude-bot-$n/.credentials.json
 done
+scripts/sync-bot-credentials.sh          # seed the staging copies once
+crontab -l | { cat; echo '* * * * * $HOME/ai-discord-bridge/scripts/sync-bot-credentials.sh'; } | crontab -
 ```
 
-**The `.credentials.json` in each bot dir MUST be an empty regular file, NOT a symlink to
-your real credential file.** The container bind-mounts your real credential file *over* this
-placeholder path. If it is a symlink (e.g. `→ ~/.claude/.credentials.json`), Docker resolves
-through it and ends up creating `/home/user/.claude/` inside the container as the mount point
-— re-exposing the operator account-dir path the isolation (§2) is meant to remove. With a
-plain placeholder, the real credential lands cleanly in the bot dir and `~/.claude` / `~/.claude-b`
-do not exist in the container at all. (Bare-running `bot.py` on the host is unsupported; the
-credential only resolves inside the container via the bind mount.)
+**Why a staging dir instead of bind-mounting the real credential file:** the claude
+CLI refreshes tokens by writing a temp file and renaming it — a **new inode**. A
+single-file bind mount pins the old inode, so the container's credential goes
+**permanently stale after the first host-side refresh** and every call 401s
+(observed live 2026-07-13: the container was still serving the token from four days
+earlier). A directory mount resolves names on every open, so the cron'd
+`scripts/sync-bot-credentials.sh` (atomic copy+rename into `~/.claude-bot-creds/`)
+keeps the container's view current within a minute of any refresh.
+
+**The symlink must point into `~/.claude-bot-creds/` — never into `~/.claude` /
+`~/.claude-b`.** The staging dir contains only the two credential copies, so the
+mount exposes nothing else; a symlink straight into your account dir would be
+dangling inside the container (those dirs are deliberately not mounted, §2) and
+invites re-exposing the operator account paths. In-container refresh attempts
+still can't persist (the staging mount is `:ro`) — the host stays the single
+writer. (Bare-running `bot.py` on the host is unsupported; the credential only
+resolves inside the container via these mounts.)
 
 ## 10. Reporting
 

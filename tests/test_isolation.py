@@ -4,7 +4,7 @@ Asserts the published deployment template (docker-compose.example.yml) and the
 in-repo minimal bot CLAUDE.md honour the isolation cuts:
   • bots run under dedicated minimal config dirs, not the operator account dirs
   • the operator's whole ~/.claude(-b) account dirs are NOT mounted (Issue 1)
-  • credentials are single-file bind-mounted into the bot dir (resolve in-container)
+  • credentials arrive via the :ro staging-dir mount (bot-dir symlink resolves in-container)
   • only the thin project_plan.md index is mounted from memory/, never the dir
 We parse the example template (committed; the real docker-compose.yml is gitignored)
 with a tiny text parser so CI needs no PyYAML.
@@ -93,18 +93,23 @@ def test_wholesale_account_dirs_not_mounted():
         assert d not in ("/home/user/.claude", "/home/user/.claude-b"), f"wholesale target: {d}"
 
 
-def test_bot_dirs_and_single_file_credentials_mounted():
+def test_bot_dirs_and_staged_credentials_mounted():
     vols = _volumes(COMPOSE_EXAMPLE)
     targets = [d for _, d, _ in vols]
     # the dedicated bot dirs are mounted
     assert "/home/user/.claude-bot-a" in targets
     assert "/home/user/.claude-bot-b" in targets
-    # each credential file is single-file bind-mounted INTO its bot dir (resolves
-    # in-container) — and the source is a single file, not the account dir
-    for bot_dir in ("a", "b"):
-        cred_target = f"/home/user/.claude-bot-{bot_dir}/.credentials.json"
-        match = [(s, d, m) for s, d, m in vols if d == cred_target]
-        assert match, f"missing single-file credential mount for bot {bot_dir}"
-        src, _, mode = match[0]
-        assert src.endswith("/.credentials.json"), f"credential source must be a single file: {src}"
-        assert mode == "ro", "credential mount should be read-only"
+    # credentials arrive via the READ-ONLY staging DIRECTORY (never a single-file
+    # mount: the CLI's write-tmp+rename refresh mints a new inode and a file mount
+    # pins the old one — the container 401s on a 4-day-stale token, live find
+    # 2026-07-13; the bot-dir .credentials.json is a host-side symlink into it)
+    match = [(s, d, m) for s, d, m in vols if d == "/home/user/.claude-bot-creds"]
+    assert match, "missing the credential staging-dir mount"
+    src, _, mode = match[0]
+    assert src == "/home/user/.claude-bot-creds"
+    assert mode == "ro", "staging dir must be read-only in-container"
+    # and no mount may source from inside the operator account dirs
+    for s, d, _ in vols:
+        for acct in ("/home/user/.claude/", "/home/user/.claude-b/"):
+            assert not s.startswith(acct), f"mount sources from the account dir: {s}"
+            assert not d.startswith(acct), f"mount targets the account dir path: {d}"
