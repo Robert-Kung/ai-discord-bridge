@@ -17,8 +17,8 @@
 容器運行時，在指定頻道的一次 `@`-mention 會在你主機上變成一個 `claude -p`
 子行程，並帶有：
 
-- **你的 Claude Code OAuth 憑證**，以單檔 bind-mount 掛進每隻 bot 的專用精簡設定目錄
-  （`~/.claude-bot-{a,b}`）——見 §2/§6。
+- **你的 Claude Code OAuth 憑證**，以唯讀的 staged 副本掛進每隻 bot 的專用精簡設定目錄
+  （`~/.claude-bot-{a,b}`）——見 §2/§6/§9。
 - **你 bind-mount 的專案目錄**——可讀可寫。
 - **一個權限模式**（`plan` / `edit` / `bypass`），決定該子行程能不經詢問做多少事。
   `plan` 是預設；**`bypass` 是 opt-in tier，未設 `ENABLE_BYPASS_TIER` 時關閉**（見 §3/§4）。
@@ -35,8 +35,9 @@
 路徑。
 
 - **bot 跑在專用精簡設定目錄**（`~/.claude-bot-{a,b}`），**不是**你自己的 `~/.claude`
-  / `~/.claude-b`。那些帳號目錄**已完全不再掛載**；只有每個帳號的單一 `.credentials.json`
-  被 bind-mount 進去（不用重登、計費不變）。精簡 `CLAUDE.md` 不含操作者個資，也**不**
+  / `~/.claude-b`。那些帳號目錄**完全不掛載**；每個帳號的 `.credentials.json` 是以
+  cron 同步的 staged 副本、經唯讀的 `~/.claude-bot-creds/` 掛載進容器（不用重登、
+  計費不變——單檔直掛為何行不通見 §9）。精簡 `CLAUDE.md` 不含操作者個資，也**不**
   `@import` 任何 shared `CLAUDE.md`。
 - **shared 目錄改用明確白名單掛載，不再整包掛。** 只掛 bot 自己的狀態
   （`discord-state/`、`discord-summaries/`、`discord-project-notes/`）、`plans/` 落地區、
@@ -319,23 +320,33 @@ allow-list 猜錯會通過啟動 canary，卻在幾小時後 token 過期時無�
 
 ## 9. Bot config dir 設定
 
-首次執行前，先建好兩個 bot 認證用的專用精簡 config dir（由 `docker-compose.yml` 掛載）：
+首次執行前，先建好兩個 bot 認證用的專用精簡 config dir，以及 executor 唯讀掛載的
+憑證 **staging 目錄**：
 
 ```sh
 for n in a b; do
-  mkdir -p ~/.claude-bot-$n
+  mkdir -p ~/.claude-bot-$n ~/.claude-bot-creds/$n
   cp /path/to/repo/bot-config/CLAUDE.md ~/.claude-bot-$n/CLAUDE.md   # 精簡、無 PII、不 @import
   printf '{}' > ~/.claude-bot-$n/settings.json
-  : > ~/.claude-bot-$n/.credentials.json                            # 空的 placeholder——見下方
+  # bot dir 的憑證是指向 staging 目錄的 SYMLINK——見下方說明
+  ln -sfn /home/user/.claude-bot-creds/$n/.credentials.json ~/.claude-bot-$n/.credentials.json
 done
+scripts/sync-bot-credentials.sh          # 先手動 seed 一次 staged 副本
+crontab -l | { cat; echo '* * * * * $HOME/ai-discord-bridge/scripts/sync-bot-credentials.sh'; } | crontab -
 ```
 
-**每個 bot dir 裡的 `.credentials.json` 必須是空的「一般檔案」，不可以是指向你真實憑證的
-symlink。** 容器會把你的真實憑證檔 bind-mount 蓋在這個 placeholder 路徑上。若它是 symlink
-（例如 `→ ~/.claude/.credentials.json`），Docker 會順著 symlink 解析，最後在容器內把
-`/home/user/.claude/` 建出來當 mount point——等於把 §2 想移除的操作者帳號目錄路徑又露出來。
-用一般 placeholder 檔，真實憑證就乾淨地落在 bot dir，且 `~/.claude` / `~/.claude-b` 在容器內
-根本不存在。（在 host 上裸跑 `bot.py` 不在支援範圍；憑證只在容器內透過 bind mount 解析。）
+**為什麼用 staging 目錄、而不是把真實憑證檔單檔 bind-mount 進去：** claude CLI 的
+token refresh 是「寫 tmp 檔再 rename」——會產生**新 inode**。單檔 bind mount 綁死舊
+inode，所以 host 端第一次 refresh 之後，容器裡的憑證就**永久停留在舊版**、每次呼叫
+401（2026-07-13 實測發現：容器還在用四天前的 token）。目錄掛載是每次 open 時按名字
+解析，配合 cron 的 `scripts/sync-bot-credentials.sh`（原子 copy+rename 進
+`~/.claude-bot-creds/`），任何 refresh 後一分鐘內容器就看得到新憑證。
+
+**symlink 必須指向 `~/.claude-bot-creds/`——絕不可指向 `~/.claude` / `~/.claude-b`。**
+staging 目錄只含兩份憑證副本，掛載不會多暴露任何東西；直接指向帳號目錄的 symlink
+在容器內會是懸空的（那些目錄刻意不掛載，§2），而且會誘發把操作者帳號路徑重新暴露
+的錯誤設定。容器內的 refresh 嘗試依然無法持久（staging 掛載是 `:ro`）——host 是唯一
+寫入者。（在 host 上裸跑 `bot.py` 不在支援範圍；憑證只在容器內透過這些掛載解析。）
 
 ## 10. 回報
 

@@ -97,10 +97,18 @@ services:
     volumes:
       # Bot identity + LIVE OAUTH CREDENTIALS — the executor is the only app
       # container that mounts these (see SECURITY.md §1/§6 for the trade-offs).
+      #
+      # Credentials come via a STAGING DIRECTORY, not a single-file mount: the
+      # claude CLI refreshes tokens by write-tmp+rename (new inode), and a
+      # single-file bind mount pins the old inode — the container goes
+      # permanently stale after the first host-side refresh (observed live:
+      # 401s four days in). A directory mount resolves by name, so the host
+      # cron running scripts/sync-bot-credentials.sh keeps it always current.
+      # Each bot dir's .credentials.json is a host-side SYMLINK into this dir
+      # (setup in SECURITY.md §9).
       - /home/user/.claude-bot-a:/home/user/.claude-bot-a
       - /home/user/.claude-bot-b:/home/user/.claude-bot-b
-      - /home/user/.claude/.credentials.json:/home/user/.claude-bot-a/.credentials.json:ro
-      - /home/user/.claude-b/.credentials.json:/home/user/.claude-bot-b/.credentials.json:ro
+      - /home/user/.claude-bot-creds:/home/user/.claude-bot-creds:ro
       # Server-side security settings (deny family), passed via --settings.
       - ./settings.json:/home/user/.claude-bridge-settings.json:ro
       # M4 verify config — one file per project (name = the project's cwd-slug), each
