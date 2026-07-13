@@ -8,7 +8,7 @@ Self-hosted dual-AI Discord companion — a working personal-scale reference imp
 
 > ⚠️ **Security**: this tool lets whitelisted Discord users run code as your host user inside the directories you mount. **Read [SECURITY.md](SECURITY.md) ([中文](SECURITY.zh.md)) before deploying** — the threat model and hardening checklist are not optional reading for this kind of project.
 
-It's a **control plane over Claude Code**: two Discord bots (Bot-A, Bot-B); an `@`-mention becomes a `claude -p --resume <sid>` call with channel context, four-layer memory, and per-channel permission modes layered on top. Execution-mode tasks run as **background jobs in throwaway git worktrees** and post a diff you approve before anything touches your checkout. Useful as a reference for **dual-agent orchestration, memory layering, egress containment, and a Discord control plane** — not as a turnkey product. Each bot runs under a dedicated minimal config dir (`~/.claude-bot-{a,b}`) with your account's credential file bind-mounted in; auth/billing options are covered under [Auth modes](#auth-modes) below.
+It's a **control plane over Claude Code**: two Discord bots (Bot-A, Bot-B); an `@`-mention becomes a `claude -p --resume <sid>` call with channel context, four-layer memory, and per-channel permission modes layered on top. Execution-mode tasks run as **background jobs in throwaway git worktrees** and post a diff you approve before anything touches your checkout. Useful as a reference for **dual-agent orchestration, memory layering, egress containment, and a Discord control plane** — not as a turnkey product. Each bot runs under a dedicated minimal config dir (`~/.claude-bot-{a,b}`) with a cron-synced read-only staged copy of your account's credential ([SECURITY.md](SECURITY.md) §9); auth/billing options are covered under [Auth modes](#auth-modes) below.
 
 ## Architecture Highlights
 
@@ -23,13 +23,13 @@ It's a **control plane over Claude Code**: two Discord bots (Bot-A, Bot-B); an `
 
 - Two Claude Code accounts (Pro or Max), logged in on the host
 - Two Discord bot tokens (one per account)
-- Dedicated minimal bot config dirs `~/.claude-bot-{a,b}` — see [SECURITY.md](SECURITY.md) §9 for the one-time setup
+- Dedicated minimal bot config dirs `~/.claude-bot-{a,b}` + the credential staging dir & sync cron — see [SECURITY.md](SECURITY.md) §9 for the one-time setup
 
 <a id="auth-modes"></a>
 ### Auth modes
 
 - **API-key mode** (`USE_API_KEY=true` + per-bot `ANTHROPIC_API_KEY_A`/`_B`) — **the intended path for public/forker use.** It bills the Developer Platform, which is the cleaner ToS footing for an automated bot. The key does **not** enter the subprocess env: it is materialized as a `0600` file behind an `apiKeyHelper` script (see [SECURITY.md](SECURITY.md) §6). ⚠️ The billing *routing* is **not yet verified against a live key** (see [SPEC.md](SPEC.md) §10) — verify with a **spend-capped** key before relying on it.
-- **Subscription mode** (default, each account's `.credentials.json` bind-mounted read-only into its bot config dir) — kept for the author's personal/local setup. Running an automated bot on subscription credentials is a grayer ToS area, so treat this as a *compatibility default, not a recommendation*. In this mode `claude -p` consumes **Agent SDK credits** (a pre-paid pool: Pro $20 / Max 5× $100 / Max 20× $200; hard-stops when exhausted). Set `MAX_BOT_TURNS` conservatively to control spend.
+- **Subscription mode** (default, each account's `.credentials.json` reaching the container as a cron-synced read-only staged copy — [SECURITY.md](SECURITY.md) §9) — kept for the author's personal/local setup. Running an automated bot on subscription credentials is a grayer ToS area, so treat this as a *compatibility default, not a recommendation*. In this mode `claude -p` consumes **Agent SDK credits** (a pre-paid pool: Pro $20 / Max 5× $100 / Max 20× $200; hard-stops when exhausted). Set `MAX_BOT_TURNS` conservatively to control spend.
 
 ## Discord Setup
 
