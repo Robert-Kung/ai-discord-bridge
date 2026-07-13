@@ -41,7 +41,7 @@
   `@import` 任何 shared `CLAUDE.md`。
 - **shared 目錄改用明確白名單掛載，不再整包掛。** 只掛 bot 自己的狀態
   （`discord-state/`、`discord-summaries/`、`discord-project-notes/`）、`plans/` 落地區、
-  以及單一精簡索引檔 `memory/project_plan.md`。`~/.claude-shared/memory/` 目錄
+  以及精簡索引 `memory/project_plan.md` 的**唯讀 staged 副本**（staging 理由同憑證，§9）。`~/.claude-shared/memory/` 目錄
   （操作者 PII / infra trove：`infrastructure.md`、`user_profile.md`、`agent_*.md`…）
   與 shared `CLAUDE.md` **都不掛**——新加進 `memory/` 的檔不會無聲變成可達。
 - `.env`（token）有 git-ignore。兩個 Discord bot token 另外也**從 `claude` 子行程
@@ -331,15 +331,15 @@ for n in a b; do
   # bot dir 的憑證是指向 staging 目錄的 SYMLINK——見下方說明
   ln -sfn /home/user/.claude-bot-creds/$n/.credentials.json ~/.claude-bot-$n/.credentials.json
 done
-scripts/sync-bot-credentials.sh          # 先手動 seed 一次 staged 副本
-crontab -l | { cat; echo '* * * * * $HOME/ai-discord-bridge/scripts/sync-bot-credentials.sh'; } | crontab -
+scripts/sync-bot-mounts.sh          # 先手動 seed 一次 staged 副本
+crontab -l | { cat; echo '* * * * * $HOME/ai-discord-bridge/scripts/sync-bot-mounts.sh'; } | crontab -
 ```
 
 **為什麼用 staging 目錄、而不是把真實憑證檔單檔 bind-mount 進去：** claude CLI 的
 token refresh 是「寫 tmp 檔再 rename」——會產生**新 inode**。單檔 bind mount 綁死舊
 inode，所以 host 端第一次 refresh 之後，容器裡的憑證就**永久停留在舊版**、每次呼叫
 401（2026-07-13 實測發現：容器還在用四天前的 token）。目錄掛載是每次 open 時按名字
-解析，配合 cron 的 `scripts/sync-bot-credentials.sh`（原子 copy+rename 進
+解析，配合 cron 的 `scripts/sync-bot-mounts.sh`（原子 copy+rename 進
 `~/.claude-bot-creds/`），任何 refresh 後一分鐘內容器就看得到新憑證。
 
 **symlink 必須指向 `~/.claude-bot-creds/`——絕不可指向 `~/.claude` / `~/.claude-b`。**

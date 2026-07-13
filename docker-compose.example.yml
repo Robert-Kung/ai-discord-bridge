@@ -103,7 +103,7 @@ services:
       # single-file bind mount pins the old inode — the container goes
       # permanently stale after the first host-side refresh (observed live:
       # 401s four days in). A directory mount resolves by name, so the host
-      # cron running scripts/sync-bot-credentials.sh keeps it always current.
+      # cron running scripts/sync-bot-mounts.sh keeps it always current.
       # Each bot dir's .credentials.json is a host-side SYMLINK into this dir
       # (setup in SECURITY.md §9).
       - /home/user/.claude-bot-a:/home/user/.claude-bot-a
@@ -125,7 +125,9 @@ services:
       - /home/user/.claude-shared/discord-summaries:/home/user/.claude-shared/discord-summaries
       - /home/user/.claude-shared/discord-project-notes:/home/user/.claude-shared/discord-project-notes
       - /home/user/.claude-shared/plans:/home/user/.claude-shared/plans
-      - /home/user/.claude-shared/memory/project_plan.md:/home/user/.claude-shared/memory/project_plan.md:ro
+      # Thin plan index as a STAGED COPY presented at the memory/ path — same
+      # inode rationale as the credentials; the real memory/ dir stays unmounted.
+      - /home/user/.claude-bot-plan:/home/user/.claude-shared/memory:ro
       # Project dirs: claude runs here (worktrees link back to these .git dirs).
       - /home/user/your-project-a:/home/user/your-project-a
       - /home/user/your-project-b:/home/user/your-project-b
@@ -177,7 +179,9 @@ services:
       - /home/user/.claude-shared/discord-summaries:/home/user/.claude-shared/discord-summaries
       - /home/user/.claude-shared/discord-project-notes:/home/user/.claude-shared/discord-project-notes
       - /home/user/.claude-shared/plans:/home/user/.claude-shared/plans
-      - /home/user/.claude-shared/memory/project_plan.md:/home/user/.claude-shared/memory/project_plan.md:ro
+      # Thin plan index as a STAGED COPY presented at the memory/ path — same
+      # inode rationale as the credentials; the real memory/ dir stays unmounted.
+      - /home/user/.claude-bot-plan:/home/user/.claude-shared/memory:ro
       # Project dirs: the frontend runs the git side (worktree add/commit/diff/merge).
       - /home/user/your-project-a:/home/user/your-project-a
       - /home/user/your-project-b:/home/user/your-project-b

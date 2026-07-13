@@ -17,7 +17,7 @@ Each bot SHALL authenticate using a dedicated `CLAUDE_CONFIG_DIR` that does not 
 - **THEN** it is not the operator's primary interactive `~/.claude` dir
 
 ### Requirement: Execution container exposes only an explicit allow-list of shared paths
-The execution container SHALL mount only: (a) the bot's operational state from `.claude-shared` — `discord-state/`, `discord-summaries/`, `discord-project-notes/`; (b) the plan landing zone `.claude-shared/plans/`; and (c) the single file `.claude-shared/memory/project_plan.md` (the thin summary index). It SHALL NOT mount the `.claude-shared/memory/` directory as a whole — which holds the operator PII / infra topology trove (`infrastructure.md`, `user_profile.md`, `agent_*.md`, per-project detail files) — nor the shared `CLAUDE.md`. Any memory file the bot needs SHALL be exposed by explicit single-file mount, never by mounting the directory, so a newly added memory file does not become reachable by default. Where the OS sandbox is active, the credential files and the unmounted memory paths SHALL additionally be in `filesystem.denyRead`.
+The execution container SHALL mount only: (a) the bot's operational state from `.claude-shared` — `discord-state/`, `discord-summaries/`, `discord-project-notes/`; (b) the plan landing zone `.claude-shared/plans/`; and (c) the thin summary index `project_plan.md`, exposed as a read-only staged copy presented at `.claude-shared/memory/project_plan.md` (the staging dir holds only that copy). It SHALL NOT mount the `.claude-shared/memory/` directory as a whole — which holds the operator PII / infra topology trove (`infrastructure.md`, `user_profile.md`, `agent_*.md`, per-project detail files) — nor the shared `CLAUDE.md`. Any memory file the bot needs SHALL be exposed by an explicit staged copy, never by mounting the real directory, so a newly added memory file does not become reachable by default (staged-copy dirs also avoid the single-file bind-mount inode staleness on atomic replacement). Where the OS sandbox is active, the credential files and the unmounted memory paths SHALL additionally be in `filesystem.denyRead`.
 
 #### Scenario: PII/infra trove is not reachable from the execution path
 - **WHEN** the execution path attempts to read `.claude-shared/memory/infrastructure.md` (or `user_profile.md`, `agent_*.md`)
@@ -29,7 +29,7 @@ The execution container SHALL mount only: (a) the bot's operational state from `
 
 #### Scenario: A newly added memory file does not leak
 - **WHEN** a new file is added to `.claude-shared/memory/` on the host
-- **THEN** it is not reachable from the execution container unless explicitly single-file mounted
+- **THEN** it is not reachable from the execution container unless explicitly staged into a mounted copy
 
 #### Scenario: Cross-surface plan continuity is preserved
 - **WHEN** the bot persists a full plan from Discord
@@ -46,3 +46,18 @@ The execution container SHALL mount only: (a) the bot's operational state from `
 - **WHEN** a forker reads the credential mount lines in the example template
 - **THEN** an accompanying note identifies these as live credentials reachable by the execution path
 </content>
+
+### Requirement: API-key mode supplies keys via apiKeyHelper, never the subprocess env
+In API-key mode the per-bot key SHALL be provided to `claude` via an `apiKeyHelper` script in the bot's config dir, and SHALL NOT be injected into the subprocess environment. The key file backing the helper SHALL live outside every mounted project directory and SHALL be covered by the credential-read deny family.
+
+#### Scenario: Subprocess env carries no API key
+- **WHEN** a `claude -p` subprocess env is built in API-key mode
+- **THEN** it contains no `ANTHROPIC_API_KEY*` variable
+
+#### Scenario: Key file is not readable by the agent
+- **WHEN** the agent attempts to read the apiKeyHelper key file
+- **THEN** the attempt is denied by the deny family, and the file is outside the mounted project tree
+
+#### Scenario: Subscription mode is unchanged
+- **WHEN** the bridge runs in subscription mode
+- **THEN** authentication continues via the read-only staged OAuth credential copy (name-resolved staging-dir mount; a single-file bind mount goes inode-stale when the CLI's write-tmp+rename refresh replaces the file), with egress containment as its stated mitigation

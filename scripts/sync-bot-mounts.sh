@@ -1,6 +1,8 @@
 #!/bin/sh
-# Sync each account's live OAuth credential into the staging dir the executor
-# bind-mounts (host cron, every minute — see SECURITY.md §9).
+# Sync the bots' read-only staged mounts (host cron, every minute — SECURITY.md §9):
+#   • each account's live OAuth credential  → ~/.claude-bot-creds/{a,b}/
+#   • the thin project-plan index           → ~/.claude-bot-plan/ (presented in-container
+#     at ~/.claude-shared/memory/project_plan.md via the staging-dir mount)
 #
 # WHY A STAGING DIR: the claude CLI refreshes credentials by write-tmp+rename,
 # which mints a NEW inode. A single-file bind mount pins the OLD inode, so the
@@ -12,13 +14,15 @@ set -eu
 sync_one() {
     src="$1"; dst_dir="$2"
     [ -f "$src" ] || return 0
-    dst="$dst_dir/.credentials.json"
+    dst="$dst_dir/$(basename "$src")"
     if [ ! -f "$dst" ] || [ "$src" -nt "$dst" ]; then
         mkdir -p "$dst_dir"
-        tmp="$dst_dir/.credentials.json.tmp.$$"
+        tmp="$dst.tmp.$$"
         cp "$src" "$tmp" && chmod 600 "$tmp" && mv "$tmp" "$dst"
     fi
 }
 
 sync_one "$HOME/.claude/.credentials.json"   "$HOME/.claude-bot-creds/a"
 sync_one "$HOME/.claude-b/.credentials.json" "$HOME/.claude-bot-creds/b"
+
+sync_one "$HOME/.claude-shared/memory/project_plan.md" "$HOME/.claude-bot-plan"
