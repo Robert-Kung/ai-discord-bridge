@@ -99,7 +99,10 @@ def _service_block(name: str) -> str:
 
 def test_frontend_container_has_no_claude_credentials():
     fe = _service_block("discord-frontend")
-    for needle in (".credentials.json", ".claude-bot-", "settings.json",
+    # (.claude-bot-plan is fine — the staged plan index carries no secrets;
+    # the forbidden set is the config dirs + the credential staging dir)
+    for needle in (".credentials.json", ".claude-bot-a", ".claude-bot-b",
+                   ".claude-bot-creds", "settings.json",
                    "ANTHROPIC_API_KEY", "env_file"):
         assert needle not in fe, f"frontend must not carry {needle}"
     assert "EXECUTOR_SOCKET" in fe and "DISCORD_BOT_A_TOKEN" in fe
