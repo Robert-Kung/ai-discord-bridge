@@ -168,9 +168,14 @@ rw 的 `discord-state` volume：開了 Bash 的 exec agent 寫得到那裡，否
 `WebFetch` 不再整個 deny：allow 清單放行少數釘死的**唯讀文件**網域（docs.anthropic.com、
 Apple／Google 開發者文件），GET-only，與 egress proxy 的 allow-list 互為鏡像——proxy
 才是真正的執法點（settings 被改掉也會在 proxy 403）。這些是 exec tier 查上架／API 文件
-需要的；**可 publish 的 host（如 package registry）刻意不放**——proxy 是 CONNECT-only
-不拆 TLS，「可達」＝「任意 method＋body」，放行 registry 等於給 executor 手上的 OAuth
-憑證開一個全世界可讀的外洩出口。`WebSearch` 直接 allow：它在 server 端經
+需要的；**可 publish 的 host 刻意不放**——proxy 是 CONNECT-only 不拆 TLS，「可達」＝
+「任意 method＋body」，放行 publish 端點等於給 executor 手上的 OAuth 憑證開一個全世界
+可讀的外洩出口。真正的判準是**逐 host 而非逐服務**：只要該 host **同時收寫入**就不合格。
+`registry.npmjs.org` 不合格——npm 的 publish 端點就是同一個 host，可達即可寫，故維持
+封鎖。PyPI 則讀寫分離：讀在 `pypi.org` 與 `files.pythonhosted.org`，上傳在
+`upload.pypi.org`。因此那兩個唯讀 host 是合格的，operator 可透過下述 opt-in 加進
+**executor** 側 proxy；上傳 host 不合格，任何情況下都不會變成可達。原則沒有改變——不放
+任何能接收 publish 的 host——這裡只是把它講精確，而非用「長得像 registry 就擋」代打。`WebSearch` 直接 allow：它在 server 端經
 `api.anthropic.com` 執行，不新增 *client* 端 egress——但它是 **egress proxy 看不到的
 通道**：被注入的 agent 可以把夾帶祕密的 query 從 Anthropic 的搜尋後端送出去，也能把
 攻擊者控制的結果頁拉回 context。請當作「低頻寬、在 proxy 邊界之外」的 egress，而非
@@ -271,6 +276,71 @@ allow-list 猜錯會通過啟動 canary，卻在幾小時後 token 過期時無�
   `**/anthropic-api-key` 的 `Read` deny）——跟 §6 其他部分一樣是名稱式、可繞過的，
   所以仍請用**有花費上限 / workspace 隔離**的 key。訂閱模式完全不受影響：不佈署
   helper，OAuth 解析不變。
+
+### Package index egress——opt-in，預設關閉
+
+不開這個，exec tier 的 agent 就裝不了依賴：既有專案靠 host 預裝的環境離線跑，greenfield
+專案則卡在第一個 `pip install`。這個 opt-in 讓 executor 可達 **唯讀** 的 PyPI host，
+其餘一律不變。
+
+**姿勢。** 預設關。它是 **proxy image 的 build arg，不是 runtime 開關**——filter 烤進
+image，被攻陷的 runtime 改不動它（M4 的教訓：agent 摸得到的 config 不算 config）。啟用方式
+是把 compose 裡 `proxy-anthropic` 底下的 `EXTRA_FILTER` 取消註解後重 build：
+
+```bash
+docker compose build proxy-anthropic && docker compose up -d
+```
+
+回滾就是把該行改回註解再重 build。
+
+**範圍，以及為何有界。**
+
+- 只有 `pypi.org` 與 `files.pythonhosted.org`——讀取端點。`upload.pypi.org` 不在其中，
+  所以這個 opt-in **不授予任何寫入路徑**。
+- `registry.npmjs.org` **排除且維持排除**：npm 的 metadata、tarball **與 publish** 都在
+  同一個 host，放行等於給被注入的 agent 一條可驗證身分的寫入通道（它可以**自帶** token
+  ——「容器內沒有 npm 憑證」不是一個安全前提）。Node 專案維持 vendored 路徑：operator 在
+  host 跑 `npm ci`，`node_modules` 掛進容器，agent 離線跑 `npm test`。
+- **僅適用 split 部署的 executor 側。** 套到 frontend proxy 或單容器的 `filter` 會讓
+  image build 直接失敗；此外 frontend 的啟動 canary 已把 index host 列為 forbidden
+  探針——誤套 filter 會讓 frontend **拒絕服務**，而不是安靜地讓握有 Discord token 的
+  容器取得 index egress。
+- index 是否可達**刻意不列為** executor 的啟動門檻：PyPI 故障應該讓安裝失敗，而不是把
+  executor 拉下線。
+
+**Install-time 執行護欄。** 所有可能跑安裝的子行程——`claude -p` 路徑與 verify 路徑兩條
+——都被注入 `npm_config_ignore_scripts=true` 與 `PIP_PREFER_BINARY=1`，且**無條件注入**，
+與 opt-in 是否開啟無關。executor image 另外烤入全域 npmrc 與 `/etc/pip.conf`（同樣設定），
+以 root 所有權寫入而 app 以 uid 1000 跑，因此 agent 在專案內寫 `.npmrc` 或 `pip.conf`
+無法重新打開 lifecycle script。
+
+**啟用後的殘留風險**——以下是**開著的**，不是關掉的：
+
+- **sdist 仍會執行。** `prefer-binary` 是偏好而非 `only-binary`（後者會讓沒出 wheel 的
+  套件直接裝不起來）。沒有 wheel 時 source distribution 照樣 build，而
+  `setup.py egg_info` 在依賴解析期就可能執行。
+- **wheel 也不安全。** wheel 內的 `.pth` 檔，其 `import` 前綴行會在**每次 Python 啟動**
+  時執行，與 build 步驟完全無關，`prefer-binary` 對它零作用。「只裝 wheel ＝ 不會執行
+  程式碼」是錯的，請勿據此推論。
+- **護欄不用來約束有敵意的 agent。** 拿到 shell 的 agent 可以把變數從自己的子行程移除
+  （`env -u`）、下覆寫用的 CLI flag、把 `PIP_CONFIG_FILE` 指向 `/dev/null`，或改用不讀
+  這兩個變數家族的套件管理器（uv、pnpm、yarn Berry）。護欄的目標對象是 honest mistake
+  與正常安裝流程，真正的執法邊界仍是 executor 的 **routeless egress**。
+- **同 CDN 租戶可經 SNI 觸及。** proxy 在 CONNECT 階段比對 hostname，tunnel 內的 SNI 由
+  client 決定。`pypi.org` 與 `files.pythonhosted.org` 在 Fastly，開啟後該租戶池變成可達。
+  這不是新的風險**類別**（`api.anthropic.com` 已經讓 Cloudflare 池可達），但**是新增的
+  一個池**。只有 TLS-terminating／SNI-pinning proxy 或無憑證 build 容器才真的關得掉。
+- **下載統計側信道。** 攻擊者可預先發佈套件，靠選擇性下載每天外洩數十 bit 等級的資訊。
+  無實務緩解手段，列出僅為清單完整。
+- **合併之後完全不在護欄範圍內。** 護欄止於容器邊界。operator 一旦合併該 job 的 commit，
+  在 host 或 CI 上跑 `pip install` 就會在毫無護欄的情況下執行 install-time 程式碼。diff
+  gate 之所以把 manifest／lockfile 變更獨立標示，正是為了這件事；新增依賴的 job 必須一併
+  產生並提交對應的 lockfile。
+
+**最終形。** **無憑證 build 容器**——安裝在一個不持有 OAuth 憑證、也沒有 API key 的容器
+內進行，因此那裡的 index 可達性對攻擊者毫無可偷之物——能消除上述除「合併後執行」以外的
+每一項殘留。它同時是**啟用 npm 的前置條件**：`registry.npmjs.org` 的寫入能力，只有在沒有
+憑證與它共存時才不再構成問題。
 
 ---
 

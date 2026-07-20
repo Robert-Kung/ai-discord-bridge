@@ -4,7 +4,7 @@
 
 Self-hosted dual-AI Discord companion — a working personal-scale reference implementation of a four-layer memory model, debate orchestration, and a **review-gated execution loop** for Claude Code.
 
-> **Status**: Personal experiment. Single-channel, no support SLA. Fork it, adapt it — don't file issues expecting maintenance. The security-critical logic is covered by a 230-test pytest suite running in CI.
+> **Status**: Personal experiment. Single-channel, no support SLA. Fork it, adapt it — don't file issues expecting maintenance. The security-critical logic is covered by a 275-test pytest suite running in CI.
 
 > ⚠️ **Security**: this tool lets whitelisted Discord users run code as your host user inside the directories you mount. **Read [SECURITY.md](SECURITY.md) ([中文](SECURITY.zh.md)) before deploying** — the threat model and hardening checklist are not optional reading for this kind of project.
 
@@ -17,7 +17,7 @@ It's a **control plane over Claude Code**: two Discord bots (Bot-A, Bot-B); an `
 - **Dual-agent debate**: `!discuss <topic>` — A and B take turns on a shared rolling transcript with an independent turn budget that doesn't starve normal @-mentions
 - **Review-gated exec loop**: execution-mode tasks become background jobs (`!jobs` / `!cancel`) streaming live progress; changes land in a throwaway git worktree, and the resulting diff waits for your ✅ to merge / ❌ to discard (`!merge` / `!discard` after a timeout). Optional per-project **post-task verification** and an optional **second-account advisory review** post above the gate.
 - **Permission tiers**: `plan` / `edit` / `approve` / `bypass` per channel; `approve` is a per-command human-approval tier (MCP approver), `bypass` is structurally unreachable unless opted in; fail-closed auth + prompt-injection isolation + a canary-proven credential-read deny family (see [SECURITY.md](SECURITY.md))
-- **Egress containment (two-container split)**: a `discord-frontend` (Discord egress only, holds bot tokens) and an `executor` (holds Claude credentials; egress limited to `api.anthropic.com` plus a GET-only read-only doc allow-list — no publish-capable host, see [SECURITY.md](SECURITY.md) §6) on routeless internal networks behind default-deny proxies — each secret lives where the other secret's egress can't reach a write-capable host. Fail-closed startup canaries prove each deny direction.
+- **Egress containment (two-container split)**: a `discord-frontend` (Discord egress only, holds bot tokens) and an `executor` (holds Claude credentials; egress limited to `api.anthropic.com` plus a GET-only read-only doc allow-list, and optionally the read-only PyPI hosts so agents can install Python dependencies — still no publish-capable host, opt-in and off by default, see [SECURITY.md](SECURITY.md) §6) on routeless internal networks behind default-deny proxies — each secret lives where the other secret's egress can't reach a write-capable host. Fail-closed startup canaries prove each deny direction.
 
 ## Prerequisites
 
@@ -64,9 +64,30 @@ docker compose up -d --build
 docker compose logs -f
 ```
 
+## Dependencies inside exec jobs
+
+The executor has no general route out, so an agent can only install what the proxy
+allow-list admits.
+
+- **Python**: off by default. Uncomment `EXTRA_FILTER: filter.pypi` under
+  `proxy-anthropic` in your compose file and `docker compose build proxy-anthropic &&
+  docker compose up -d` to let agents install from PyPI. Only the read-only hosts open;
+  `upload.pypi.org` stays denied. Read [SECURITY.md](SECURITY.md) §6 before enabling —
+  the residual risks are listed there, not hand-waved.
+- **Node**: **vendored, no opt-in available.** `registry.npmjs.org` serves publishes from
+  the same host, so allow-listing it would give an injected agent a write path out with
+  its own token. Run `npm ci` on the host, mount `node_modules` in with the project, and
+  the agent runs `npm test` offline. Lifecycle scripts are disabled in every spawned
+  subprocess regardless. Automatic npm installs unlock only once installs move to a
+  credential-free build container, where index reachability grants an attacker nothing.
+
+Both spawn paths (the agent and the verify command) always carry
+`npm_config_ignore_scripts=true` and `PIP_PREFER_BINARY=1`, opt-in or not. These bound
+mistakes, not a hostile agent — the real boundary is the routeless egress.
+
 ## Verify your deployment (smoke test)
 
-Unit tests (`pip install -r requirements-dev.txt && pytest`, 230 tests) cover the security-critical logic — fail-closed auth, `!cd` path/escape guard, trust filtering, env scrubbing, the exec-loop job/worktree/verify machinery, egress canary logic — and run in CI. They don't touch live Discord/Claude, so confirm end-to-end wiring by hand:
+Unit tests (`pip install -r requirements-dev.txt && pytest`, 275 tests) cover the security-critical logic — fail-closed auth, `!cd` path/escape guard, trust filtering, env scrubbing, the exec-loop job/worktree/verify machinery, egress canary logic — and run in CI. They don't touch live Discord/Claude, so confirm end-to-end wiring by hand:
 
 1. `docker compose config` — the compose file parses and mount paths resolve.
 2. **Fail-closed auth**: start with `ALLOWED_USER_IDS` empty → the container must exit immediately (`refusing to start`). Set it back to your id.

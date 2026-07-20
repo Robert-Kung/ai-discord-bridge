@@ -31,6 +31,7 @@ def build_subprocess_env(cfg: dict, base_env: "dict | None" = None) -> dict:
     Pure: pass base_env in tests instead of monkeypatching os.environ."""
     src = os.environ if base_env is None else base_env
     env = {k: v for k, v in src.items() if k not in config._SUBPROCESS_ENV_DENY}
+    env.update(config.INSTALL_GUARDRAIL_ENV)  # see config: install-time exec guardrails
     env["CLAUDE_CONFIG_DIR"] = cfg["config_dir"]
     # Egress containment (phase 1): route `claude`'s HTTPS through the allow-list proxy
     # and drop non-essential telemetry so those endpoints need not be opened. The proxy
@@ -346,7 +347,11 @@ def build_verify_env(base_env: "dict | None" = None) -> dict:
     sits in a 0600 file the same uid can `open()`, so — like the Bash tier — the real
     exfil barrier is the executor's routeless egress, not this env strip."""
     src = os.environ if base_env is None else base_env
-    return {k: v for k, v in src.items() if k not in config._SUBPROCESS_ENV_DENY}
+    env = {k: v for k, v in src.items() if k not in config._SUBPROCESS_ENV_DENY}
+    # Not a hole-plug but the main path: verify commands are routinely
+    # `pip install -e . && pytest` / `npm ci && npm test`.
+    env.update(config.INSTALL_GUARDRAIL_ENV)
+    return env
 
 
 async def run_verify(project: str, workdir: str,

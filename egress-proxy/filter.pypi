@@ -1,0 +1,13 @@
+# Opt-in, read-only Python package index hosts. Appended to filter.anthropic via
+# the proxy image's EXTRA_FILTER build arg; never merged into a base filter and
+# off by default. Executor-side split deployments only — the single-container
+# posture holds Discord tokens and Claude credentials together, which is exactly
+# the pairing that bounds the residual risk here.
+#
+# Deliberately excluded, do not add:
+#   registry.npmjs.org      publish endpoint is the same host — reachable means writable
+#   upload.pypi.org         PyPI's upload endpoint; the split from pypi.org is why
+#                           the two hosts below are eligible at all
+#   github.com / codeload   source dependencies are out of scope
+^pypi\.org$
+^files\.pythonhosted\.org$

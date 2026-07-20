@@ -64,11 +64,14 @@ async def main():
     # Egress containment: prove the network posture before anything else (fail-closed;
     # skipped when no proxy is configured). Split deploy (EXECUTOR_SOCKET set): this
     # process is the DISCORD FRONTEND — its proxy must reach Discord and must NOT reach
-    # Anthropic (5.3 deny direction; the executor asserts the mirror image). Single
-    # container: the phase-1 posture (Anthropic required, no forbidden set).
+    # Anthropic (5.3 deny direction; the executor asserts the mirror image) nor the
+    # package-index hosts — a misapplied EXTRA_FILTER must fail closed here rather than
+    # hand index egress to the Discord-token container. Single container: the phase-1
+    # posture (Anthropic required, no forbidden set); the index opt-in is unsupported
+    # in that posture by construction (the proxy build refuses it).
     if config.EXECUTOR_SOCKET:
         await egress.canary_gate(required_host="discord.com",
-                                 forbidden_hosts=(config.ANTHROPIC_API_HOST,))
+                                 forbidden_hosts=config.FRONTEND_FORBIDDEN_HOSTS)
     else:
         await egress.canary_gate()
 

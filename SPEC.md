@@ -78,6 +78,13 @@ egress-exec-isolation 的最終形：**憑證與 egress 反向配對**——每�
 
 - 兩個 app 容器都在 `internal: true`（routeless）網路上，唯一出口是各自的
   default-deny CONNECT proxy（tinyproxy + hostname allow-list，`./egress-proxy`）。
+- **package index opt-in（預設關）**：executor 側 proxy 可用 build arg
+  `EXTRA_FILTER=filter.pypi` 追加唯讀的 `pypi.org` / `files.pythonhosted.org`，讓 agent
+  能自行安裝 Python 依賴。只接受疊在 `filter.anthropic` 上——套到 frontend 或單容器
+  `filter` 會 build 失敗，且 frontend canary 已把 index host 列為 forbidden 探針。
+  `registry.npmjs.org` 不納入（publish 端點同 host）。規格正本見
+  `openspec/specs/`（egress-containment / registry-install-guardrails），威脅論證見
+  SECURITY.md §6。
 - **啟動 canary（fail-closed）**：每個容器開機時證明**自己那一側的 deny 方向**
   ——frontend 證明 Anthropic 不可達、executor 證明 Discord 不可達，加上
   allow-list 是 default-deny、必要 host 可達。任一不成立 → 拒絕服務。
@@ -125,7 +132,7 @@ ai-discord-bridge/
 ├── mcp_approver.py              approve tier 的 MCP permission-prompt server（claude 掛載）
 ├── approver-allowlist.json      approve tier 自動放行的指令 allow-list
 ├── settings.json                server 端安全設定（permissions.deny family；--settings 每 call 都帶）
-├── egress-proxy/                default-deny CONNECT proxy（tinyproxy；filter.anthropic / filter.discord）
+├── egress-proxy/                default-deny CONNECT proxy（tinyproxy；filter / filter.anthropic / filter.discord / filter.pypi[opt-in]）
 ├── Dockerfile                   python:3.12-slim + Node20 + claude-code CLI + discord.py
 ├── docker-compose.example.yml   公開樣板：雙容器 + 雙 proxy + routeless 網路（真實 compose gitignore）
 ├── README.md / README.zh.md     公開入口（英 / 中）
@@ -401,7 +408,9 @@ rm ~/.claude-shared/discord-state/A__*.json
 ```
 
 - ⚠️ **改 code 後一定要 `--build`**；proxy 的 allow-list filter 是 build 時烤進 image，
-  改 `egress-proxy/filter.*` 也要 `--build`。
+  改 `egress-proxy/filter.*` 或改 `EXTRA_FILTER`（package index opt-in）都要
+  `docker compose build proxy-anthropic && docker compose up -d`——filter 刻意只在
+  build 時決定，runtime 改不動。
 - **split cutover 程序**（含 OAuth refresh host 的 pin 法與已觀測結果）見 SECURITY.md §6。
 - **M4 啟用前置**：split 跑起來 + `discord-verify/<cwd-slug>` 寫好 verify 指令（host 端），
   再設 `ENABLE_EXEC_BASH=1`（兩容器都設，compose 樣板已接好）。

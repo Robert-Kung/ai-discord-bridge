@@ -547,8 +547,19 @@ async def _post_diff_gate(job, channel, stat: str, full: str) -> None:
     stat_shown = stat.strip()
     stat_trunc = "" if len(stat_shown) <= 1500 else (
         f"\n⚠️ **diffstat 已截斷（{len(stat_shown) - 1500} 字元未顯示）——完整檔案清單見附件/分支**")
+    # 依賴變更要獨立標示：容器內的 install 護欄止於 commit，合併後在 host／CI 跑
+    # 安裝時不受約束，而 lockfile 的大量 churn 正是新套件最好藏的地方。
+    deps = worktree.dependency_changes(full)
+    dep_note = ""
+    if deps:
+        shown = "、".join(f"`{p}`" for p in deps[:5])
+        more = f" 等 {len(deps)} 個檔案" if len(deps) > 5 else ""
+        dep_note = (f"\n⚠️ **此 job 變更了依賴宣告／lockfile**：{shown}{more}\n"
+                    f"合併後在 host 或 CI 安裝時會執行第三方 install-time 程式碼——"
+                    f"容器內的護欄到此為止，請逐項確認新增的套件。")
     header = (f"🔍 **[job `{job.id}` diff · base `{base8}`]** "
-              f"✅ 合併到 live / ❌ 丟棄（{config.PLAN_REACTION_TIMEOUT}s，逾時＝保留待審）\n"
+              f"✅ 合併到 live / ❌ 丟棄（{config.PLAN_REACTION_TIMEOUT}s，逾時＝保留待審）"
+              f"{dep_note}\n"
               f"```\n{stat_shown[:1500]}\n```{stat_trunc}")
     full_bytes = full.encode("utf-8")
     if len(full) <= 1500:

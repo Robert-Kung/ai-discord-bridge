@@ -202,10 +202,18 @@ list of pinned **read-only documentation** domains (docs.anthropic.com, Apple/Go
 developer docs), mirroring the egress proxy's allow-list — the proxy is the real
 enforcement (an un-listed domain 403s even if a settings edit slipped). These hosts
 were chosen for the app-store/API-doc lookups the exec tier needs; a **publish-capable
-host (e.g. a package registry) is deliberately NOT on this list**, because the proxy
-is CONNECT-only (no TLS bump) so "reachable" means "arbitrary method + body" — an
-allowed registry would be a world-readable exfil sink for the OAuth credential the
-executor holds. `WebSearch` is allowed: it runs server-side at `api.anthropic.com`,
+host is deliberately NOT on this list**, because the proxy is CONNECT-only (no TLS
+bump) so "reachable" means "arbitrary method + body" — an allowed publish endpoint
+would be a world-readable exfil sink for the OAuth credential the executor holds.
+The test that matters is **per host, not per service**: a host is ineligible when it
+*also* accepts writes. `registry.npmjs.org` fails that test — npm's publish endpoint
+is the same host, so reachable means writable, and it stays denied. PyPI splits the
+two: reads live on `pypi.org` and `files.pythonhosted.org`, uploads on
+`upload.pypi.org`. Those two read hosts are therefore eligible, and an operator can
+add them to the **executor** proxy through the opt-in described below; the upload
+host is not, and never becomes reachable. The rule is unchanged — no host that can
+receive a publish is allow-listed — this states it precisely rather than by proxy for
+"anything registry-shaped". `WebSearch` is allowed: it runs server-side at `api.anthropic.com`,
 so it adds no *client* egress — but note it is a channel the egress proxy cannot see:
 an injected agent can drive secret-bearing search queries out through Anthropic's
 search backend, and pull attacker-controlled result pages back into context. Treat it
@@ -325,6 +333,84 @@ single-file mount, so a container-side refresh cannot persist anyway).
   `**/anthropic-api-key`) — name-based and evadable like the rest of §6, so still
   use a key with a **spend cap / scoped workspace**. Subscription mode is untouched
   by all of this: no helper is provisioned, and OAuth resolution is unchanged.
+
+### Package-index egress — opt-in, default OFF
+
+Without this, an exec-tier agent cannot install dependencies: existing projects run
+offline against a host-preinstalled environment, and a greenfield project stalls at the
+first `pip install`. The opt-in makes the **read-only** PyPI hosts reachable from the
+executor, and nothing else.
+
+**Posture.** Off by default. It is a **proxy image build arg**, not a runtime switch —
+the filter is baked into the image so a compromised runtime cannot rewrite it (the M4
+lesson: config the agent can reach is not config). To enable, uncomment `EXTRA_FILTER`
+under `proxy-anthropic` in your compose file and rebuild:
+
+```bash
+docker compose build proxy-anthropic && docker compose up -d
+```
+
+Rollback is the same edit in reverse plus a rebuild.
+
+**Scope, and why it is bounded.**
+
+- Only `pypi.org` and `files.pythonhosted.org` — read endpoints. `upload.pypi.org` is
+  not included, so the opt-in grants **no write path**.
+- `registry.npmjs.org` is **excluded and stays excluded**: npm serves metadata,
+  tarballs *and publishes* from that one host, so allow-listing it would hand an
+  injected agent an authenticated write channel (it can bring its own token — "the
+  container has no npm credentials" is not a security premise). Node projects stay on
+  the vendored path: the operator runs `npm ci` on the host, `node_modules` is mounted
+  in, and the agent runs `npm test` offline.
+- **Executor side of a split deployment only.** Applying it to the frontend proxy or to
+  the single-container `filter` fails the image build, and the frontend's startup canary
+  additionally treats the index hosts as forbidden probes — a misapplied filter makes
+  the frontend refuse to serve rather than quietly granting index egress to the
+  container that holds the Discord token.
+- Index reachability is deliberately **not** a startup gate on the executor: a PyPI
+  outage must fail an install, not take the executor down.
+
+**Install-time execution guardrails.** Every subprocess that might run an install — both
+the `claude -p` path and the verify path — is spawned with `npm_config_ignore_scripts=true`
+and `PIP_PREFER_BINARY=1`, unconditionally, whether or not the opt-in is enabled. The
+executor image also carries a global npmrc and `/etc/pip.conf` with the same settings,
+written root-owned while the app runs as uid 1000, so a project-level `.npmrc` or
+`pip.conf` written by the agent cannot re-enable lifecycle scripts.
+
+**Residual risks once enabled** — these are open, not closed:
+
+- **sdist builds still execute.** `prefer-binary` is a preference, not `only-binary`
+  (which would break installs of packages that ship no wheel). When no wheel exists, the
+  source distribution builds, and `setup.py egg_info` can run during dependency
+  resolution.
+- **Wheels are not safe either.** A `.pth` file in a wheel executes its `import` line at
+  every interpreter startup, entirely independent of the build step. `prefer-binary` does
+  nothing about it. "Wheel-only means no code execution" is false — do not rely on it.
+- **The guardrails do not bound a hostile agent.** An agent with a shell can drop the
+  variables from its own children (`env -u`), pass overriding CLI flags, point
+  `PIP_CONFIG_FILE` at `/dev/null`, or use a package manager that reads neither family
+  (uv, pnpm, yarn Berry). They target honest mistakes and the normal install path. The
+  enforcing boundary remains the executor's **routeless egress**.
+- **SNI-routed access to co-tenants of the same CDN.** The proxy allow-lists hostnames on
+  CONNECT; the SNI inside the tunnel is chosen by the client. `pypi.org` and
+  `files.pythonhosted.org` are on Fastly, so enabling this makes that tenant pool
+  reachable. This is not a new *class* — `api.anthropic.com` already made the Cloudflare
+  pool reachable — but it is a **new pool**. Only a TLS-terminating / SNI-pinning proxy or
+  a credential-free build container actually closes it.
+- **Download-statistics side channel.** An attacker who pre-publishes packages can
+  exfiltrate on the order of tens of bits per day by choosing which ones to download.
+  There is no practical mitigation; it is listed for completeness.
+- **Post-merge execution is entirely outside these guardrails.** They end at the
+  container. Once the operator merges the job's commit, a `pip install` on the host or in
+  CI runs install-time code with none of them in force. The diff gate flags manifest and
+  lockfile changes distinctly for exactly this reason, and a job that adds a dependency
+  must commit the corresponding lockfile.
+
+**End state.** A **credential-free build container** — installs run in a container that
+holds no OAuth credential and no API key, so index reachability there grants an attacker
+nothing to steal — removes every residual above except post-merge execution. It is also
+the **precondition for enabling npm**: `registry.npmjs.org`'s write capability only stops
+mattering when there is no credential co-resident with it.
 
 ---
 

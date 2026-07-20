@@ -78,6 +78,17 @@ EGRESS_PROXY_URL = os.environ.get("EGRESS_PROXY_URL") or None
 EGRESS_CANARY_CONTROL_HOST = os.environ.get("EGRESS_CANARY_CONTROL_HOST", "example.com")
 ANTHROPIC_API_HOST = "api.anthropic.com"
 DISCORD_HOSTS = ("discord.com", "gateway.discord.gg", "cdn.discordapp.com")
+# Read-only package-index hosts the executor MAY reach under the build-time opt-in
+# (egress-proxy/filter.pypi). The frontend must never reach them: it holds the Discord
+# token, so index egress there would pair a credential with a fetch path the opt-in's
+# risk argument assumes are kept apart. Listed as frontend canary forbidden probes so
+# an EXTRA_FILTER applied to the wrong proxy fails closed instead of passing silently.
+PACKAGE_INDEX_HOSTS = ("pypi.org", "files.pythonhosted.org")
+# What the split-deploy FRONTEND must never reach: the executor's Anthropic endpoint
+# (5.3 deny direction) plus the index hosts above. The executor asserts the mirror
+# image (DISCORD_HOSTS) and deliberately has NO index probe — an index outage must
+# not take the executor down.
+FRONTEND_FORBIDDEN_HOSTS = (ANTHROPIC_API_HOST,) + PACKAGE_INDEX_HOSTS
 
 # ── Phase 2 split (egress-exec-isolation 5.x) ───────────────────────────
 # When set, this process is PART OF A SPLIT DEPLOY: bot.py (frontend) becomes an IPC
@@ -168,6 +179,29 @@ _SUBPROCESS_ENV_DENY = {
     "ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_A", "ANTHROPIC_API_KEY_B",
     "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
     "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+}
+
+# Install-time code-execution guardrails, injected into EVERY subprocess that might
+# run a package install (spec: registry-install-guardrails). Unconditional — not gated
+# on the package-index opt-in — so behaviour does not vary with deployment posture.
+#
+# npm reads `npm_config_ignore_scripts`; the value must be the literal "true" (npm
+# parses booleans, "1" is not truthy here). pip's prefer-binary is a REDUCTION, not an
+# elimination: sdists still build when no wheel exists, and a wheel can still execute
+# code at interpreter startup through a .pth file.
+#
+# These env values beat any .npmrc/pip.conf the agent can write inside a worktree, but
+# they do NOT bound a hostile agent: it can drop them from its own children, pass CLI
+# flags, point PIP_CONFIG_FILE at /dev/null, or use uv/pnpm/yarn Berry, which read
+# neither family. The enforcing boundary remains the executor's routeless egress.
+#
+# The cache dirs point at image-created, uid-1000-writable paths: the executor runs as
+# 1000:1000 with a root-owned HOME, so the default ~/.cache would EACCES.
+INSTALL_GUARDRAIL_ENV = {
+    "npm_config_ignore_scripts": "true",
+    "PIP_PREFER_BINARY": "1",
+    "PIP_CACHE_DIR": "/home/user/.cache/pip",
+    "npm_config_cache": "/home/user/.cache/npm",
 }
 
 # Project cwd whitelist (resolved abs paths), populated by load_config from PROJECT_DIRS.

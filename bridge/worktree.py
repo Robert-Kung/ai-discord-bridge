@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from pathlib import Path
 
 from bridge import config, sessions
@@ -100,6 +101,34 @@ async def job_diff(project: str, base: str, job_id: str) -> tuple[str, str]:
     _, stat, _ = await _git(project, "diff", "--stat", f"{base}..{branch}")
     _, full, _ = await _git(project, "diff", f"{base}..{branch}")
     return stat, full
+
+
+# Dependency manifests and lockfiles. A change here means the merged commit will pull
+# and execute third-party install-time code on the operator's host or in CI, where NONE
+# of the container's install guardrails apply (spec: registry-install-guardrails). It
+# must not blend into the diff — a lockfile churn of thousands of lines is exactly where
+# an added package hides.
+_DEPENDENCY_FILE_RE = re.compile(
+    r"(^|/)("
+    r"requirements[^/]*\.txt"
+    r"|pyproject\.toml|setup\.py|setup\.cfg|Pipfile(\.lock)?|poetry\.lock|uv\.lock"
+    r"|package(-lock)?\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml"
+    r")$",
+    re.IGNORECASE,
+)
+# `diff --git a/<path> b/<path>` — parsed instead of the diffstat because the stat
+# elides long paths with "...", which would silently drop a nested manifest.
+_DIFF_HEADER_RE = re.compile(r"^diff --git a/(.+?) b/(.+)$", re.MULTILINE)
+
+
+def dependency_changes(full_diff: str) -> list[str]:
+    """Dependency manifests/lockfiles touched by this diff, sorted and de-duplicated."""
+    paths: set[str] = set()
+    for a_path, b_path in _DIFF_HEADER_RE.findall(full_diff or ""):
+        for path in (a_path, b_path):
+            if _DEPENDENCY_FILE_RE.search(path):
+                paths.add(path)
+    return sorted(paths)
 
 
 async def merge_job(project: str, job_id: str, base: str) -> tuple[str, str]:
