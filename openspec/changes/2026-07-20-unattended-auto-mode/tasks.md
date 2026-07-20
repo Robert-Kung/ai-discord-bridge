@@ -2,7 +2,10 @@
 
 ## 0. Preconditions
 - [ ] 0.1 PR #20 (fix/job-loss-family) merged — commit semantics the chain depends on
-- [ ] 0.2 PR #21 (egress allowlist A) merged — verify tier can npm install/test
+- [ ] 0.2 PR #21 (egress allowlist A) merged — WebSearch/doc lookups for the verify tier.
+      NOTE: npm registry was dropped from #21 on the security review (credential-container
+      exfil sink); Node projects' `npm install`/test in auto mode needs a read-only
+      registry mirror first — track separately, do NOT assume npm reachability here.
 
 ## 1. Structured evaluator verdict (bridge/discuss.py)
 - [ ] 1.1 Verdict contract in the evaluator prompt (first line `VERDICT: …`)
