@@ -23,16 +23,21 @@ RUN pip install --no-cache-dir discord.py==2.4.0
 # bridge/config.py:INSTALL_GUARDRAIL_ENV. Written root-owned 0644: the app runs as
 # uid 1000, so the agent can read but never rewrite these. They are NOT a boundary
 # against a hostile agent (PIP_CONFIG_FILE=/dev/null, CLI flags, and uv/pnpm/yarn
-# all sidestep them) — see SECURITY.md. The cache dirs are uid-1000-writable because
-# HOME is root-owned (docker creates it for the bind mounts), so pip/npm defaults
-# under ~/.cache would EACCES.
+# all sidestep them) — see SECURITY.md.
+#
+# HOME stays root-owned deliberately: a writable ~/.local would let an install drop a
+# `.pth` that executes at EVERY interpreter start, including this long-lived executor
+# holding the OAuth credential. Installs belong in a per-job venv inside the throwaway
+# worktree (PIP_REQUIRE_VIRTUALENV enforces this and turns the would-be EACCES into a
+# clear message). Only the npm cache dir is made writable — npm exits non-zero on an
+# unwritable cache, while pip runs cacheless by design here.
 RUN set -eux; \
     GLOBAL_NPMRC="$(npm config get globalconfig)"; \
     mkdir -p "$(dirname "$GLOBAL_NPMRC")"; \
     printf 'ignore-scripts=true\n' >"$GLOBAL_NPMRC"; \
     printf '[global]\nprefer-binary = true\n' >/etc/pip.conf; \
     chmod 0644 "$GLOBAL_NPMRC" /etc/pip.conf; \
-    mkdir -p /home/user/.cache/pip /home/user/.cache/npm; \
+    mkdir -p /home/user/.cache/npm; \
     chown -R 1000:1000 /home/user/.cache
 
 WORKDIR /app

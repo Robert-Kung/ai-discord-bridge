@@ -354,8 +354,13 @@ Rollback is the same edit in reverse plus a rebuild.
 
 **Scope, and why it is bounded.**
 
-- Only `pypi.org` and `files.pythonhosted.org` — read endpoints. `upload.pypi.org` is
-  not included, so the opt-in grants **no write path**.
+- Only `pypi.org` and `files.pythonhosted.org`. `upload.pypi.org` is not included, so
+  the opt-in reaches **no package-upload endpoint** — that is the precise claim, and
+  it is the one the exclusion rule is about. It is *not* the claim that these hosts are
+  inert: `pypi.org` serves the whole Warehouse web application, including authenticated
+  account and project management. An attacker who supplies their own PyPI session can
+  write attacker-readable bytes into fields on their own account. See the residual list
+  below — this is disclosed, not designed away.
 - `registry.npmjs.org` is **excluded and stays excluded**: npm serves metadata,
   tarballs *and publishes* from that one host, so allow-listing it would hand an
   injected agent an authenticated write channel (it can bring its own token — "the
@@ -371,14 +376,41 @@ Rollback is the same edit in reverse plus a rebuild.
   outage must fail an install, not take the executor down.
 
 **Install-time execution guardrails.** Every subprocess that might run an install — both
-the `claude -p` path and the verify path — is spawned with `npm_config_ignore_scripts=true`
-and `PIP_PREFER_BINARY=1`, unconditionally, whether or not the opt-in is enabled. The
-executor image also carries a global npmrc and `/etc/pip.conf` with the same settings,
-written root-owned while the app runs as uid 1000, so a project-level `.npmrc` or
-`pip.conf` written by the agent cannot re-enable lifecycle scripts.
+the `claude -p` path and the verify path — is spawned with `npm_config_ignore_scripts=true`,
+`PIP_PREFER_BINARY=1`, `PIP_REQUIRE_VIRTUALENV=1` and `PIP_NO_CACHE_DIR=1`,
+unconditionally, whether or not the opt-in is enabled. The executor image also carries a
+global npmrc and `/etc/pip.conf` with the same settings, written root-owned while the app
+runs as uid 1000, so a project-level `.npmrc` or `pip.conf` written by the agent cannot
+re-enable lifecycle scripts.
+
+The last two are not conveniences. **Installs must land in a per-job venv**: `HOME` is
+root-owned, so a bare `pip install` would otherwise die on EACCES creating `~/.local`,
+and — worse if that were "fixed" by making HOME writable — a user-site install is
+*persistent*, with any `.pth` file there executing at every interpreter start, including
+the long-lived executor process holding the credential. A venv inside the throwaway
+worktree dies with the job. **The pip cache is disabled** because it would otherwise be
+shared by every job in one long-lived container: an entry poisoned during one job's run
+would be served to a different, trusted project's `pip install -e .` at verify time.
+(npm's cache stays on — it is content-addressed with integrity checking, and npm exits
+non-zero on an unwritable cache dir.)
 
 **Residual risks once enabled** — these are open, not closed:
 
+- **An ordinary import runs third-party code, no injection required.** The verify
+  command is routinely `pip install -e . && pytest`, and pytest **imports** the
+  installed packages — module bodies execute in the container that holds the OAuth
+  credential. A typosquatted or hallucinated package name is enough; neither
+  `PIP_PREFER_BINARY` (a wheel serves an attacker fine) nor `npm_config_ignore_scripts`
+  (this is pip) touches this path. Before the opt-in, no third-party code could enter
+  that container at all — this is the single largest change in exposure here.
+- **Authenticated writes to attacker-controlled PyPI accounts.** As above: `pypi.org`
+  is a full web app on the allow-list, so an injected agent carrying the attacker's own
+  session has a store-and-retrieve channel with far more bandwidth than the download
+  side channel below. No upload endpoint is involved, and none becomes reachable.
+- **A new prompt-injection ingress.** Package names, versions, resolver error text and
+  project metadata now flow from PyPI into the agent's context. Indirect prompt
+  injection is this system's primary threat, and this is a new attacker-authorable
+  channel into the context window.
 - **sdist builds still execute.** `prefer-binary` is a preference, not `only-binary`
   (which would break installs of packages that ship no wheel). When no wheel exists, the
   source distribution builds, and `setup.py egg_info` can run during dependency
@@ -391,12 +423,18 @@ written root-owned while the app runs as uid 1000, so a project-level `.npmrc` o
   `PIP_CONFIG_FILE` at `/dev/null`, or use a package manager that reads neither family
   (uv, pnpm, yarn Berry). They target honest mistakes and the normal install path. The
   enforcing boundary remains the executor's **routeless egress**.
-- **SNI-routed access to co-tenants of the same CDN.** The proxy allow-lists hostnames on
-  CONNECT; the SNI inside the tunnel is chosen by the client. `pypi.org` and
-  `files.pythonhosted.org` are on Fastly, so enabling this makes that tenant pool
-  reachable. This is not a new *class* — `api.anthropic.com` already made the Cloudflare
-  pool reachable — but it is a **new pool**. Only a TLS-terminating / SNI-pinning proxy or
-  a credential-free build container actually closes it.
+- **SNI-routed access to co-tenants behind the same CDN mapping.** The proxy
+  allow-lists hostnames on CONNECT; the SNI inside the tunnel is chosen by the client.
+  Measured 2026-07-20: the reachable set is **not** "all of Fastly" but the hosts
+  sharing `python.map.fastly.net` — `www.python.org` and `test.pypi.org` complete a TLS
+  handshake this way; `www.rust-lang.org`, `deb.debian.org`, `cdn.jsdelivr.net` and
+  `www.fastly.com` do not. So generic domain-fronting write-ups overstate this, and an
+  attacker cannot self-serve onto that mapping — but those two specific hosts do become
+  reachable. (`test.pypi.org`'s `/legacy/` upload route was probed and returns
+  `405 Allow: GET, HEAD, OPTIONS`, with and without credentials.) Worth crediting on the
+  other side: tinyproxy resolves DNS itself, so the container cannot point `pypi.org` at
+  an IP of its choosing. Only a TLS-terminating / SNI-pinning proxy or a credential-free
+  build container closes the SNI gap.
 - **Download-statistics side channel.** An attacker who pre-publishes packages can
   exfiltrate on the order of tens of bits per day by choosing which ones to download.
   There is no practical mitigation; it is listed for completeness.
@@ -465,6 +503,12 @@ mattering when there is no credential co-resident with it.
 - [ ] Set `ALLOWED_USER_IDS` to your own id(s) only.
 - [ ] Mount **only** the projects you accept the bots reading/modifying.
 - [ ] Keep the channel private; restrict who can post.
+- [ ] Leave the package-index opt-in (`EXTRA_FILTER`) **off** unless agents actually
+      need to install Python dependencies. It is an egress widening: read §6's residual
+      list first, in particular that verify-time imports execute third-party code inside
+      the credential-holding container. Never apply it to the frontend proxy or a
+      single-container deployment (the build refuses, and the canary catches a
+      hand-edited filter).
 - [ ] Leave the default mode at `plan`; switch to `edit` per task, not as a
       channel default.
 - [ ] Leave `ENABLE_BYPASS_TIER` **unset** unless you truly need full bypass; it

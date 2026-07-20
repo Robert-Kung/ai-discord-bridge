@@ -20,6 +20,15 @@ from bridge.util import chunk_message
 
 log = logging.getLogger("bridge.frontend")
 
+# Diff-gate header budget. Discord's hard limit is 2000 chars per message and the
+# header CANNOT be chunked — the ✅/❌ reactions live on that single message, so an
+# over-length header raises HTTPException and the approval gate never appears (the
+# job then sits in RUNNING with its worktree retained). 1900 leaves margin for the
+# code fence and the truncation notice.
+_HEADER_MAX = 1900
+_STAT_FENCE_OVERHEAD = 200  # ``` fences + the truncation warning line
+_DEP_NOTE_MAX = 400
+
 
 # ── Command / flag parsing ──────────────────────────────────────────────
 def parse_command(content: str) -> tuple[str, str] | None:
@@ -545,22 +554,39 @@ async def _post_diff_gate(job, channel, stat: str, full: str) -> None:
     park as awaiting-review (branch + persisted diff survive for !merge/!discard)."""
     base8 = (job.base or "")[:8]
     stat_shown = stat.strip()
-    stat_trunc = "" if len(stat_shown) <= 1500 else (
-        f"\n⚠️ **diffstat 已截斷（{len(stat_shown) - 1500} 字元未顯示）——完整檔案清單見附件/分支**")
-    # 依賴變更要獨立標示：容器內的 install 護欄止於 commit，合併後在 host／CI 跑
-    # 安裝時不受約束，而 lockfile 的大量 churn 正是新套件最好藏的地方。
+    # 依賴／post-merge 執行檔變更要獨立標示：容器內的 install 護欄止於 commit，
+    # 合併後在 host／CI 跑安裝時不受約束，而 lockfile 的大量 churn 正是新套件最好藏的地方。
+    #
+    # 路徑來自 agent，且這段刻意放在 code fence 之外（要讓 ⚠️ 顯眼），所以必須
+    # (1) escape markdown——檔名可含反引號，能閉合 code span 後注入「已通過審查」之類的
+    #     文字到操作者按 ✅ 的那則訊息裡；
+    # (2) 硬性限長——header 是「單則」訊息（reaction 掛在上面，不能 chunk），超過
+    #     Discord 2000 字元會拋 HTTPException，被上層 except 吞掉後審查門就完全不會出現，
+    #     而最可能觸發的正是這個標示要抓的依賴變更 job。
     deps = worktree.dependency_changes(full)
     dep_note = ""
     if deps:
-        shown = "、".join(f"`{p}`" for p in deps[:5])
-        more = f" 等 {len(deps)} 個檔案" if len(deps) > 5 else ""
-        dep_note = (f"\n⚠️ **此 job 變更了依賴宣告／lockfile**：{shown}{more}\n"
-                    f"合併後在 host 或 CI 安裝時會執行第三方 install-time 程式碼——"
+        shown = "、".join(
+            f"`{discord.utils.escape_markdown(Path(p).name)}`" for p in deps[:3])
+        more = f" 等 {len(deps)} 個檔案" if len(deps) > 3 else ""
+        dep_note = (f"\n⚠️ **此 job 變更了依賴宣告／lockfile／合併後會執行的設定檔**："
+                    f"{shown}{more}（完整路徑見下方 diff）\n"
+                    f"合併後在 host 或 CI 安裝／執行時會跑第三方 install-time 程式碼——"
                     f"容器內的護欄到此為止，請逐項確認新增的套件。")
-    header = (f"🔍 **[job `{job.id}` diff · base `{base8}`]** "
-              f"✅ 合併到 live / ❌ 丟棄（{config.PLAN_REACTION_TIMEOUT}s，逾時＝保留待審）"
-              f"{dep_note}\n"
-              f"```\n{stat_shown[:1500]}\n```{stat_trunc}")
+        if len(dep_note) > _DEP_NOTE_MAX:  # 檔名極長時的最後防線
+            dep_note = (f"\n⚠️ **此 job 變更了 {len(deps)} 個依賴宣告／lockfile／"
+                        f"合併後會執行的設定檔**（清單見下方 diff）——"
+                        f"合併後在 host 或 CI 會跑第三方程式碼，請逐項確認。")
+    lead = (f"🔍 **[job `{job.id}` diff · base `{base8}`]** "
+            f"✅ 合併到 live / ❌ 丟棄（{config.PLAN_REACTION_TIMEOUT}s，逾時＝保留待審）"
+            f"{dep_note}\n")
+    # diffstat 的預算＝剩下的空間，不是固定 1500：header 必須是「單則」訊息（reaction
+    # 掛在它上面，不能 chunk），一旦超過 Discord 上限就整則送不出去，審查門靜默消失。
+    stat_budget = max(0, _HEADER_MAX - len(lead) - _STAT_FENCE_OVERHEAD)
+    stat_trunc = "" if len(stat_shown) <= stat_budget else (
+        f"\n⚠️ **diffstat 已截斷（{len(stat_shown) - stat_budget} 字元未顯示）"
+        f"——完整檔案清單見附件/分支**")
+    header = f"{lead}```\n{stat_shown[:stat_budget]}\n```{stat_trunc}"
     full_bytes = full.encode("utf-8")
     if len(full) <= 1500:
         msg = await channel.send(f"{header}\n```diff\n{full}\n```")

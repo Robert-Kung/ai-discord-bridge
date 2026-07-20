@@ -82,9 +82,11 @@ egress-exec-isolation 的最終形：**憑證與 egress 反向配對**——每�
   `EXTRA_FILTER=filter.pypi` 追加唯讀的 `pypi.org` / `files.pythonhosted.org`，讓 agent
   能自行安裝 Python 依賴。只接受疊在 `filter.anthropic` 上——套到 frontend 或單容器
   `filter` 會 build 失敗，且 frontend canary 已把 index host 列為 forbidden 探針。
-  `registry.npmjs.org` 不納入（publish 端點同 host）。規格正本見
-  `openspec/specs/`（egress-containment / registry-install-guardrails），威脅論證見
-  SECURITY.md §6。
+  `registry.npmjs.org` 不納入（publish 端點同 host）。安裝一律進 per-job venv
+  （`PIP_REQUIRE_VIRTUALENV`），pip cache 關閉（跨 job 汙染）。規格正本在歸檔前是
+  `openspec/changes/registry-egress-opt-in/specs/`，歸檔後才併入 `openspec/specs/`
+  ——注意 `openspec/specs/egress-containment/spec.md` 目前仍是舊敘述（尚未反映本 change
+  與 #21 的文件站 host），以 change 目錄與 SECURITY.md §6 為準。
 - **啟動 canary（fail-closed）**：每個容器開機時證明**自己那一側的 deny 方向**
   ——frontend 證明 Anthropic 不可達、executor 證明 Discord 不可達，加上
   allow-list 是 default-deny、必要 host 可達。任一不成立 → 拒絕服務。

@@ -64,7 +64,26 @@ def _build_filter(filter_name: str, extra: str = "") -> str:
     return out.stdout.decode()
 
 
-def test_no_shipped_filter_names_a_publish_capable_host():
+# Half-anchored variants of the shipped lines. tinyproxy would tunnel upload.pypi.org
+# for every one of these; a guard test using re.fullmatch calls them all safe.
+# Dropping the LEADING anchor lets a subdomain in (upload.pypi.org); dropping the
+# TRAILING one lets an attacker-registered suffix in (pypi.org.evil.example).
+_ANCHOR_MUTANTS = [
+    (r"pypi\.org$", "upload.pypi.org"),
+    (r"pypi\.org", "upload.pypi.org"),
+    (r".*pypi\.org.*", "upload.pypi.org"),
+    (r"^pypi\.org", "pypi.org.evil.example"),
+]
+
+
+def _tinyproxy_would_allow(pattern: str, host: str) -> bool:
+    """tinyproxy matches with POSIX regexec, which is UNANCHORED — a pattern matching
+    any SUBSTRING of the CONNECT host allows it. re.fullmatch models a different engine
+    and would score `pypi\.org$` as safe while the proxy tunnels upload.pypi.org."""
+    return re.search(pattern, host, re.IGNORECASE) is not None
+
+
+def test_no_shipped_filter_allows_a_publish_capable_host():
     # Guards against a later "just add npm too" edit: the exclusion is the whole
     # basis for README/SECURITY's no-publish-capable-host claim.
     # Match on active regex lines only: filter.pypi names these hosts in a comment
@@ -72,8 +91,18 @@ def test_no_shipped_filter_names_a_publish_capable_host():
     for path in PROXY.glob("filter*"):
         for line in _regex_lines(path):
             for host in PUBLISH_CAPABLE:
-                assert not re.fullmatch(line, host, re.IGNORECASE), \
+                assert not _tinyproxy_would_allow(line, host), \
                     f"{path.name} allow-lists publish-capable host {host} via {line!r}"
+
+
+@pytest.mark.parametrize("mutant,host", _ANCHOR_MUTANTS)
+def test_the_guard_itself_catches_a_dropped_anchor(mutant, host):
+    # Meta-test: the guard above exists to stop a future one-character edit. Prove it
+    # actually would — under re.fullmatch these all scored as "safe".
+    assert _tinyproxy_would_allow(mutant, host), \
+        f"guard would not catch {mutant!r} vs {host} — wrong regex engine"
+    assert not _tinyproxy_would_allow(r"^pypi\.org$", host), \
+        "the shipped double-anchored form must still reject it"
 
 
 def test_base_executor_filter_has_no_index_hosts():
@@ -113,3 +142,55 @@ def test_opt_in_on_non_executor_filter_fails_the_build(base):
     # not a guardrail — the build must refuse.
     with pytest.raises(subprocess.CalledProcessError):
         _build_filter(base, "filter.pypi")
+
+
+@docker_required
+@pytest.mark.parametrize("extra", ["filter.discord", "filter", "../../etc/hostname"])
+def test_build_rejects_any_extra_filter_but_the_index_one(extra):
+    # Guarding only FILTER left the mirror-image footgun open: filter.anthropic +
+    # EXTRA_FILTER=filter.discord built a proxy granting the CREDENTIAL container
+    # Discord egress — the exact inversion the split exists to prevent. Traversal
+    # (../../etc/hostname) would splice arbitrary file contents in as match patterns.
+    with pytest.raises(subprocess.CalledProcessError):
+        _build_filter("filter.anthropic", extra)
+
+
+@docker_required
+def test_composed_filter_denies_unlisted_hosts_in_a_live_proxy():
+    """End-to-end against a running tinyproxy, not just file contents.
+
+    The composition inserts a blank line between the base and appended filters. If a
+    blank line ever compiled as an empty regex it would match EVERY host, silently
+    turning default-deny into allow-all — a file-contents test cannot see that, and
+    `FROM alpine:3.20` floats the tinyproxy version under us.
+    """
+    tag = "filtertest-live"
+    subprocess.run(
+        ["docker", "build", "-q", "-t", tag, "--build-arg", "FILTER=filter.anthropic",
+         "--build-arg", "EXTRA_FILTER=filter.pypi", str(PROXY)],
+        check=True, capture_output=True, timeout=600,
+    )
+    cid = subprocess.run(["docker", "run", "-d", "--rm", tag],
+                         check=True, capture_output=True, timeout=120).stdout.decode().strip()
+    try:
+        probe = (
+            "import socket,sys\n"
+            "for h in ['pypi.org','api.anthropic.com','upload.pypi.org',"
+            "'registry.npmjs.org','example.com']:\n"
+            "    s=socket.create_connection(('127.0.0.1',8888),timeout=8)\n"
+            "    s.sendall(('CONNECT %s:443 HTTP/1.1\\r\\nHost: %s:443\\r\\n\\r\\n'%(h,h)).encode())\n"
+            "    print(h, s.recv(32).decode('utf-8','replace').split()[1]); s.close()\n"
+        )
+        # python3 is not in the proxy image; run the probe from a sibling container.
+        out = subprocess.run(
+            ["docker", "run", "--rm", f"--network=container:{cid}", "python:3.12-slim",
+             "python3", "-c", probe],
+            check=True, capture_output=True, timeout=180,
+        ).stdout.decode()
+    finally:
+        subprocess.run(["docker", "rm", "-f", cid], capture_output=True, timeout=60)
+    status = dict(line.split() for line in out.strip().splitlines())
+    assert status["pypi.org"] == "200", "opt-in host should tunnel"
+    assert status["api.anthropic.com"] == "200", "base allow-list regressed"
+    for denied in ("upload.pypi.org", "registry.npmjs.org", "example.com"):
+        assert status[denied] == "403", f"{denied} was NOT denied (allow-all filter?)"

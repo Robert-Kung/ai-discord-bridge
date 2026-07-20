@@ -89,6 +89,14 @@ PACKAGE_INDEX_HOSTS = ("pypi.org", "files.pythonhosted.org")
 # image (DISCORD_HOSTS) and deliberately has NO index probe — an index outage must
 # not take the executor down.
 FRONTEND_FORBIDDEN_HOSTS = (ANTHROPIC_API_HOST,) + PACKAGE_INDEX_HOSTS
+# Hosts that accept package UPLOADS. The whole basis for admitting the read-only index
+# hosts is that these stay denied, so the executor proves it at startup rather than
+# trusting the filter file. This is NOT an index-reachability gate: a forbidden probe
+# expects `403 Filtered`, which tinyproxy answers itself without contacting the host,
+# so a PyPI/npm outage cannot affect it — the "outage must not take the executor down"
+# rule applies to REQUIRED hosts only.
+PUBLISH_CAPABLE_HOSTS = ("upload.pypi.org", "registry.npmjs.org")
+EXECUTOR_FORBIDDEN_HOSTS = DISCORD_HOSTS + PUBLISH_CAPABLE_HOSTS
 
 # ── Phase 2 split (egress-exec-isolation 5.x) ───────────────────────────
 # When set, this process is PART OF A SPLIT DEPLOY: bot.py (frontend) becomes an IPC
@@ -188,21 +196,46 @@ _SUBPROCESS_ENV_DENY = {
 # npm reads `npm_config_ignore_scripts`; the value must be the literal "true" (npm
 # parses booleans, "1" is not truthy here). pip's prefer-binary is a REDUCTION, not an
 # elimination: sdists still build when no wheel exists, and a wheel can still execute
-# code at interpreter startup through a .pth file.
+# code at interpreter startup through a .pth file — and an ordinary import of a
+# typosquatted package runs its module body during verify's pytest regardless.
+#
+# PIP_REQUIRE_VIRTUALENV: installs must land in a project venv. Two reasons, both
+# load-bearing. (1) The executor runs as uid 1000 under a root-owned HOME, so a bare
+# `pip install` would otherwise die on EACCES creating ~/.local — an opaque failure
+# for the exact use case this exists to enable; this turns it into "Could not find an
+# activated virtualenv (required)". (2) A user-site install is PERSISTENT: a `.pth`
+# there executes on every interpreter start, including the long-lived executor holding
+# the OAuth credential. A venv inside the throwaway worktree dies with the job.
+#
+# PIP_NO_CACHE_DIR: the pip cache is shared by every job in one long-lived container.
+# A poisoned entry written by one job's agent would be served to a DIFFERENT, trusted
+# project's `pip install -e .` during verify. Correctness beats the re-download cost.
+# (npm's cache is content-addressed with integrity checks, so it stays enabled — npm
+# hard-fails on an unwritable cache dir, unlike pip.)
 #
 # These env values beat any .npmrc/pip.conf the agent can write inside a worktree, but
 # they do NOT bound a hostile agent: it can drop them from its own children, pass CLI
 # flags, point PIP_CONFIG_FILE at /dev/null, or use uv/pnpm/yarn Berry, which read
 # neither family. The enforcing boundary remains the executor's routeless egress.
-#
-# The cache dirs point at image-created, uid-1000-writable paths: the executor runs as
-# 1000:1000 with a root-owned HOME, so the default ~/.cache would EACCES.
-INSTALL_GUARDRAIL_ENV = {
+_INSTALL_GUARDRAIL_STATIC = {
     "npm_config_ignore_scripts": "true",
     "PIP_PREFER_BINARY": "1",
-    "PIP_CACHE_DIR": "/home/user/.cache/pip",
-    "npm_config_cache": "/home/user/.cache/npm",
+    "PIP_REQUIRE_VIRTUALENV": "1",
+    "PIP_NO_CACHE_DIR": "1",
 }
+
+
+def install_guardrail_env(base_env: "dict | None" = None) -> dict:
+    """The guardrail vars for one spawn. npm's cache dir is derived from the caller's
+    HOME rather than hardcoded: npm exits non-zero on an unwritable cache, so a bare
+    (non-container) run under a different HOME must not have `npm ci` broken for it."""
+    src = os.environ if base_env is None else base_env
+    env = dict(_INSTALL_GUARDRAIL_STATIC)
+    home = (src.get("HOME") or "").strip()
+    if home:
+        env["npm_config_cache"] = str(Path(home) / ".cache" / "npm")
+    return env
+
 
 # Project cwd whitelist (resolved abs paths), populated by load_config from PROJECT_DIRS.
 DEFAULT_CWD = "/home/user"

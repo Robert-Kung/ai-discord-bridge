@@ -23,6 +23,26 @@ logging.basicConfig(
 log = logging.getLogger("bridge")
 
 
+def startup_canary_hosts() -> "tuple[str | None, tuple[str, ...]]":
+    """(required_host, forbidden_hosts) for this process's egress canary.
+
+    Split deploy (EXECUTOR_SOCKET set): this process is the DISCORD FRONTEND — its
+    proxy must reach Discord and must NOT reach Anthropic (5.3 deny direction; the
+    executor asserts the mirror image) nor the package-index hosts, so a misapplied
+    EXTRA_FILTER fails closed here instead of handing index egress to the container
+    holding the Discord token.
+
+    Single container: both secrets live here, so the index opt-in is unsupported. The
+    proxy build refuses to bake it into the combined filter, but an operator can still
+    hand-edit `egress-proxy/filter` — probing the index hosts makes that detected
+    rather than silent. Returns it as a pair so the wiring is testable without
+    standing up a Discord client.
+    """
+    if config.EXECUTOR_SOCKET:
+        return "discord.com", config.FRONTEND_FORBIDDEN_HOSTS
+    return None, config.PACKAGE_INDEX_HOSTS
+
+
 async def main():
     config.load_config()  # read env into globals + ensure dirs + fail-closed validation
     # Recover exec jobs from the previous container: mark orphaned running jobs, reload
@@ -69,11 +89,8 @@ async def main():
     # hand index egress to the Discord-token container. Single container: the phase-1
     # posture (Anthropic required, no forbidden set); the index opt-in is unsupported
     # in that posture by construction (the proxy build refuses it).
-    if config.EXECUTOR_SOCKET:
-        await egress.canary_gate(required_host="discord.com",
-                                 forbidden_hosts=config.FRONTEND_FORBIDDEN_HOSTS)
-    else:
-        await egress.canary_gate()
+    required, forbidden = startup_canary_hosts()
+    await egress.canary_gate(required_host=required, forbidden_hosts=forbidden)
 
     # OV1 — prove the --settings deny family is actually in force before serving.
     skip_canary = os.environ.get("BRIDGE_SKIP_CANARY", "").strip().lower() in ("1", "true", "yes", "on")

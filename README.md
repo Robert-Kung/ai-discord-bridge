@@ -4,7 +4,7 @@
 
 Self-hosted dual-AI Discord companion — a working personal-scale reference implementation of a four-layer memory model, debate orchestration, and a **review-gated execution loop** for Claude Code.
 
-> **Status**: Personal experiment. Single-channel, no support SLA. Fork it, adapt it — don't file issues expecting maintenance. The security-critical logic is covered by a 275-test pytest suite running in CI.
+> **Status**: Personal experiment. Single-channel, no support SLA. Fork it, adapt it — don't file issues expecting maintenance. The security-critical logic is covered by a 296-test pytest suite running in CI.
 
 > ⚠️ **Security**: this tool lets whitelisted Discord users run code as your host user inside the directories you mount. **Read [SECURITY.md](SECURITY.md) ([中文](SECURITY.zh.md)) before deploying** — the threat model and hardening checklist are not optional reading for this kind of project.
 
@@ -71,9 +71,15 @@ allow-list admits.
 
 - **Python**: off by default. Uncomment `EXTRA_FILTER: filter.pypi` under
   `proxy-anthropic` in your compose file and `docker compose build proxy-anthropic &&
-  docker compose up -d` to let agents install from PyPI. Only the read-only hosts open;
-  `upload.pypi.org` stays denied. Read [SECURITY.md](SECURITY.md) §6 before enabling —
-  the residual risks are listed there, not hand-waved.
+  docker compose up -d` to let agents install from PyPI. Only the read hosts open;
+  `upload.pypi.org` stays denied. **Installs must go into a venv** —
+  `python3 -m venv .venv && ./.venv/bin/pip install …` — because a user-site install
+  would persist across jobs (a `.pth` there executes at every interpreter start,
+  including the credential-holding executor). A bare `pip install` fails with
+  `Could not find an activated virtualenv (required)`; that is the guardrail, not a
+  bug. Per-project verify commands should use the venv too. Read
+  [SECURITY.md](SECURITY.md) §6 before enabling — the residual risks are listed there,
+  not hand-waved, and they include third-party code executing on import during verify.
 - **Node**: **vendored, no opt-in available.** `registry.npmjs.org` serves publishes from
   the same host, so allow-listing it would give an injected agent a write path out with
   its own token. Run `npm ci` on the host, mount `node_modules` in with the project, and
@@ -82,12 +88,13 @@ allow-list admits.
   credential-free build container, where index reachability grants an attacker nothing.
 
 Both spawn paths (the agent and the verify command) always carry
-`npm_config_ignore_scripts=true` and `PIP_PREFER_BINARY=1`, opt-in or not. These bound
-mistakes, not a hostile agent — the real boundary is the routeless egress.
+`npm_config_ignore_scripts=true`, `PIP_PREFER_BINARY=1`, `PIP_REQUIRE_VIRTUALENV=1` and
+`PIP_NO_CACHE_DIR=1`, opt-in or not. These bound mistakes, not a hostile agent — the
+real boundary is the routeless egress.
 
 ## Verify your deployment (smoke test)
 
-Unit tests (`pip install -r requirements-dev.txt && pytest`, 275 tests) cover the security-critical logic — fail-closed auth, `!cd` path/escape guard, trust filtering, env scrubbing, the exec-loop job/worktree/verify machinery, egress canary logic — and run in CI. They don't touch live Discord/Claude, so confirm end-to-end wiring by hand:
+Unit tests (`pip install -r requirements-dev.txt && pytest`, 296 tests) cover the security-critical logic — fail-closed auth, `!cd` path/escape guard, trust filtering, env scrubbing, the exec-loop job/worktree/verify machinery, egress canary logic — and run in CI. They don't touch live Discord/Claude, so confirm end-to-end wiring by hand:
 
 1. `docker compose config` — the compose file parses and mount paths resolve.
 2. **Fail-closed auth**: start with `ALLOWED_USER_IDS` empty → the container must exit immediately (`refusing to start`). Set it back to your id.

@@ -16,6 +16,20 @@ RUN apk add --no-cache tinyproxy
 COPY tinyproxy.conf /etc/tinyproxy/tinyproxy.conf
 COPY filter filter.anthropic filter.discord filter.pypi /tmp/filters/
 RUN set -eu; \
+    # Both args are validated against an explicit allow-list. Guarding only FILTER
+    # would leave the mirror-image footgun open: FILTER=filter.anthropic with
+    # EXTRA_FILTER=filter.discord builds a proxy granting the CREDENTIAL container
+    # Discord egress — the exact inversion the split exists to prevent. It also
+    # rejects path traversal (EXTRA_FILTER=../../etc/hostname would otherwise splice
+    # arbitrary file contents in as unanchored match patterns).
+    case "$EXTRA_FILTER" in \
+        "" | filter.pypi) ;; \
+        *) echo "build refused: EXTRA_FILTER must be empty or 'filter.pypi', got '$EXTRA_FILTER'" >&2; exit 1 ;; \
+    esac; \
+    case "$FILTER" in \
+        filter | filter.anthropic | filter.discord) ;; \
+        *) echo "build refused: FILTER must be one of filter, filter.anthropic, filter.discord; got '$FILTER'" >&2; exit 1 ;; \
+    esac; \
     if [ -n "$EXTRA_FILTER" ] && [ "$FILTER" != "filter.anthropic" ]; then \
         echo "build refused: EXTRA_FILTER=$EXTRA_FILTER requires FILTER=filter.anthropic (executor side of a split deployment), got FILTER=$FILTER" >&2; \
         exit 1; \
