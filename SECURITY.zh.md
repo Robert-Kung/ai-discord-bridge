@@ -58,7 +58,8 @@
 - **這套隔離只在你用內附容器部署時成立。** 設定路徑硬寫死 `/home/user/...`，但若
   某個 fork 在 host 上**裸跑** `bot.py`，mount 邊界就消失，`bypass` 會觸及你整個 `$HOME`。
 - **mount 隔離不等於網路隔離。** `bypass`/`edit` 可以把已掛載的資料 `curl`/POST 到任何
-  地方；deny family 以名稱擋掉 `curl`/`wget`/`WebFetch`，但堅決的 shell 仍可繞過（見 §6）。
+  地方；deny family 以名稱擋掉 `curl`/`wget`、`WebFetch` 限縮在釘死的網域 allow-list，
+  但堅決的 shell 仍可繞過——真正的邊界是 egress proxy 的 hostname allow-list（見 §6）。
 
 **推論：** 一個 fork 的安全性取決於它的 mount 清單。只掛載你願意讓頻道使用者讀取與
 修改的專案。
@@ -161,8 +162,19 @@ rw 的 `discord-state` volume：開了 Bash 的 exec agent 寫得到那裡，否
 "Read(//home/user/.claude-bot-a/**)", "Read(//home/user/.claude-bot-b/**)",
 "Read(//home/user/**/.credentials.json)",      // 憑證讀取，所有模式
 "Bash(env)", "Bash(env:*)", "Bash(printenv)", "Bash(printenv:*)",  // env dump
-"Bash(curl:*)", "Bash(wget:*)", "WebFetch"     // 任意網路抓取
+"Bash(curl:*)", "Bash(wget:*)"                 // 任意網路抓取
 ```
+
+`WebFetch` 不再整個 deny：allow 清單放行少數釘死的**唯讀文件**網域（docs.anthropic.com、
+Apple／Google 開發者文件），GET-only，與 egress proxy 的 allow-list 互為鏡像——proxy
+才是真正的執法點（settings 被改掉也會在 proxy 403）。這些是 exec tier 查上架／API 文件
+需要的；**可 publish 的 host（如 package registry）刻意不放**——proxy 是 CONNECT-only
+不拆 TLS，「可達」＝「任意 method＋body」，放行 registry 等於給 executor 手上的 OAuth
+憑證開一個全世界可讀的外洩出口。`WebSearch` 直接 allow：它在 server 端經
+`api.anthropic.com` 執行，不新增 *client* 端 egress——但它是 **egress proxy 看不到的
+通道**：被注入的 agent 可以把夾帶祕密的 query 從 Anthropic 的搜尋後端送出去，也能把
+攻擊者控制的結果頁拉回 context。請當作「低頻寬、在 proxy 邊界之外」的 egress，而非
+「無 egress」。
 
 Deny 規則在**每個模式都生效，含 bypass**（deny 永遠覆蓋），且已實測驗證：`Bash` deny
 會出現在 `permission_denials`；`Read` deny 回 *"File is in a directory that is denied by
@@ -192,8 +204,11 @@ canary** 證明（fail-closed）：
 webhook / CDN 上傳是**可用的 exfil sink**。所以 phase 1 把 egress 從「任何地方」收斂到
 「Anthropic 或 Discord」，能降低自主／注入驅動的外洩，但**不能**圍堵 OAuth 憑證。
 真正的圍堵是 **phase 2**：拆成 `discord-frontend` 容器（只有 Discord egress，持 bot
-token）與 `executor` 容器（只有 Anthropic egress，持憑證），讓每個 secret 都活在
-「另一個 secret 的 egress 到不了」的容器裡。Phase 2 **已在
+token）與 `executor` 容器（持憑證；egress 限於 `api.anthropic.com` 加一小串唯讀文件
+allow-list——見上方 WebFetch 說明），讓每個 secret 都活在「另一個 secret 的 egress
+到不了」的容器裡。文件 allow-list 全是 GET-only 唯讀目標、無 publish sink，不開憑證
+外洩路徑；圍堵保證是「executor 到不了 Discord、也到不了可寫的第三方 host」，不是字面
+「只有 Anthropic」。Phase 2 **已在
 `docker-compose.example.yml` 出貨**（executor 入口 `executor.py`；semantic-request IPC
 走共用 volume 上的 unix socket——argv/env 不跨界，executor 逐參數驗證；per-container
 filter `filter.anthropic`／`filter.discord`；每個容器啟動時跑自己的 canary 證明自己的

@@ -73,7 +73,8 @@ def test_egress_containment_does_not_alter_the_deny_family():
     assert any("credentials.json" in d for d in DENY)
     assert "Bash(env)" in DENY and any("printenv" in d for d in DENY)
     assert any(d.startswith("Bash(curl") for d in DENY)
-    assert "WebFetch" in DENY
-    # ...and WebSearch is NOT denied (it never was — the reviewed "un-deny" strand was a
-    # no-op against a settings.json that never contained it; nothing to give back).
+    # egress-allowlist-a (2026-07-20): WebFetch left the blanket deny for a
+    # domain-scoped allow (proxy filter is the enforcement); it must never come
+    # back as a blanket ALLOW either — that's covered in test_permissions.
+    assert "WebFetch" not in DENY
     assert not any("WebSearch" in d for d in DENY)

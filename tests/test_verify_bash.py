@@ -40,7 +40,7 @@ def test_m4_live_when_split_and_opted_in(monkeypatch):
 # ── 4.4 Bash allow keeps the deny family (deny outranks allow) ───────────────
 def test_exec_settings_adds_bash_allow_preserving_deny(tmp_path, monkeypatch):
     base = tmp_path / "settings.json"
-    deny = ["Read(//home/user/**/.credentials.json)", "Bash(curl)", "Bash(env)", "WebFetch"]
+    deny = ["Read(//home/user/**/.credentials.json)", "Bash(curl)", "Bash(env)", "Bash(wget)"]
     base.write_text(json.dumps({"permissions": {"deny": deny}}))
     out = tmp_path / "exec-settings.json"
     monkeypatch.setattr(config, "BRIDGE_SETTINGS_PATH", str(base))

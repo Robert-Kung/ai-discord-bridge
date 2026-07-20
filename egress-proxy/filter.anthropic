@@ -1,1 +1,5 @@
 ^api\.anthropic\.com$
+^docs\.anthropic\.com$
+^developer\.apple\.com$
+^developers\.google\.com$
+^support\.google\.com$
