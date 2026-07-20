@@ -58,7 +58,8 @@
 - **這套隔離只在你用內附容器部署時成立。** 設定路徑硬寫死 `/home/user/...`，但若
   某個 fork 在 host 上**裸跑** `bot.py`，mount 邊界就消失，`bypass` 會觸及你整個 `$HOME`。
 - **mount 隔離不等於網路隔離。** `bypass`/`edit` 可以把已掛載的資料 `curl`/POST 到任何
-  地方；deny family 以名稱擋掉 `curl`/`wget`/`WebFetch`，但堅決的 shell 仍可繞過（見 §6）。
+  地方；deny family 以名稱擋掉 `curl`/`wget`、`WebFetch` 限縮在釘死的網域 allow-list，
+  但堅決的 shell 仍可繞過——真正的邊界是 egress proxy 的 hostname allow-list（見 §6）。
 
 **推論：** 一個 fork 的安全性取決於它的 mount 清單。只掛載你願意讓頻道使用者讀取與
 修改的專案。
@@ -161,8 +162,13 @@ rw 的 `discord-state` volume：開了 Bash 的 exec agent 寫得到那裡，否
 "Read(//home/user/.claude-bot-a/**)", "Read(//home/user/.claude-bot-b/**)",
 "Read(//home/user/**/.credentials.json)",      // 憑證讀取，所有模式
 "Bash(env)", "Bash(env:*)", "Bash(printenv)", "Bash(printenv:*)",  // env dump
-"Bash(curl:*)", "Bash(wget:*)", "WebFetch"     // 任意網路抓取
+"Bash(curl:*)", "Bash(wget:*)"                 // 任意網路抓取
 ```
+
+`WebFetch` 不再整個 deny：allow 清單放行少數釘死的文件／registry 網域（與 egress
+proxy 的 allow-list 互為鏡像——proxy 才是真正的執法點，settings 被改掉也會在
+proxy 403）。`WebSearch` 直接 allow：它在 server 端經 `api.anthropic.com` 執行，
+不新增任何 client 端 egress。
 
 Deny 規則在**每個模式都生效，含 bypass**（deny 永遠覆蓋），且已實測驗證：`Bash` deny
 會出現在 `permission_denials`；`Read` deny 回 *"File is in a directory that is denied by

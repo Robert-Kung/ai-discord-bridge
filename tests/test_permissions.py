@@ -30,10 +30,35 @@ def test_settings_denies_env_dump():
     assert any("printenv" in d for d in DENY)
 
 
+ALLOW = SETTINGS["permissions"].get("allow", [])
+
+
 def test_settings_denies_network_fetch():
     assert any(d.startswith("Bash(curl") for d in DENY)
     assert any(d.startswith("Bash(wget") for d in DENY)
-    assert "WebFetch" in DENY
+    # egress-allowlist-a (2026-07-20): WebFetch moved from blanket deny to
+    # domain-scoped allow. No blanket grant, ever — every entry must pin a domain.
+    assert "WebFetch" not in DENY
+    assert "WebFetch" not in ALLOW
+    assert all(a.startswith("WebFetch(domain:") for a in ALLOW if a.startswith("WebFetch"))
+
+
+def test_webfetch_allow_domains_mirror_the_egress_filter():
+    # settings is advisory (claude silently drops an invalid file); the proxy filter is
+    # the enforcement. Every domain granted here MUST be tunnel-able, or WebFetch would
+    # pass permissions then 403 at the proxy — keep the two lists in lockstep.
+    import re
+    filter_lines = (REPO / "egress-proxy" / "filter.anthropic").read_text().split()
+    granted = [a[len("WebFetch(domain:"):-1] for a in ALLOW if a.startswith("WebFetch(domain:")]
+    assert granted, "option A expects at least one pinned WebFetch domain"
+    for domain in granted:
+        assert any(re.fullmatch(pat, domain, re.IGNORECASE) for pat in filter_lines), \
+            f"{domain} is allowed in settings.json but not tunnelable per filter.anthropic"
+
+
+def test_websearch_allowed_webfetch_never_blanket():
+    # WebSearch is server-side (api.anthropic.com) — no client egress, safe to allow.
+    assert "WebSearch" in ALLOW
 
 
 def test_settings_is_strict_json_no_unknown_top_keys():

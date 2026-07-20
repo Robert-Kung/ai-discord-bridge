@@ -1,1 +1,6 @@
 ^api\.anthropic\.com$
+^registry\.npmjs\.org$
+^docs\.anthropic\.com$
+^developer\.apple\.com$
+^developers\.google\.com$
+^support\.google\.com$

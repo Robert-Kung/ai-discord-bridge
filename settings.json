@@ -14,8 +14,15 @@
       "Bash(curl)",
       "Bash(curl:*)",
       "Bash(wget)",
-      "Bash(wget:*)",
-      "WebFetch"
+      "Bash(wget:*)"
+    ],
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:registry.npmjs.org)",
+      "WebFetch(domain:docs.anthropic.com)",
+      "WebFetch(domain:developer.apple.com)",
+      "WebFetch(domain:developers.google.com)",
+      "WebFetch(domain:support.google.com)"
     ]
   },
   "sandbox": {

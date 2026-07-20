@@ -70,8 +70,9 @@ Everything else in `$HOME` (`.ssh`, `.gnupg`, `Documents`, unrelated repos, …)
   `$HOME`.
 - **Mount isolation is not network isolation.** `bypass`/`edit` can `curl`/POST
   mounted data to anywhere; restricting the filesystem does not restrict egress
-  (the deny family blocks `curl`/`wget`/`WebFetch` by name, which a determined
-  shell can still evade — see §6).
+  (the deny family blocks `curl`/`wget` by name and `WebFetch` is limited to a
+  pinned domain allow-list, all of which a determined shell can still evade —
+  the egress proxy's hostname allow-list is the real boundary, see §6).
 
 **Corollary:** the security of a fork depends on the mount list. Mount only the
 projects you are willing to let channel users read and modify.
@@ -193,8 +194,14 @@ of credential/env/network denial — there is no longer a `--disallowedTools` fl
 "Read(//home/user/.claude-bot-a/**)", "Read(//home/user/.claude-bot-b/**)",
 "Read(//home/user/**/.credentials.json)",      // credential reads, all modes
 "Bash(env)", "Bash(env:*)", "Bash(printenv)", "Bash(printenv:*)",  // env dump
-"Bash(curl:*)", "Bash(wget:*)", "WebFetch"     // arbitrary network fetch
+"Bash(curl:*)", "Bash(wget:*)"                 // arbitrary network fetch
 ```
+
+`WebFetch` is not blanket-denied: the allow list grants it for a short list of
+pinned documentation/registry domains (mirroring the egress proxy's allow-list,
+which is the real enforcement — an un-listed domain 403s at the proxy even if a
+settings edit slipped). `WebSearch` is allowed: it executes server-side via
+`api.anthropic.com`, so it adds no client egress.
 
 Deny rules **win in every mode, including bypass** (deny always overrides), and
 were verified live: a `Bash` deny shows up in `permission_denials`; a `Read` deny
