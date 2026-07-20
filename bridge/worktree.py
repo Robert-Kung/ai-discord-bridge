@@ -79,7 +79,7 @@ async def commit_job(worktree: str, job_id: str, summary: str, base: str) -> boo
     branch now holds ANY work — a commit made here from leftover changes, or commits the
     agent made itself during the run (HEAD moved past base). False only when the branch
     is still exactly at base. Treating "clean staging" as "no work" lost a whole job's
-    self-committed output once (2026-07-18, drinkradar 158ecad) — never repeat that."""
+    self-committed output once (2026-07-18 live incident) — never repeat that."""
     await _git(worktree, "add", "-A")
     rc, _, _ = await _git(worktree, "diff", "--cached", "--quiet")
     if rc != 0:

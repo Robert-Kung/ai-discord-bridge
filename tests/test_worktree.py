@@ -56,8 +56,8 @@ def test_create_edit_commit_diff(project):
 
 
 def test_commit_job_detects_agent_self_commits(project):
-    # regression: 2026-07-18 an /opsx:apply agent committed its own work (158ecad) and
-    # the clean staging area was read as "no changes" → branch deleted, 1377 lines lost
+    # regression: 2026-07-18 an /opsx:apply agent committed its own work and the clean
+    # staging area was read as "no changes" → branch deleted, ~1.4k lines lost
     async def go():
         from pathlib import Path
         wt, branch, base = await worktree.create_job_worktree(project, "selfc1")
