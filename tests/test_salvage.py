@@ -92,3 +92,114 @@ def test_salvage_stages_uncommitted_leftovers_too(project):
         assert await _salvage_partial_work(job, chan, project, wt, "p") is True
         assert jobs.load_diff(job.id) and "wip.txt" in jobs.load_diff(job.id)
     asyncio.run(go())
+
+
+def test_salvage_parks_when_diff_check_errors_but_branch_has_commits(project, monkeypatch):
+    # H1 regression: a git error during the diff step must NOT be read as net-zero and
+    # delete a branch that holds the agent's committed work.
+    async def go():
+        from pathlib import Path
+        job = jobs.create_job("A", project, 1)
+        wt, branch, base = await worktree.create_job_worktree(project, job.id)
+        jobs.set_worktree(job, wt, branch, base)
+        Path(wt, "committed.txt").write_text("real work\n")
+        _run(wt, "git", "add", "-A")
+        _run(wt, "git", "-c", "user.name=a", "-c", "user.email=a@a", "commit", "-qm", "t1")
+        jobs.set_status(job, jobs.TIMEOUT)
+
+        async def _boom(*a, **k):
+            return None  # git couldn't answer
+
+        monkeypatch.setattr(worktree, "diff_is_empty", _boom)
+        chan = _Chan()
+        assert await _salvage_partial_work(job, chan, project, wt, "p") is True
+        assert job.status == jobs.AWAITING_REVIEW
+        assert await worktree.branch_head(project, job.id) != base  # branch preserved
+    asyncio.run(go())
+
+
+def test_salvage_parks_when_commit_raises_after_self_commit(project, monkeypatch):
+    # M1 regression: commit_job raising (e.g. a failing pre-commit hook on leftovers)
+    # AFTER the agent already self-committed must still park, not discard.
+    async def go():
+        from pathlib import Path
+        job = jobs.create_job("A", project, 1)
+        wt, branch, base = await worktree.create_job_worktree(project, job.id)
+        jobs.set_worktree(job, wt, branch, base)
+        Path(wt, "committed.txt").write_text("real work\n")
+        _run(wt, "git", "add", "-A")
+        _run(wt, "git", "-c", "user.name=a", "-c", "user.email=a@a", "commit", "-qm", "t1")
+        jobs.set_status(job, jobs.TIMEOUT)
+
+        async def _raise(*a, **k):
+            raise worktree.WorktreeError("commit failed: hook rejected")
+
+        monkeypatch.setattr(worktree, "commit_job", _raise)
+        chan = _Chan()
+        assert await _salvage_partial_work(job, chan, project, wt, "p") is True
+        assert job.status == jobs.AWAITING_REVIEW
+        assert await worktree.branch_head(project, job.id) != base
+    asyncio.run(go())
+
+
+def test_salvage_true_net_zero_returns_false(project):
+    # commit that cancels out (add then remove) → proven net-zero → nothing to salvage
+    async def go():
+        from pathlib import Path
+        job = jobs.create_job("A", project, 1)
+        wt, branch, base = await worktree.create_job_worktree(project, job.id)
+        jobs.set_worktree(job, wt, branch, base)
+        f = Path(wt, "a.txt")
+        orig = f.read_text()
+        f.write_text("changed\n")
+        _run(wt, "git", "add", "-A")
+        _run(wt, "git", "-c", "user.name=a", "-c", "user.email=a@a", "commit", "-qm", "c1")
+        f.write_text(orig)  # revert
+        _run(wt, "git", "add", "-A")
+        _run(wt, "git", "-c", "user.name=a", "-c", "user.email=a@a", "commit", "-qm", "c2")
+        jobs.set_status(job, jobs.TIMEOUT)
+        chan = _Chan()
+        assert await _salvage_partial_work(job, chan, project, wt, "p") is False
+    asyncio.run(go())
+
+
+def test_rescue_committed_orphans_survives_gc(project):
+    # M2: end-to-end startup rescue — a running-orphan with a committed branch must be
+    # parked (registered awaiting-review) AND survive the subsequent gc_project.
+    async def go():
+        from pathlib import Path
+        job = jobs.create_job("B", project, 1)
+        wt, branch, base = await worktree.create_job_worktree(project, job.id)
+        jobs.set_worktree(job, wt, branch, base)
+        Path(wt, "work.txt").write_text("committed by agent\n")
+        _run(wt, "git", "add", "-A")
+        _run(wt, "git", "-c", "user.name=a", "-c", "user.email=a@a", "commit", "-qm", "t")
+        jobs.reset_registry_for_tests()          # simulate restart: registry gone, mirror stays
+        _, orphans = jobs.recover_jobs()          # running → orphaned, returned not registered
+        assert [j.id for j in orphans] == [job.id]
+
+        n = await jobs.rescue_committed_orphans(orphans)
+        assert n == 1
+        reloaded = jobs.get_job(job.id)
+        assert reloaded is not None and reloaded.status == jobs.AWAITING_REVIEW
+
+        keep = jobs.awaiting_review_ids_by_project()
+        await worktree.gc_project(project, keep.get(project, set()))
+        assert await worktree.branch_head(project, job.id) is not None  # branch survived GC
+    asyncio.run(go())
+
+
+def test_rescue_skips_non_git_and_base_only_orphans(project):
+    async def go():
+        # non-git orphan (no branch/base) is skipped
+        j1 = jobs.create_job("A", project, 1)  # no set_worktree → branch/base None
+        # base-only orphan (branch exists but at base) is left for the GC
+        j2 = jobs.create_job("A", project, 1)
+        wt, branch, base = await worktree.create_job_worktree(project, j2.id)
+        jobs.set_worktree(j2, wt, branch, base)  # no commits on the branch
+        jobs.reset_registry_for_tests()
+        _, orphans = jobs.recover_jobs()
+        n = await jobs.rescue_committed_orphans(orphans)
+        assert n == 0
+        assert jobs.get_job(j1.id) is None and jobs.get_job(j2.id) is None
+    asyncio.run(go())

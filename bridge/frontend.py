@@ -326,25 +326,32 @@ async def _drive_exec_job(job, message: discord.Message, bot_name: str, prompt: 
         if upd:
             await upd
             upd = None
+        # `await upd` yielded — a !cancel landing in that window must win over a
+        # timeout/failed classification, else salvage would park work the operator
+        # explicitly threw away (L1). Re-read the authoritative status once more.
+        if kind != "cancelled" and job.status == jobs.CANCELLED:
+            kind = "cancelled"
 
         if kind != "done":
-            note = {
-                "cancelled": f"🛑 **[job `{job.id}`]** 已取消（worktree 變更已丟棄）",
-                "timeout": f"⏱️ **[job `{job.id}`]** 逾時（{config.EXEC_TIMEOUT}s）→ 已終止 process group，變更丟棄",
+            base_note = {
+                "cancelled": f"🛑 **[job `{job.id}`]** 已取消",
+                "timeout": f"⏱️ **[job `{job.id}`]** 逾時（{config.EXEC_TIMEOUT}s）→ 已終止 process group",
                 "failed": f"❌ **[job `{job.id}`]** 執行失敗（無結果）",
             }[kind]
             jobs.set_status(job, {"cancelled": jobs.CANCELLED, "timeout": jobs.TIMEOUT,
                                   "failed": jobs.FAILED}[kind])
+            disposition = ""
             if use_worktree:
                 # timeout/failed can strand real work in the branch (an /opsx:apply run
                 # commits per task) — salvage it for review instead of deleting. A
                 # cancel is an explicit "throw this away": discard unconditionally.
                 if kind in ("timeout", "failed") and await _salvage_partial_work(
                         job, channel, cwd, workdir, prompt):
-                    note += f"（部分成果已保留待審：`!merge {job.id}` / `!discard {job.id}`）"
+                    disposition = f"（部分成果已保留待審：`!merge {job.id}` / `!discard {job.id}`）"
                 else:
                     await worktree.discard_job(cwd, job.id)
-            await _safe_edit(status_msg, note)
+                    disposition = "（worktree 變更已丟棄）"
+            await _safe_edit(status_msg, base_note + disposition)
             return
 
         # DONE — post the agent's textual reply first, then gate the file changes.
@@ -366,14 +373,15 @@ async def _drive_exec_job(job, message: discord.Message, bot_name: str, prompt: 
             await worktree.discard_job(cwd, job.id)
             return
         committed = True  # branch now holds real work — never auto-discard it below
-        stat, full = await worktree.job_diff(cwd, job.base, job.id)
-        if not full.strip():
-            # commits exist but they cancel out (e.g. change + revert) — nothing to
-            # review or merge; this is the one deliberate discard of a moved branch.
+        # The ONLY post-commit discard is a TRUE net-zero diff, proven by `git diff
+        # --quiet` rc — never by an empty job_diff string (a git error yields "" too and
+        # would delete committed work; H1 2026-07-20). None (git couldn't answer) → keep.
+        if await worktree.diff_is_empty(cwd, job.base, job.id) is True:
             jobs.set_status(job, jobs.DONE)
             await channel.send(f"（job `{job.id}`：分支有 commit 但相對 base 無淨變更，無 diff 可審）")
             await worktree.discard_job(cwd, job.id)
             return
+        stat, full = await worktree.job_diff(cwd, job.base, job.id)
         jobs.save_diff(job, full)
         # M4 post-task verification (phase-2 gated): run the per-project verify command
         # in the executor (contained egress + stripped env) and post the outcome above
@@ -421,24 +429,51 @@ async def _drive_exec_job(job, message: discord.Message, bot_name: str, prompt: 
                         pass
 
 
+async def _branch_has_commits(project: str, job_id: str, base: "str | None") -> bool:
+    """True iff bridge/<id> exists and its tip moved past base (real committed work).
+    The single safe primitive for 'must not delete this branch'."""
+    if not base:
+        return False
+    try:
+        head = await worktree.branch_head(project, job_id)
+        return head is not None and head != base
+    except Exception:
+        return False
+
+
 async def _salvage_partial_work(job, channel, project: str, workdir: str, prompt: str) -> bool:
     """A timed-out/failed run may leave real work behind — uncommitted in the worktree or
     already committed on the branch by the agent itself. Commit and park it as
     awaiting-review (branch survives, worktree removed) instead of deleting it. Returns
-    True when work was parked; False → the caller discards as before."""
+    True when work was parked; False → the caller discards. Fails SAFE: if the branch
+    already holds commits, park even when the diff step errors (H1) or commit_job raises
+    (M1) — never report False for a branch that moved past base."""
     try:
         if not await worktree.commit_job(workdir, job.id, prompt, job.base):
+            # nothing committed and nothing to commit — unless the agent already
+            # self-committed and commit_job saw a clean tree at base; branch check covers it
+            if not await _branch_has_commits(project, job.id, job.base):
+                return False
+        # commits exist. Only a PROVEN net-zero diff means nothing to review; a git error
+        # (None) must NOT discard committed work.
+        if await worktree.diff_is_empty(project, job.base, job.id) is True:
             return False
         stat, full = await worktree.job_diff(project, job.base, job.id)
-        if not full.strip():
-            return False
         jobs.save_diff(job, full)
         jobs.set_status(job, jobs.AWAITING_REVIEW)
     except Exception:
         log.exception("salvage of job %s failed", job.id)
-        # if parking already happened, the branch holds work — do NOT let the caller
-        # discard it over a late hiccup
-        return job.status == jobs.AWAITING_REVIEW
+        # never let a mid-salvage error delete a branch that holds commits
+        if job.status == jobs.AWAITING_REVIEW or await _branch_has_commits(project, job.id, job.base):
+            jobs.set_status(job, jobs.AWAITING_REVIEW)
+            try:
+                await channel.send(
+                    f"🅿️ job `{job.id}` 中斷、救援時出錯但分支已有 commit → 保留待審"
+                    f"（`!merge {job.id}` / `!discard {job.id}`）")
+            except Exception:
+                pass
+            return True
+        return False
     try:
         await worktree.remove_worktree(project, job.id)
     except Exception:

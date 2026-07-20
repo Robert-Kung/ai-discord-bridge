@@ -140,6 +140,20 @@ async def branch_head(project: str, job_id: str) -> "str | None":
     return out.strip() if rc == 0 else None
 
 
+async def diff_is_empty(project: str, base: str, job_id: str) -> "bool | None":
+    """Reliable net-zero test for base..bridge/<id> via `git diff --quiet`: rc 0 = no
+    net change (truly net-zero), rc 1 = real changes, anything else (128/timeout/124) =
+    git could not answer → None. Callers MUST NOT discard on None: an empty `job_diff`
+    string is produced by BOTH net-zero and a git error, and conflating them re-opens the
+    committed-work-deleted hole this module exists to close (H1, 2026-07-20 review)."""
+    rc, _, _ = await _git(project, "diff", "--quiet", f"{base}..{branch_name(job_id)}")
+    if rc == 0:
+        return True
+    if rc == 1:
+        return False
+    return None
+
+
 async def remove_worktree(project: str, job_id: str) -> None:
     """Remove the worktree working copy (the branch survives)."""
     wt = worktree_path(project, job_id)

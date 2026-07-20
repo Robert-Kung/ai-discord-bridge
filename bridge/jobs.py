@@ -234,6 +234,41 @@ def rescue_orphan(job: Job) -> None:
     _persist(job)
 
 
+async def rescue_committed_orphans(orphans: "list[Job]") -> int:
+    """Startup step: for each orphaned job whose bridge/<id> branch moved past base
+    (committed work from a run cut short by the restart), park it awaiting-review and
+    persist its diff so the GC keeps the branch and !merge/!discard still work. A
+    non-git orphan (no branch/base) is skipped; a branch still at base is left for the
+    GC; an unknowable git state is parked fail-safe (a bogus park is one !discard from
+    clean). Returns the count rescued. Imported lazily to avoid a jobs↔worktree cycle."""
+    from bridge import worktree
+    rescued = 0
+    for job in orphans:
+        if not (job.branch and job.base):
+            continue
+        try:
+            head = await worktree.branch_head(job.project, job.id)
+            if head is None or head == job.base:
+                continue  # branch at base → nothing committed → let the GC take it
+            if await worktree.diff_is_empty(job.project, job.base, job.id) is True:
+                continue  # commits that net to zero → nothing to review
+            _, full = await worktree.job_diff(job.project, job.base, job.id)
+            rescue_orphan(job)
+            save_diff(job, full)
+            try:
+                await worktree.remove_worktree(job.project, job.id)
+            except Exception:
+                pass
+            rescued += 1
+            log.info("rescued orphaned job %s (branch bridge/%s holds committed work)",
+                     job.id, job.id)
+        except Exception:
+            log.exception("orphan rescue check failed for job %s — parking to be safe", job.id)
+            rescue_orphan(job)
+            rescued += 1
+    return rescued
+
+
 def gc_job_state(keep_ids: "set[str]") -> int:
     """Remove on-disk job state (the `<id>.json` mirror and the `<id>/` dir holding
     attachments + diff.patch) for every job NOT in keep_ids. Called at startup with the

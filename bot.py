@@ -30,31 +30,9 @@ async def main():
     # stale bridge/<id> worktrees + branches — keeping only the awaiting-review ones.
     _, _orphans = jobs.recover_jobs()
     # An orphaned job whose branch moved past base holds committed work (an agent
-    # commits per task during long runs) — park it for !merge/!discard instead of
-    # letting the GC below delete the branch.
-    for _job in _orphans:
-        if not (_job.branch and _job.base):
-            continue
-        try:
-            _head = await worktree.branch_head(_job.project, _job.id)
-            if _head is None or _head == _job.base:
-                continue
-            _, _full = await worktree.job_diff(_job.project, _job.base, _job.id)
-            if not _full.strip():
-                continue
-            jobs.rescue_orphan(_job)
-            jobs.save_diff(_job, _full)
-            try:
-                await worktree.remove_worktree(_job.project, _job.id)
-            except Exception:
-                pass
-            log.info("rescued orphaned job %s (branch bridge/%s holds committed work)",
-                     _job.id, _job.id)
-        except Exception:
-            # unknown git state — park anyway so the GC can't delete a branch that may
-            # hold work; a bogus park is one !discard away from clean
-            log.exception("orphan rescue check failed for job %s — parking to be safe", _job.id)
-            jobs.rescue_orphan(_job)
+    # commits per task during long runs) — park it for !merge/!discard BEFORE the GC
+    # below (which computes _keep after this) can delete the branch.
+    await jobs.rescue_committed_orphans(_orphans)
     _keep = jobs.awaiting_review_ids_by_project()
     for _project in {str(p) for p in config.PROJECT_DIRS}:
         try:
