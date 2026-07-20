@@ -75,17 +75,23 @@ async def create_job_worktree(project: str, job_id: str) -> tuple[str, str, str]
 
 
 async def commit_job(worktree: str, job_id: str, summary: str, base: str) -> bool:
-    """Stage everything in the worktree and commit to its branch. Returns True if a commit
-    was made, False if the agent left no changes (nothing to review)."""
+    """Stage everything in the worktree and commit to its branch. Returns True if the
+    branch now holds ANY work — a commit made here from leftover changes, or commits the
+    agent made itself during the run (HEAD moved past base). False only when the branch
+    is still exactly at base. Treating "clean staging" as "no work" lost a whole job's
+    self-committed output once (2026-07-18 live incident) — never repeat that."""
     await _git(worktree, "add", "-A")
     rc, _, _ = await _git(worktree, "diff", "--cached", "--quiet")
-    if rc == 0:
-        return False  # no staged changes
-    msg = f"bridge job {job_id}\n\n{summary.strip()[:500]}\n\nBase: {base}"
-    rc, _, err = await _git(worktree, *_COMMITTER, "commit", "-m", msg)
     if rc != 0:
-        raise WorktreeError(f"commit failed: {err.strip()}")
-    return True
+        msg = f"bridge job {job_id}\n\n{summary.strip()[:500]}\n\nBase: {base}"
+        rc, _, err = await _git(worktree, *_COMMITTER, "commit", "-m", msg)
+        if rc != 0:
+            raise WorktreeError(f"commit failed: {err.strip()}")
+        return True
+    rc, head, err = await _git(worktree, "rev-parse", "HEAD")
+    if rc != 0:
+        raise WorktreeError(f"rev-parse HEAD failed: {err.strip()}")
+    return head.strip() != base
 
 
 async def job_diff(project: str, base: str, job_id: str) -> tuple[str, str]:
@@ -126,6 +132,26 @@ async def merge_job(project: str, job_id: str, base: str) -> tuple[str, str]:
         return ("merged", out.strip())
     await _git(project, "merge", "--abort")
     return ("conflict", (err or out).strip())
+
+
+async def branch_head(project: str, job_id: str) -> "str | None":
+    """Commit hash at the tip of bridge/<id>, or None if the branch does not exist."""
+    rc, out, _ = await _git(project, "rev-parse", "refs/heads/" + branch_name(job_id))
+    return out.strip() if rc == 0 else None
+
+
+async def diff_is_empty(project: str, base: str, job_id: str) -> "bool | None":
+    """Reliable net-zero test for base..bridge/<id> via `git diff --quiet`: rc 0 = no
+    net change (truly net-zero), rc 1 = real changes, anything else (128/timeout/124) =
+    git could not answer → None. Callers MUST NOT discard on None: an empty `job_diff`
+    string is produced by BOTH net-zero and a git error, and conflating them re-opens the
+    committed-work-deleted hole this module exists to close (H1, 2026-07-20 review)."""
+    rc, _, _ = await _git(project, "diff", "--quiet", f"{base}..{branch_name(job_id)}")
+    if rc == 0:
+        return True
+    if rc == 1:
+        return False
+    return None
 
 
 async def remove_worktree(project: str, job_id: str) -> None:

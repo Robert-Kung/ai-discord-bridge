@@ -55,6 +55,50 @@ def test_create_edit_commit_diff(project):
     asyncio.run(go())
 
 
+def test_commit_job_detects_agent_self_commits(project):
+    # regression: 2026-07-18 an /opsx:apply agent committed its own work and the clean
+    # staging area was read as "no changes" → branch deleted, ~1.4k lines lost
+    async def go():
+        from pathlib import Path
+        wt, branch, base = await worktree.create_job_worktree(project, "selfc1")
+        Path(wt, "feature.txt").write_text("real work\n")
+        _run(wt, "git", "add", "-A")
+        _run(wt, "git", "-c", "user.name=agent", "-c", "user.email=a@a",
+             "commit", "-qm", "task 1 done")
+        assert await worktree.commit_job(wt, "selfc1", "apply", base) is True
+        stat, full = await worktree.job_diff(project, base, "selfc1")
+        assert "feature.txt" in stat and "+real work" in full
+    asyncio.run(go())
+
+
+def test_commit_job_self_commit_plus_leftover_changes(project):
+    async def go():
+        from pathlib import Path
+        wt, branch, base = await worktree.create_job_worktree(project, "selfc2")
+        Path(wt, "one.txt").write_text("committed\n")
+        _run(wt, "git", "add", "-A")
+        _run(wt, "git", "-c", "user.name=agent", "-c", "user.email=a@a",
+             "commit", "-qm", "task 1")
+        Path(wt, "two.txt").write_text("uncommitted\n")
+        assert await worktree.commit_job(wt, "selfc2", "apply", base) is True
+        _, full = await worktree.job_diff(project, base, "selfc2")
+        assert "+committed" in full and "+uncommitted" in full
+    asyncio.run(go())
+
+
+def test_branch_head_reports_tip_or_none(project):
+    async def go():
+        wt, branch, base = await worktree.create_job_worktree(project, "bh1")
+        assert await worktree.branch_head(project, "bh1") == base
+        from pathlib import Path
+        Path(wt, "x.txt").write_text("x\n")
+        await worktree.commit_job(wt, "bh1", "e", base)
+        head = await worktree.branch_head(project, "bh1")
+        assert head is not None and head != base
+        assert await worktree.branch_head(project, "nosuchjob") is None
+    asyncio.run(go())
+
+
 def test_commit_job_no_changes_returns_false(project):
     async def go():
         wt, branch, base = await worktree.create_job_worktree(project, "nochg")

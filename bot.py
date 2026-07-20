@@ -28,7 +28,11 @@ async def main():
     # Recover exec jobs from the previous container: mark orphaned running jobs, reload
     # awaiting-review jobs into the registry (so !merge/!discard keep working), then GC
     # stale bridge/<id> worktrees + branches — keeping only the awaiting-review ones.
-    jobs.recover_jobs()
+    _, _orphans = jobs.recover_jobs()
+    # An orphaned job whose branch moved past base holds committed work (an agent
+    # commits per task during long runs) — park it for !merge/!discard BEFORE the GC
+    # below (which computes _keep after this) can delete the branch.
+    await jobs.rescue_committed_orphans(_orphans)
     _keep = jobs.awaiting_review_ids_by_project()
     for _project in {str(p) for p in config.PROJECT_DIRS}:
         try:
