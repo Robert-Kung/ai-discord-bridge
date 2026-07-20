@@ -189,12 +189,14 @@ async def cancel_job(job: Job) -> bool:
     return True
 
 
-def recover_jobs() -> list[Job]:
+def recover_jobs() -> "tuple[list[Job], list[Job]]":
     """At startup, read the on-disk mirror: mark any job left `running` as orphaned (its
     process died with the previous container), and RELOAD `awaiting_review` jobs into the
-    in-memory registry so `!merge`/`!discard` keep working across a restart. Returns the
-    reloaded awaiting-review jobs (their branch + persisted diff survive on disk)."""
-    orphaned = 0
+    in-memory registry so `!merge`/`!discard` keep working across a restart. Returns
+    (awaiting, orphaned). Orphaned jobs are NOT registered — but they are returned so the
+    caller can inspect their branch for committed work and rescue it (park as
+    awaiting-review) before the startup GC deletes the branch."""
+    orphans: list[Job] = []
     awaiting: list[Job] = []
     for p in _jobs_dir().glob("*.json"):
         try:
@@ -206,7 +208,7 @@ def recover_jobs() -> list[Job]:
             data["status"] = ORPHANED
             try:
                 p.write_text(json.dumps(data, ensure_ascii=False))
-                orphaned += 1
+                orphans.append(Job.from_dict(data))
             except OSError:
                 pass
         elif status in (AWAITING_REVIEW, MERGING):
@@ -217,11 +219,19 @@ def recover_jobs() -> list[Job]:
             job = Job.from_dict(data)
             _registry[job.id] = job
             awaiting.append(job)
-    if orphaned:
-        log.info("recovered %d orphaned job(s) from a previous run", orphaned)
+    if orphans:
+        log.info("recovered %d orphaned job(s) from a previous run", len(orphans))
     if awaiting:
         log.info("reloaded %d awaiting-review job(s)", len(awaiting))
-    return awaiting
+    return awaiting, orphans
+
+
+def rescue_orphan(job: Job) -> None:
+    """Re-register an orphaned job as awaiting-review: its branch holds committed work
+    that must reach the !merge/!discard gate instead of the startup GC."""
+    job.status = AWAITING_REVIEW
+    _registry[job.id] = job
+    _persist(job)
 
 
 def gc_job_state(keep_ids: "set[str]") -> int:

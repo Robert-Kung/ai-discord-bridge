@@ -203,7 +203,9 @@ ai-discord-bridge/
 
 ### 6.1 背景 job + 串流（M1）
 - job registry：記憶體 dict + `discord-state/jobs/` JSON mirror；重啟後 running → `orphaned`、
-  待審 job 重載回 registry。每專案同時最多 **1 個** exec job（含待審——防從未審 HEAD 再分支）。
+  待審 job 重載回 registry。orphan 若分支已有 commit（HEAD ≠ base）→ **救回為待審**
+  （diff 落盤、worktree 移除、分支保留），不會被啟動 GC 收走。
+  每專案同時最多 **1 個** exec job（含待審——防從未審 HEAD 再分支）。
 - `claude -p --output-format stream-json --verbose` 串流；狀態訊息以 reply 貼出、
   ≤1 edit / `EXEC_STATUS_EDIT_INTERVAL` 秒節流，帶 job id 與 `!cancel` 提示。
 - `EXEC_TIMEOUT`（預設 1800s）獨立於 `CLAUDE_TIMEOUT`；逾時/取消都 kill 整個 process group。
@@ -214,6 +216,9 @@ ai-discord-bridge/
   **live checkout 全程不被碰**。subprocess cwd = worktree，但 session/鎖/token 記帳仍 key 在專案。
 - 完成後 commit 到分支 → 貼 `--stat` + 完整 diff（≤1500 字 inline，否則 `.txt` 附件）→
   ✅ 合併 / ❌ 丟棄。逾時無人審 → **park 為待審**（永不自動丟棄），`!merge`/`!discard` 處理。
+- 「有無變更」判定 = staged 變更 **或 branch HEAD ≠ base**——agent 自行 commit（如
+  `/opsx:apply` 逐 task commit）一樣進審查門，不會被當「無變更」丟棄。
+  job 逾時/失敗時若 worktree 或分支已有成果 → commit + park 為待審（僅 `!cancel` 無條件丟棄）。
 - 合併協定：持專案鎖；live tree `git status --porcelain` 不乾淨 → 拒絕（分支保留）；
   衝突 → `git merge --abort` + 回報 + 保留分支；永不 force。
 - 啟動 GC：`git worktree prune` + 清掉非待審的 `bridge/<id>` 分支/worktree/job 狀態。
@@ -410,9 +415,7 @@ rm ~/.claude-shared/discord-state/A__*.json
    split 下容器內憑證 :ro，refresh 由 host 保鮮）
 2. **單頻道**：寫死單一 `DISCORD_CHANNEL_ID`，多頻道未支援；turn 計數也是單一全域計數器
 3. **重啟遺失記憶體狀態**：進行中的 plan 確認、buffer、turn 計數重啟即消失（session/summary/待審 job 皆持久）
-4. **restart 邊界的 committed-ungated 工作**：job 完成 commit 後、diff 貼出前重啟 →
-   該分支不在待審清單、會被啟動 GC 收走（M5 審查已知 finding，M6+ 再議）
-5. **無 rate limiting**：白名單使用者可自由花額度；`MAX_BOT_TURNS` 只管 bot↔bot
+4. **無 rate limiting**：白名單使用者可自由花額度；`MAX_BOT_TURNS` 只管 bot↔bot
 
 ### 主要里程碑（已完成，細節見 openspec/）
 - **v2**：雙帳號聊天室 + 權限模式 + plan-then-execute
@@ -437,7 +440,6 @@ rm ~/.claude-shared/discord-state/A__*.json
 
 ### Backlog（未來）
 - API 計費優先序實證（spend-capped key 對帳 console）
-- restart 邊界 orphan 分支的保守 GC（上表限制 4）
 - 多頻道路由 + per-channel turn budget
 - 目錄名含結尾空格的舊專案：改名去空格後再納入白名單
 

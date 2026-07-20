@@ -335,9 +335,16 @@ async def _drive_exec_job(job, message: discord.Message, bot_name: str, prompt: 
             }[kind]
             jobs.set_status(job, {"cancelled": jobs.CANCELLED, "timeout": jobs.TIMEOUT,
                                   "failed": jobs.FAILED}[kind])
-            await _safe_edit(status_msg, note)
             if use_worktree:
-                await worktree.discard_job(cwd, job.id)
+                # timeout/failed can strand real work in the branch (an /opsx:apply run
+                # commits per task) — salvage it for review instead of deleting. A
+                # cancel is an explicit "throw this away": discard unconditionally.
+                if kind in ("timeout", "failed") and await _salvage_partial_work(
+                        job, channel, cwd, workdir, prompt):
+                    note += f"（部分成果已保留待審：`!merge {job.id}` / `!discard {job.id}`）"
+                else:
+                    await worktree.discard_job(cwd, job.id)
+            await _safe_edit(status_msg, note)
             return
 
         # DONE — post the agent's textual reply first, then gate the file changes.
@@ -360,6 +367,13 @@ async def _drive_exec_job(job, message: discord.Message, bot_name: str, prompt: 
             return
         committed = True  # branch now holds real work — never auto-discard it below
         stat, full = await worktree.job_diff(cwd, job.base, job.id)
+        if not full.strip():
+            # commits exist but they cancel out (e.g. change + revert) — nothing to
+            # review or merge; this is the one deliberate discard of a moved branch.
+            jobs.set_status(job, jobs.DONE)
+            await channel.send(f"（job `{job.id}`：分支有 commit 但相對 base 無淨變更，無 diff 可審）")
+            await worktree.discard_job(cwd, job.id)
+            return
         jobs.save_diff(job, full)
         # M4 post-task verification (phase-2 gated): run the per-project verify command
         # in the executor (contained egress + stripped env) and post the outcome above
@@ -405,6 +419,39 @@ async def _drive_exec_job(job, message: discord.Message, bot_name: str, prompt: 
                         await worktree.discard_job(cwd, job.id)
                     except Exception:
                         pass
+
+
+async def _salvage_partial_work(job, channel, project: str, workdir: str, prompt: str) -> bool:
+    """A timed-out/failed run may leave real work behind — uncommitted in the worktree or
+    already committed on the branch by the agent itself. Commit and park it as
+    awaiting-review (branch survives, worktree removed) instead of deleting it. Returns
+    True when work was parked; False → the caller discards as before."""
+    try:
+        if not await worktree.commit_job(workdir, job.id, prompt, job.base):
+            return False
+        stat, full = await worktree.job_diff(project, job.base, job.id)
+        if not full.strip():
+            return False
+        jobs.save_diff(job, full)
+        jobs.set_status(job, jobs.AWAITING_REVIEW)
+    except Exception:
+        log.exception("salvage of job %s failed", job.id)
+        # if parking already happened, the branch holds work — do NOT let the caller
+        # discard it over a late hiccup
+        return job.status == jobs.AWAITING_REVIEW
+    try:
+        await worktree.remove_worktree(project, job.id)
+    except Exception:
+        pass
+    base8 = (job.base or "")[:8]
+    try:
+        await channel.send(
+            f"🅿️ job `{job.id}` 中斷但已有成果 → 保留待審（`!merge {job.id}` / "
+            f"`!discard {job.id}`）\n```\n{stat[:1200]}\n```"
+            f"完整 diff：`git diff {base8}..bridge/{job.id}`")
+    except Exception:
+        pass
+    return True
 
 
 async def _post_verify(job, channel, project: str) -> None:
