@@ -36,7 +36,8 @@ Discord control plane** 的參考實作——不是即裝即用的產品。每�
   人工核可 tier（MCP approver），`bypass` 未 opt-in 時結構性不可達；fail-closed 授權 +
   prompt injection 隔離 + canary 驗證過的憑證讀取 deny family（見 [SECURITY.zh.md](SECURITY.zh.md)）
 - **egress 圍堵（雙容器 split）**：`discord-frontend`（只能連 Discord，持 bot token）與
-  `executor`（只能連 Anthropic，持 Claude 憑證）各自跑在 routeless internal 網路、
+  `executor`（持 Claude 憑證；egress 限 `api.anthropic.com` 加一小串 GET-only 唯讀文件
+  allow-list，無可 publish 的 host，見 [SECURITY.md](SECURITY.md) §6）各自跑在 routeless internal 網路、
   各配一個 default-deny proxy——每個 secret 所在容器的網路都到不了另一個 secret 的
   用武之地。開機 canary fail-closed 證明各自的 deny 方向。
 

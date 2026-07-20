@@ -1,4 +1,8 @@
 ^api\.anthropic\.com$
+^docs\.anthropic\.com$
+^developer\.apple\.com$
+^developers\.google\.com$
+^support\.google\.com$
 ^gateway\.discord\.gg$
 ^[a-z0-9.-]*\.discord\.gg$
 ^discord\.com$

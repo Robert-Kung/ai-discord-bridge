@@ -197,11 +197,19 @@ of credential/env/network denial — there is no longer a `--disallowedTools` fl
 "Bash(curl:*)", "Bash(wget:*)"                 // arbitrary network fetch
 ```
 
-`WebFetch` is not blanket-denied: the allow list grants it for a short list of
-pinned documentation/registry domains (mirroring the egress proxy's allow-list,
-which is the real enforcement — an un-listed domain 403s at the proxy even if a
-settings edit slipped). `WebSearch` is allowed: it executes server-side via
-`api.anthropic.com`, so it adds no client egress.
+`WebFetch` is not blanket-denied: the allow list grants it (GET-only) for a short
+list of pinned **read-only documentation** domains (docs.anthropic.com, Apple/Google
+developer docs), mirroring the egress proxy's allow-list — the proxy is the real
+enforcement (an un-listed domain 403s even if a settings edit slipped). These hosts
+were chosen for the app-store/API-doc lookups the exec tier needs; a **publish-capable
+host (e.g. a package registry) is deliberately NOT on this list**, because the proxy
+is CONNECT-only (no TLS bump) so "reachable" means "arbitrary method + body" — an
+allowed registry would be a world-readable exfil sink for the OAuth credential the
+executor holds. `WebSearch` is allowed: it runs server-side at `api.anthropic.com`,
+so it adds no *client* egress — but note it is a channel the egress proxy cannot see:
+an injected agent can drive secret-bearing search queries out through Anthropic's
+search backend, and pull attacker-controlled result pages back into context. Treat it
+as low-bandwidth egress that lives OUTSIDE the proxy boundary, not as "no egress."
 
 Deny rules **win in every mode, including bypass** (deny always overrides), and
 were verified live: a `Bash` deny shows up in `permission_denials`; a `Read` deny
@@ -236,8 +244,12 @@ Discord hosts the bridge process needs (`discord.com`, `cdn.discordapp.com`, `ga
 collapses egress from "anywhere" to "Anthropic or Discord", which reduces autonomous /
 injection-driven exfil but does **not** contain the OAuth credential. Real containment is
 **phase 2**: split into a `discord-frontend` container (Discord egress only, bot tokens)
-and an `executor` container (Anthropic egress only, credentials) so each secret lives
-where the *other* secret's egress can't reach. Phase 2 is **shipped in
+and an `executor` container (credentials; egress limited to `api.anthropic.com` plus a
+short read-only doc allow-list — see the WebFetch note above) so each secret lives
+where the *other* secret's egress can't reach. The doc allow-list is GET-only read
+targets and carries no publish sink, so it does not open a credential exfil path; the
+containment guarantee is "the executor cannot reach Discord and cannot reach a
+write-capable third-party host," not literally "Anthropic only." Phase 2 is **shipped in
 `docker-compose.example.yml`** (executor entrypoint `executor.py`; semantic-request IPC
 over a shared-volume unix socket — no argv/env crosses it, the executor validates every
 parameter; per-container filters `filter.anthropic`/`filter.discord`; each container
