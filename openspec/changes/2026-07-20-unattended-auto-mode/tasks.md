@@ -3,9 +3,26 @@
 ## 0. Preconditions
 - [ ] 0.1 PR #20 (fix/job-loss-family) merged — commit semantics the chain depends on
 - [ ] 0.2 PR #21 (egress allowlist A) merged — WebSearch/doc lookups for the verify tier.
-      NOTE: npm registry was dropped from #21 on the security review (credential-container
-      exfil sink); Node projects' `npm install`/test in auto mode needs a read-only
-      registry mirror first — track separately, do NOT assume npm reachability here.
+      NOTE (updated 2026-07-21, superseding the original "needs a registry mirror first"
+      note; source: `registry-egress-opt-in`, PR #23, archived):
+      - **Python: available today.** `pypi.org` + `files.pythonhosted.org` are reachable
+        on the **executor** proxy when the operator opts in at build time
+        (`EXTRA_FILTER=filter.pypi`). Default build is off and byte-identical, so auto
+        mode may assume pip reachability *only* where the operator enabled it.
+      - **npm: still unreachable, and a mirror is NOT the unlock.** A read-only mirror
+        (Verdaccio et al.) was explicitly ruled out. The unlock condition is a
+        **credential-free build container** — move installs out of the container holding
+        the OAuth credential. Track separately; do not assume npm reachability here.
+      - **Why npm and not PyPI:** the test is per host — is this host *also* a write
+        endpoint? npm's publish endpoint is the same host as its registry, and the proxy
+        is CONNECT-only (no TLS bump), so reachable means arbitrary method and body.
+        PyPI splits them (uploads live on `upload.pypi.org`), so its two read hosts pass.
+        "The container holds credentials" is NOT the criterion — an injected dependency
+        can carry its own token.
+      - **Residual risk to carry into the auto gate:** verify runs
+        `pip install -e . && pytest`, and pytest imports installed packages, so a
+        typosquat executes inside the credential-holding executor with no prompt
+        injection required. See `SECURITY.md` §6.
 
 ## 1. Structured evaluator verdict (bridge/discuss.py)
 - [ ] 1.1 Verdict contract in the evaluator prompt (first line `VERDICT: …`)
