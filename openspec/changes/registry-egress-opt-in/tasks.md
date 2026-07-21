@@ -89,7 +89,7 @@
   未採納：`.pth`／下載側信道／agent 主動繞過等既有殘留維持「揭露而非宣稱關閉」。
 - [ ] 6.4 開 PR（branch 先開再 commit，不直推 main，由 operator merge）——branch
   `feat/registry-egress-opt-in` 已開、已 commit，待 operator 確認後開 PR
-- [ ] 6.5 live smoke：opt-in 開啟後跑一次真實 `pip install`，確認 sdist 未被優先選用、cache 可寫；並確認 frontend 誤建態真的被 canary 擋下（unit 綠 ≠ 可部署）
+- [x] 6.5 live smoke：opt-in 開啟後跑一次真實 `pip install`，確認 sdist 未被優先選用、cache 可寫；並確認 frontend 誤建態真的被 canary 擋下（unit 綠 ≠ 可部署）
   - [x] 容器層已實測（2026-07-20，本機 docker，非 live 部署；修完 review finding 後重跑）：
     opt-in proxy build 後，executor image 以 uid 1000 經 proxy 在 **venv 內**
     `pip install requests==2.32.3` 成功（全部 wheel、無 sdist build）；裸 `pip install`
@@ -101,5 +101,16 @@
     蓋過。以上多數已固化為 docker-gated 測試，不只是一次性手測。
     ⚠️ 首次 smoke 用 `--target` 掩蓋了裸 `pip install` 的 EACCES（reviewer M6 抓到）——
     教訓：smoke 指令要用**文件教使用者的那一條**，不要用自己順手的變體。
-  - [ ] 仍待 operator：真實 live compose 上的 frontend 誤建態 canary 擋下驗證
+  - [x] 真實 live compose 誤建態驗證（2026-07-21，operator 在場，本機 live 部署）：
+    frontend 重建為 branch code 後，canary forbidden 集合確實含 `pypi.org` /
+    `files.pythonhosted.org`（部署前的舊 image 只探 `api.anthropic.com`，證明新行為真的上線）。
+    手動在 running `proxy-discord` 的 `/etc/tinyproxy/filter` 追加 `^pypi\.org$`
+    模擬誤建態 → frontend 重啟後 `pypi.org: tunneled` → `peer_reachable` →
+    **拒絕服務並 restart-loop**（fail-closed，未登入 Discord）。還原 filter 後
+    `pypi.org: denied` → ok → 兩隻 bot 正常登入，stack 恢復原狀。
+    最終姿勢確認：frontend proxy 僅 `discord.com` 通；executor proxy 僅
+    `api.anthropic.com` 通（live 未開 opt-in，故 `pypi.org` 亦 403）。
+    📌 附帶發現：對 tinyproxy 送 SIGHUP **不會**重載 filter——手改 filter 檔後
+    仍需重啟 proxy 才生效。這略微收窄「手改繞過 build assertion」的威脅路徑，
+    但不改變結論（重啟 proxy 是 operator 容易做到的動作），故 canary 仍為必要防線。
 - [ ] 6.6 archive 後同步更新 `~/.claude-shared/memory/project_plan.md` 的 meta 行與狀態
