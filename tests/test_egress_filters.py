@@ -77,7 +77,7 @@ _ANCHOR_MUTANTS = [
 
 
 def _tinyproxy_would_allow(pattern: str, host: str) -> bool:
-    """tinyproxy matches with POSIX regexec, which is UNANCHORED — a pattern matching
+    r"""tinyproxy matches with POSIX regexec, which is UNANCHORED — a pattern matching
     any SUBSTRING of the CONNECT host allows it. re.fullmatch models a different engine
     and would score `pypi\.org$` as safe while the proxy tunnels upload.pypi.org."""
     return re.search(pattern, host, re.IGNORECASE) is not None
