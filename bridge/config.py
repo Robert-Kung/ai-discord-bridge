@@ -241,6 +241,13 @@ def install_guardrail_env(base_env: "dict | None" = None) -> dict:
 DEFAULT_CWD = "/home/user"
 PROJECT_DIRS: list[Path] = []
 
+# Expansion base for a bare `!cd <name>` (never for absolute input). NOT a security
+# boundary: expansion happens before the PROJECT_DIRS whitelist + .git check, so a wrong
+# value can only cause false rejections, never false accepts. Host and container paths
+# are kept identical (compose mounts both sides at the same path) because git worktrees
+# record absolute gitdir pointers that the operator also reads from the host.
+PROJECT_BASE_DIR: Path = Path("/home/user/projects")
+
 VALID_MODES = {"plan", "edit", "bypass", "approve"}
 # "approve" is the M4 per-command tier: runs claude in `default` permission mode
 # (the only mode --permission-prompt-tool is consulted in).
@@ -272,15 +279,15 @@ EXEC_BASH_ENABLED: bool = False
 # The env-derived globals load_config() owns — single source of truth so tests can
 # snapshot/restore them without a hand-maintained list drifting out of sync.
 _CONFIG_GLOBALS = ("CHANNEL_ID", "ALLOWED_USER_IDS", "USE_API_KEY", "BOTS",
-                   "PROJECT_DIRS", "BYPASS_TIER_ENABLED", "APPROVER_TIER_ENABLED",
-                   "EVALUATOR_ENABLED", "EXEC_BASH_ENABLED")
+                   "PROJECT_DIRS", "PROJECT_BASE_DIR", "BYPASS_TIER_ENABLED",
+                   "APPROVER_TIER_ENABLED", "EVALUATOR_ENABLED", "EXEC_BASH_ENABLED")
 
 
 def load_config() -> None:
     """Read every env-derived global (the _CONFIG_GLOBALS) and ensure state dirs
     exist. Called once at startup; tests call it after monkeypatching os.environ.
     Ends by validating (fail-closed)."""
-    global CHANNEL_ID, ALLOWED_USER_IDS, USE_API_KEY, BOTS, PROJECT_DIRS
+    global CHANNEL_ID, ALLOWED_USER_IDS, USE_API_KEY, BOTS, PROJECT_DIRS, PROJECT_BASE_DIR
     global BYPASS_TIER_ENABLED, APPROVER_TIER_ENABLED, EVALUATOR_ENABLED, EXEC_BASH_ENABLED
     CHANNEL_ID = int(os.environ["DISCORD_CHANNEL_ID"])
     ALLOWED_USER_IDS = {
@@ -301,6 +308,7 @@ def load_config() -> None:
         Path(p.strip()).resolve()
         for p in os.environ.get("PROJECT_DIRS", "").split(",") if p.strip()
     ]
+    PROJECT_BASE_DIR = Path(os.environ.get("PROJECT_BASE_DIR", "/home/user/projects"))
     for d in (STATE_DIR, SUMMARIES_DIR, PROJECT_NOTES_DIR):
         d.mkdir(parents=True, exist_ok=True)
     validate_config()
