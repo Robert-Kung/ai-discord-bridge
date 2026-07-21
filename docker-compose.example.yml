@@ -44,7 +44,16 @@ services:
   proxy-anthropic:
     build:
       context: ./egress-proxy
-      args: { FILTER: filter.anthropic }
+      # Opt-in: uncomment EXTRA_FILTER to let the executor reach the read-only
+      # PyPI hosts (pypi.org, files.pythonhosted.org) so agents can install Python
+      # dependencies. OFF by default. Changing it requires a rebuild:
+      #   docker compose build proxy-anthropic && docker compose up -d
+      # Valid ONLY here, on the executor side of a split deployment. Adding it to
+      # proxy-discord or to the single-container `filter` build fails the image
+      # build on purpose — see egress-proxy/filter.pypi and SECURITY.md.
+      args:
+        FILTER: filter.anthropic
+        # EXTRA_FILTER: filter.pypi
     container_name: ai-discord-bridge-proxy-anthropic
     restart: unless-stopped
     networks: [executor_internal, egress_outbound]

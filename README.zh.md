@@ -6,7 +6,7 @@
 A↔B 辯論編排，以及一個**受審查門控的執行迴圈**（基於 Claude Code）。
 
 > **狀態**：個人實驗。單頻道、無支援 SLA。歡迎 fork 與改造——但別期待維護或回 issue。
-> 安全關鍵邏輯由 230 個 pytest 測試覆蓋並在 CI 執行。
+> 安全關鍵邏輯由 296 個 pytest 測試覆蓋並在 CI 執行。
 
 > ⚠️ **安全**：這個工具讓白名單內的 Discord 使用者以你的主機使用者身分、在你掛載的
 > 目錄裡執行程式碼。**部署前請先讀 [SECURITY.zh.md](SECURITY.zh.md)**——對這類專案，
@@ -37,7 +37,8 @@ Discord control plane** 的參考實作——不是即裝即用的產品。每�
   prompt injection 隔離 + canary 驗證過的憑證讀取 deny family（見 [SECURITY.zh.md](SECURITY.zh.md)）
 - **egress 圍堵（雙容器 split）**：`discord-frontend`（只能連 Discord，持 bot token）與
   `executor`（持 Claude 憑證；egress 限 `api.anthropic.com` 加一小串 GET-only 唯讀文件
-  allow-list，無可 publish 的 host，見 [SECURITY.md](SECURITY.md) §6）各自跑在 routeless internal 網路、
+  allow-list，另可 opt-in 開啟唯讀 PyPI host 讓 agent 自行安裝 Python 依賴——仍無可
+  publish 的 host，預設關閉，見 [SECURITY.md](SECURITY.md) §6）各自跑在 routeless internal 網路、
   各配一個 default-deny proxy——每個 secret 所在容器的網路都到不了另一個 secret 的
   用武之地。開機 canary fail-closed 證明各自的 deny 方向。
 
@@ -98,9 +99,33 @@ docker compose up -d --build
 docker compose logs -f
 ```
 
+## exec job 內的依賴安裝
+
+executor 沒有一般的對外路由，agent 只裝得到 proxy allow-list 放行的東西。
+
+- **Python**：預設關閉。把 compose 裡 `proxy-anthropic` 底下的
+  `EXTRA_FILTER: filter.pypi` 取消註解，再
+  `docker compose build proxy-anthropic && docker compose up -d`，agent 就能從 PyPI 安裝。
+  只開讀取 host，`upload.pypi.org` 維持封鎖。**安裝必須進 venv**——
+  `python3 -m venv .venv && ./.venv/bin/pip install …`——因為 user-site 安裝會跨 job
+  持久存在（其中的 `.pth` 會在每次直譯器啟動時執行，包含持有憑證的 executor）。裸的
+  `pip install` 會以 `Could not find an activated virtualenv (required)` 失敗，那是護欄
+  不是 bug；每專案的 verify 指令也應改用該 venv。啟用前請先讀
+  [SECURITY.zh.md](SECURITY.zh.md) §6——殘留風險在那裡逐項列出，沒有被含糊帶過，其中
+  包含「verify 期間第三方程式碼會在 import 時執行」這一項。
+- **Node**：**維持 vendored，沒有 opt-in 可用。** `registry.npmjs.org` 的 publish 端點就是
+  同一個 host，放行等於給被注入的 agent 一條可自帶 token 的寫出通道。請在 host 跑
+  `npm ci`，把 `node_modules` 隨專案掛進容器，agent 離線跑 `npm test`。無論如何，所有
+  spawn 出來的子行程都停用 lifecycle script。npm 自動安裝的**解鎖條件**是：安裝改在
+  無憑證 build 容器內進行——那裡就算 index 可達，攻擊者也沒有東西可偷。
+
+兩條 spawn 路徑（agent 與 verify 指令）一律帶 `npm_config_ignore_scripts=true`、
+`PIP_PREFER_BINARY=1`、`PIP_REQUIRE_VIRTUALENV=1` 與 `PIP_NO_CACHE_DIR=1`，與 opt-in
+是否開啟無關。它們防的是誤觸而非有敵意的 agent——真正的邊界是 routeless egress。
+
 ## 驗證你的部署（smoke test）
 
-單元測試（`pip install -r requirements-dev.txt && pytest`，230 個）涵蓋安全關鍵邏輯——
+單元測試（`pip install -r requirements-dev.txt && pytest`，296 個）涵蓋安全關鍵邏輯——
 fail-closed 授權、`!cd` 路徑/逃逸防護、信任過濾、env 去敏、exec loop 的 job/worktree/verify
 機制、egress canary 邏輯——並在 CI 跑。它們不碰真 Discord/Claude，所以端到端接線用手動確認：
 

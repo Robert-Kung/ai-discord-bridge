@@ -36,8 +36,11 @@ async def main() -> None:
     if config.USE_API_KEY:
         for cfg in config.BOTS.values():
             runner.provision_api_key_helper(cfg)
+    # Forbidden set = Discord (the peer's credential lives there) + the package-upload
+    # endpoints, so the opt-in's core invariant — read hosts only, never a write path —
+    # is proven at startup instead of assumed from the filter file.
     await egress.canary_gate(required_host=config.ANTHROPIC_API_HOST,
-                             forbidden_hosts=config.DISCORD_HOSTS)
+                             forbidden_hosts=config.EXECUTOR_FORBIDDEN_HOSTS)
     # The executor is where claude actually spawns, so it owns the settings-canary proof
     # of the deny family (the frontend can't — no credentials / no Anthropic egress).
     if os.environ.get("BRIDGE_SKIP_CANARY", "").strip().lower() not in ("1", "true", "yes", "on"):

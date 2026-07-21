@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from pathlib import Path
 
 from bridge import config, sessions
@@ -100,6 +101,54 @@ async def job_diff(project: str, base: str, job_id: str) -> tuple[str, str]:
     _, stat, _ = await _git(project, "diff", "--stat", f"{base}..{branch}")
     _, full, _ = await _git(project, "diff", f"{base}..{branch}")
     return stat, full
+
+
+# Files whose change means the merged commit will pull or execute third-party code on
+# the operator's host or in CI, where NONE of the container's install guardrails apply
+# (spec: registry-install-guardrails). Two groups, both flagged the same way:
+#
+#   1. dependency manifests and lockfiles — a lockfile churn of thousands of lines is
+#      exactly where an added package hides;
+#   2. files that EXECUTE post-merge — a `pip install <evil>` line added to a Makefile
+#      or a CI workflow reaches the operator's host without touching a manifest at all.
+#
+# `requirements` is matched as a path SEGMENT too: the `requirements/prod.txt`
+# (pip-tools / Django) layout is common and a basename-only rule misses it entirely.
+_DEPENDENCY_FILE_RE = re.compile(
+    r"(^|/)(?:"
+    r"requirements[^/]*\.(?:txt|in)|constraints\.txt"
+    r"|pyproject\.toml|setup\.py|setup\.cfg|Pipfile(?:\.lock)?|poetry\.lock|uv\.lock"
+    r"|package(?:-lock)?\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml"
+    r"|go\.mod|go\.sum|Cargo\.toml|Cargo\.lock|Gemfile(?:\.lock)?|environment\.ya?ml"
+    # executes post-merge without any manifest edit:
+    r"|Makefile|conftest\.py|noxfile\.py|tox\.ini|\.pre-commit-config\.ya?ml"
+    r"|Dockerfile|docker-compose[^/]*\.ya?ml|\.npmrc|pip\.conf"
+    r")$",
+    re.IGNORECASE,
+)
+# Redirects the resolver at an attacker-chosen index without editing any manifest.
+_DEPENDENCY_DIR_RE = re.compile(r"(^|/)(requirements|\.github/workflows)/", re.IGNORECASE)
+# `diff --git a/<path> b/<path>`. Parsed instead of the diffstat because the stat elides
+# long paths with "...". Git QUOTES paths containing spaces/non-ASCII ("a/my proj/x"),
+# so the quoted form is matched first — an unquoted-only pattern silently drops them.
+_DIFF_HEADER_RE = re.compile(
+    r'^diff --git (?:"a/(?P<qa>(?:[^"\\]|\\.)*)"|a/(?P<a>.+?)) '
+    r'(?:"b/(?P<qb>(?:[^"\\]|\\.)*)"|b/(?P<b>.+))$',
+    re.MULTILINE,
+)
+
+
+def dependency_changes(full_diff: str) -> list[str]:
+    """Paths in this diff that install or execute third-party code after merge, sorted
+    and de-duplicated. Deliberately over-inclusive: a false flag costs the operator one
+    glance, a missed one costs an unreviewed execution path on their host."""
+    paths: set[str] = set()
+    for m in _DIFF_HEADER_RE.finditer(full_diff or ""):
+        for side in (m.group("qa") or m.group("a"), m.group("qb") or m.group("b")):
+            if side and (_DEPENDENCY_FILE_RE.search(side)
+                         or _DEPENDENCY_DIR_RE.search(side)):
+                paths.add(side)
+    return sorted(paths)
 
 
 async def merge_job(project: str, job_id: str, base: str) -> tuple[str, str]:
