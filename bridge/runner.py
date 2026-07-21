@@ -318,6 +318,37 @@ def m4_live() -> bool:
     return bool(config.EXEC_BASH_ENABLED and config.EXECUTOR_SOCKET)
 
 
+def settings_base_is_agent_writable() -> bool:
+    """True iff the base settings file can be rewritten by the uid claude runs as.
+
+    write_exec_settings() re-derives the exec-tier file from this base before every
+    spawn, so tampering with the DERIVED file cannot persist — but a tamper of the BASE
+    propagates into every regeneration. Mounting the base read-only is therefore what
+    makes the per-spawn regen meaningful."""
+    return os.access(config.BRIDGE_SETTINGS_PATH, os.W_OK)
+
+
+def assert_settings_base_readonly() -> None:
+    """Phase-2 executor only: refuse to serve if the base settings file is writable by
+    us. In the split posture the base MUST come from a read-only mount outside any
+    project bind — otherwise an agent rewrites the deny family (or just corrupts the
+    JSON, which claude silently ignores) and every later spawn inherits it.
+
+    Host-direct and single-container runs legitimately use the repo copy, which the
+    operator owns and writes; the check is scoped to the executor for that reason."""
+    if not config.EXECUTOR_SOCKET:
+        return
+    if settings_base_is_agent_writable():
+        raise SystemExit(
+            f"base settings file is WRITABLE by this process: {config.BRIDGE_SETTINGS_PATH}\n"
+            "In the phase-2 split the executor must read it from a read-only mount that "
+            "lives OUTSIDE any project bind. A writable base lets one job rewrite the "
+            "deny family for every job that follows, and an invalid file is silently "
+            "ignored by claude rather than rejected. Refusing to serve.\n"
+            "Fix: stage it (e.g. ~/.claude-bot-settings/settings.json), mount that dir "
+            "read-only, and point BRIDGE_SETTINGS_PATH at it.")
+
+
 def write_exec_settings() -> None:
     """Generate the exec-tier settings file: the base deny family PLUS `Bash` allowed,
     derived from the canary-proven base settings. Regenerated before every exec spawn.

@@ -99,6 +99,9 @@ services:
       # bind mounts below (and the frontend's PROJECT_DIRS).
       PROJECT_DIRS: >-
         /home/user/your-project-a,/home/user/your-project-b
+      # Base deny-family file. Must live outside every read-write bind (see the
+      # ~/.claude-bot-settings mount below); the executor refuses to serve otherwise.
+      BRIDGE_SETTINGS_PATH: /home/user/.claude-bot-settings/settings.json
       # API-key mode only (interpolated from .env; empty in subscription mode)
       USE_API_KEY: ${USE_API_KEY:-}
       ANTHROPIC_API_KEY_A: ${ANTHROPIC_API_KEY_A:-}
@@ -119,7 +122,18 @@ services:
       - /home/user/.claude-bot-b:/home/user/.claude-bot-b
       - /home/user/.claude-bot-creds:/home/user/.claude-bot-creds:ro
       # Server-side security settings (deny family), passed via --settings.
-      - ./settings.json:/home/user/.claude-bridge-settings.json:ro
+      # Staged OUTSIDE the project binds, not `./settings.json`. If the repo is bind
+      # mounted read-write (it is, so the agent can work on it), then `:ro` on the repo
+      # copy protects only the mount point — the same inode stays writable through the
+      # project path, and a rewrite there propagates into every later spawn, because
+      # write_exec_settings() re-derives the exec-tier file from this base each time.
+      # A directory mount rather than a single file, so a rewrite on the host (new
+      # inode) doesn't leave the container reading a stale one.
+      #   mkdir -p ~/.claude-bot-settings
+      #   cp settings.json ~/.claude-bot-settings/settings.json
+      #   chmod 444 ~/.claude-bot-settings/settings.json
+      # The executor asserts this at startup and refuses to serve if it is writable.
+      - /home/user/.claude-bot-settings:/home/user/.claude-bot-settings:ro
       # M4 verify config — one file per project (name = the project's cwd-slug), each
       # holding the shell verify command. Mounted READ-ONLY: the exec agent runs with
       # Bash + rw discord-state, so a verify command kept on a writable volume could be

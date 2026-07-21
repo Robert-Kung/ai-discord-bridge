@@ -187,6 +187,22 @@ your permission settings."* **啟動 canary**（嘗試一個被 deny 的指令�
 真的載入——因為 claude 對驗證失敗的 settings 檔會**無聲忽略**。canary 沒讓 deny 生效，
 bot 就 fail closed。
 
+**正本檔不可被 executor 寫入。** canary 證明的是 deny family *載入過*；它只在啟動時跑
+一次，所以證明不了之後檔案沒被改。`write_exec_settings()` 在**每次** spawn 前從這份正本
+重新衍生 exec-tier settings——所以改衍生檔無法留存，但反過來說，改**正本**會被之後每一次
+重生繼承。當 repo 本身以 rw bind 掛載給 agent 工作時，把 repo 內那份掛 `:ro` 是不夠的：
+`:ro` 保護的是 mount point 而不是 inode，同一個檔案從專案路徑仍然寫得到。正確做法是把它
+staged 到所有 rw bind 之外（`~/.claude-bot-settings/settings.json`，`:ro` 掛載，並以
+`BRIDGE_SETTINGS_PATH` 指向），且掛**目錄**而非單檔，避免 host 端重寫後容器讀到過期
+inode。phase-2 split 下 executor 啟動時會斷言這件事，正本可寫就拒絕服務。host-direct 與
+單容器部署本來就用 operator 自己擁有的 repo 副本，所以該斷言只在 split executor 生效。
+
+範圍要說誠實：**在 exec tier 上 deny family 本來就只是減速丘、不是圍堵**——該層允許
+`Bash`，而 shell 能輕易繞過工具名稱式的 deny（用 `cat` 讀憑證檔而不是用 `Read`）。所以
+改正本在*那一層*買到的東西不多，真正的邊界是 executor 的 routeless egress。它買到的是
+持久性與隱蔽性：被之後每次 spawn 繼承、同時也把 deny family 從「它確實是邊界」的非 Bash
+層剝掉，而且只要把 JSON 弄壞就夠了（claude 對無效檔案無聲忽略，不需要精心構造）。
+
 ### 網路 egress 圍堵（phase 1）——啟用後的主要屏障
 
 **一旦 proxy 啟用**（設 `EGRESS_PROXY_URL` + bridge 跑在 routeless internal 網路上），

@@ -10,6 +10,8 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
+
 from bridge import config, runner, sessions, trust, frontend
 
 REPO = Path(config.__file__).resolve().parent.parent
@@ -189,3 +191,54 @@ def test_cmd_mode_allows_edit_tier(monkeypatch, tmp_state):
     msg = asyncio.run(frontend.cmd_mode(_FakeChannel(), "edit", 111))
     assert "edit" in msg
     assert sessions.load_channel_state(_FakeChannel.id)["mode"] == "edit"
+
+
+# ── base settings must be read-only to the executor (the per-spawn regen's premise) ──
+# write_exec_settings() re-derives the exec-tier file from the base before every spawn,
+# so tampering the DERIVED file cannot persist. That defence is only worth something if
+# the BASE cannot be rewritten — a base tamper propagates into every regeneration.
+
+def test_executor_refuses_when_base_settings_writable(monkeypatch, tmp_path):
+    base = tmp_path / "settings.json"
+    base.write_text(json.dumps({"permissions": {"deny": [], "allow": []}}))
+    base.chmod(0o644)                                   # writable by us
+    monkeypatch.setattr(config, "BRIDGE_SETTINGS_PATH", str(base))
+    monkeypatch.setattr(config, "EXECUTOR_SOCKET", "/tmp/exec.sock")
+    with pytest.raises(SystemExit) as e:
+        runner.assert_settings_base_readonly()
+    assert "WRITABLE" in str(e.value)
+
+
+def test_executor_serves_when_base_settings_readonly(monkeypatch, tmp_path):
+    base = tmp_path / "settings.json"
+    base.write_text(json.dumps({"permissions": {"deny": [], "allow": []}}))
+    base.chmod(0o444)                                   # read-only, as the :ro mount gives
+    monkeypatch.setattr(config, "BRIDGE_SETTINGS_PATH", str(base))
+    monkeypatch.setattr(config, "EXECUTOR_SOCKET", "/tmp/exec.sock")
+    runner.assert_settings_base_readonly()              # must not raise
+
+
+def test_check_is_scoped_to_the_split_executor(monkeypatch, tmp_path):
+    # Host-direct / single-container legitimately use the operator-owned repo copy, which
+    # IS writable by them. Gating on EXECUTOR_SOCKET keeps those deploys working.
+    base = tmp_path / "settings.json"
+    base.write_text(json.dumps({"permissions": {"deny": [], "allow": []}}))
+    base.chmod(0o644)
+    monkeypatch.setattr(config, "BRIDGE_SETTINGS_PATH", str(base))
+    monkeypatch.setattr(config, "EXECUTOR_SOCKET", "")
+    runner.assert_settings_base_readonly()              # must not raise
+
+
+def test_exec_settings_regen_reads_the_base_each_time(monkeypatch, tmp_path):
+    # Pins WHY the base matters: the regen re-reads it, so whatever the base says at
+    # spawn time is what the exec-tier settings inherit.
+    base = tmp_path / "settings.json"
+    base.write_text(json.dumps({"permissions": {"deny": ["Bash(curl)"], "allow": []}}))
+    out = tmp_path / "exec-settings.json"
+    monkeypatch.setattr(config, "BRIDGE_SETTINGS_PATH", str(base))
+    monkeypatch.setattr(config, "EXEC_SETTINGS_PATH", str(out))
+    runner.write_exec_settings()
+    assert json.loads(out.read_text())["permissions"]["deny"] == ["Bash(curl)"]
+    base.write_text(json.dumps({"permissions": {"deny": [], "allow": []}}))
+    runner.write_exec_settings()
+    assert json.loads(out.read_text())["permissions"]["deny"] == []   # base tamper carries
