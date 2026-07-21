@@ -87,8 +87,8 @@
     並註明歸檔前後差異。
   - §8 加固清單兩語補上 opt-in 條目。
   未採納：`.pth`／下載側信道／agent 主動繞過等既有殘留維持「揭露而非宣稱關閉」。
-- [ ] 6.4 開 PR（branch 先開再 commit，不直推 main，由 operator merge）——branch
-  `feat/registry-egress-opt-in` 已開、已 commit，待 operator 確認後開 PR
+- [x] 6.4 開 PR（branch 先開再 commit，不直推 main，由 operator merge）——
+  PR #23 已開，待 operator merge：https://github.com/Robert-Kung/ai-discord-bridge/pull/23
 - [x] 6.5 live smoke：opt-in 開啟後跑一次真實 `pip install`，確認 sdist 未被優先選用、cache 可寫；並確認 frontend 誤建態真的被 canary 擋下（unit 綠 ≠ 可部署）
   - [x] 容器層已實測（2026-07-20，本機 docker，非 live 部署；修完 review finding 後重跑）：
     opt-in proxy build 後，executor image 以 uid 1000 經 proxy 在 **venv 內**
