@@ -35,7 +35,7 @@ def resolve_project_cwd(raw: str) -> tuple[str | None, str]:
         return None, "empty"
     candidate = Path(raw)
     if not candidate.is_absolute():
-        candidate = Path("/home/user") / raw  # bare name → /home/user/<name>
+        candidate = config.PROJECT_BASE_DIR / raw  # bare name → <base>/<name>
     try:
         resolved = candidate.resolve()
     except (OSError, RuntimeError):
