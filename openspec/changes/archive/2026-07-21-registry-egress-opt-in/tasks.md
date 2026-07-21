@@ -113,4 +113,6 @@
     📌 附帶發現：對 tinyproxy 送 SIGHUP **不會**重載 filter——手改 filter 檔後
     仍需重啟 proxy 才生效。這略微收窄「手改繞過 build assertion」的威脅路徑，
     但不改變結論（重啟 proxy 是 operator 容易做到的動作），故 canary 仍為必要防線。
-- [ ] 6.6 archive 後同步更新 `~/.claude-shared/memory/project_plan.md` 的 meta 行與狀態
+- [x] 6.6 archive 後同步更新 `~/.claude-shared/memory/project_plan.md` 的 meta 行與狀態
+  （2026-07-21：specs sync 進 `openspec/specs/`——egress-containment 換掉 2 條 requirement、
+  新增 registry-install-guardrails 能力；validate 9/9。plan meta 行已更新。）
