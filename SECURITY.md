@@ -226,6 +226,30 @@ returns *"File is in a directory that is denied by your permission settings."* A
 file actually loaded — because claude *silently ignores* a settings file that
 fails validation. If the canary does not trip the deny, the bot fails closed.
 
+**The base file must not be writable by the executor.** The canary proves the deny
+family *loaded*; it runs once, at startup, so it cannot prove the file stayed intact
+afterwards. `write_exec_settings()` re-derives the exec-tier settings from this base
+before *every* spawn, which means a tamper of the derived file cannot persist — but it
+also means a tamper of the **base** propagates into every regeneration that follows.
+Mounting the repo copy `:ro` is not sufficient when the repo itself is bind mounted
+read-write for the agent to work in: `:ro` protects that mount point, not the inode,
+and the same file stays writable through the project path. Stage it outside every
+read-write bind instead (`~/.claude-bot-settings/settings.json`, mounted `:ro`, pointed
+at by `BRIDGE_SETTINGS_PATH`) — a *directory* mount, so a host-side rewrite does not
+strand the container on a stale inode. In the phase-2 split the executor asserts this
+at startup and refuses to serve if the base is writable. Host-direct and
+single-container deploys legitimately use the operator-owned repo copy, so the
+assertion is scoped to the split executor.
+
+Scope this honestly: on the **exec tier the deny family is already a speed-bump, not
+containment**, because `Bash` is allowed there and a shell trivially sidesteps
+tool-name denials (`cat` the credential file rather than `Read` it). Tampering with
+the base therefore buys an attacker little *on that tier* — the real boundary is the
+executor's routeless egress. What it does buy is persistence and silence: it is
+inherited by every later spawn, it also strips the deny family from the non-Bash tiers
+where it *is* the boundary, and corrupting the JSON is enough (claude silently ignores
+an invalid file, so no crafting is required).
+
 ### Network egress containment (phase 1) — the primary barrier once enabled
 
 Name-based deny is no longer the *sole* exfil barrier **once the proxy is enabled**

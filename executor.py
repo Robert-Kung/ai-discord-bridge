@@ -41,6 +41,10 @@ async def main() -> None:
     # is proven at startup instead of assumed from the filter file.
     await egress.canary_gate(required_host=config.ANTHROPIC_API_HOST,
                              forbidden_hosts=config.EXECUTOR_FORBIDDEN_HOSTS)
+    # The canary proves the deny family LOADS; this proves it stays loaded. A base that
+    # we can rewrite makes the per-spawn exec-settings regen pointless, since the regen
+    # re-reads that same base. Checked before the canary so the failure names the cause.
+    runner.assert_settings_base_readonly()
     # The executor is where claude actually spawns, so it owns the settings-canary proof
     # of the deny family (the frontend can't — no credentials / no Anthropic egress).
     if os.environ.get("BRIDGE_SKIP_CANARY", "").strip().lower() not in ("1", "true", "yes", "on"):
