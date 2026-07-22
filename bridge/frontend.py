@@ -9,6 +9,7 @@ import asyncio
 import io
 import json
 import logging
+import re
 import time
 from collections import deque
 from pathlib import Path
@@ -28,6 +29,16 @@ log = logging.getLogger("bridge.frontend")
 _HEADER_MAX = 1900
 _STAT_FENCE_OVERHEAD = 200  # ``` fences + the truncation warning line
 _DEP_NOTE_MAX = 400
+
+# ── Outbound media (unattended-auto-mode §4) ─────────────────────────────
+# The agent may ask the frontend to attach a workspace file to a reply with a
+# `DISCORD_ATTACH: <relative-path>` marker line. Containment is by is_relative_to the
+# reply's workspace root (worktree/job dir for exec, live checkout for chat), NEVER a
+# string prefix. Whitelisted extensions + per-file/per-message caps below.
+_ATTACH_MARKER_RE = re.compile(r"^[ \t]*DISCORD_ATTACH:[ \t]*(.+?)[ \t]*$", re.MULTILINE)
+_ATTACH_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".html", ".txt", ".pdf"}
+_ATTACH_MAX_FILES = 4
+_ATTACH_MAX_BYTES = 8 * 1024 * 1024  # Discord's per-file cap
 
 
 # ── Command / flag parsing ──────────────────────────────────────────────
@@ -240,6 +251,104 @@ def _render_job_status(job, where: str, trace) -> str:
     return f"{head}\n{body}"[:1990]
 
 
+# ── Outbound media: marker parse + containment ───────────────────────────
+def resolve_attachment_markers(reply: str, root: str) -> "tuple[str, list[str], list[str]]":
+    """Pure: parse `DISCORD_ATTACH:` markers out of `reply` and validate each against the
+    workspace `root`. Returns (cleaned_reply, accepted_paths, refusals).
+
+    Containment is `Path(root, rel).resolve()` then `is_relative_to(root_resolved)` —
+    symlinks are followed by resolve() first, so a whitelisted-extension symlink pointing
+    outside the root is refused by CONTAINMENT, not the extension check. A string-prefix
+    test is deliberately NOT used: a neighbour dir `<root>-evil` would defeat it. Absolute
+    markers resolve to themselves and thus fail is_relative_to. Marker lines are stripped
+    from the returned text whether or not the file was attached (no leaking the protocol
+    into the channel)."""
+    if "DISCORD_ATTACH:" not in reply:
+        return reply, [], []
+    try:
+        root_resolved = Path(root).resolve()
+    except (OSError, RuntimeError):
+        # an unresolvable root refuses everything but still strips the markers
+        cleaned = _ATTACH_MARKER_RE.sub("", reply).strip()
+        return cleaned, [], ["<all>（workspace root 無法解析）"]
+    accepted: list[str] = []
+    refusals: list[str] = []
+    for m in _ATTACH_MARKER_RE.finditer(reply):
+        rel = m.group(1).strip()
+        if not rel:
+            continue
+        if len(accepted) >= _ATTACH_MAX_FILES:
+            refusals.append(f"{rel}（超過每則 {_ATTACH_MAX_FILES} 個附件上限）")
+            continue
+        try:
+            target = (root_resolved / rel).resolve()
+        except (OSError, RuntimeError):
+            refusals.append(f"{rel}（路徑無法解析）")
+            continue
+        if not (target == root_resolved or target.is_relative_to(root_resolved)):
+            refusals.append(f"{rel}（解析後超出 workspace 根目錄，拒絕）")
+            continue
+        if target.suffix.lower() not in _ATTACH_EXTS:
+            refusals.append(f"{rel}（副檔名不在白名單）")
+            continue
+        if not target.is_file():
+            refusals.append(f"{rel}（找不到檔案）")
+            continue
+        try:
+            size = target.stat().st_size
+        except OSError:
+            refusals.append(f"{rel}（無法讀取）")
+            continue
+        if size > _ATTACH_MAX_BYTES:
+            refusals.append(f"{rel}（超過每檔 8 MB 上限）")
+            continue
+        accepted.append(str(target))
+    cleaned = _ATTACH_MARKER_RE.sub("", reply).strip()
+    return cleaned, accepted, refusals
+
+
+async def _send_reply(channel, reply: str, root: str, *, prefix: str = "") -> None:
+    """Post an agent reply, honouring DISCORD_ATTACH markers (files resolved under `root`
+    via resolve_attachment_markers). Marker lines are stripped; whitelisted files under
+    the caps ride on the first chunk; refusals are logged and surfaced. Best-effort: a
+    file that vanishes between stat and send is skipped, never crashing the reply."""
+    cleaned, paths, refusals = resolve_attachment_markers(reply, root)
+    for r in refusals:
+        log.warning("outbound attachment refused (root=%s): %s", root, r)
+    files = []
+    for p in paths:
+        try:
+            files.append(discord.File(p, filename=Path(p).name))
+        except OSError as e:
+            log.warning("could not open attachment %s: %s", p, e)
+    chunks = chunk_message(prefix + cleaned) if (prefix + cleaned).strip() else []
+    if not chunks:
+        chunks = ["📎" if files else "(空回覆)"]
+    for i, c in enumerate(chunks):
+        if i == 0 and files:
+            await channel.send(c, files=files)
+        else:
+            await channel.send(c)
+    if refusals:
+        await channel.send("⚠️ 附件被拒：" + "；".join(refusals[:5]))
+
+
+def split_task_list(text: str) -> list[str]:
+    """Split an operator message into an ordered auto-mode task list. A CHAIN is only
+    recognised when there are ≥2 explicitly-marked items (numbered `1.`/`1)` or bulleted
+    `-`/`*`/`•`); otherwise the whole message is ONE task. Conservative on purpose —
+    splitting plain multi-line prose into per-line tasks would spawn garbage jobs."""
+    marked: list[str] = []
+    for ln in text.splitlines():
+        m = re.match(r"^\s*(?:\d+[.)]|[-*•])\s+(.+)$", ln)
+        if m:
+            marked.append(m.group(1).strip())
+    if len(marked) >= 2:
+        return marked
+    stripped = text.strip()
+    return [stripped] if stripped else []
+
+
 async def start_exec_job(message: discord.Message, bot_name: str, prompt: str,
                          mode: str, cwd: str) -> None:
     """Spawn an execution-tier task as a tracked background job. Capped at one active job
@@ -254,6 +363,52 @@ async def start_exec_job(message: discord.Message, bot_name: str, prompt: str,
         return
     job = jobs.create_job(bot_name, cwd, message.channel.id)
     asyncio.create_task(_drive_exec_job(job, message, bot_name, prompt, mode, cwd))
+
+
+async def _run_auto_chain(message: discord.Message, bot_name: str, context: str,
+                          task_text: str, mention_hint: str, cwd: str) -> None:
+    """Auto-mode driver (unattended-auto-mode §3): run an ordered task list, advancing to
+    task N+1 ONLY when task N reached `status == DONE` (its merge commit exists). An
+    `approve` verdict that still parks (dirty/diverged/conflict) is NOT DONE and stops the
+    chain. Each task branches from the then-current HEAD (create_job_worktree reads HEAD,
+    which the prior merge advanced). Bounded by AUTO_MAX_JOBS and the per-project
+    occupancy rule; stops on the first non-DONE outcome or a park.
+
+    Runs jobs SEQUENTIALLY (awaits each _drive_exec_job) rather than fire-and-forget, so
+    the HEAD a task branches from is the merged result of its predecessor."""
+    tasks = split_task_list(task_text)
+    if not tasks:
+        return
+    cap = config.AUTO_MAX_JOBS
+    total = len(tasks)
+    if total > 1:
+        await message.channel.send(
+            f"⛓️ auto chain：{total} 個任務（上限 AUTO_MAX_JOBS={cap}，任一 park/失敗即停）")
+    ran = 0
+    for i, task in enumerate(tasks, 1):
+        if ran >= cap:
+            await message.channel.send(
+                f"🔚 auto chain 達上限 AUTO_MAX_JOBS={cap}，停止（{total - ran} 個任務未執行）")
+            return
+        if jobs.project_occupied(cwd):
+            await message.channel.send(
+                f"🛑 `{_where(cwd)}` 已有進行中/待審任務，auto chain 停止（`!jobs` 查看）")
+            return
+        if total > 1:
+            await message.channel.send(f"⛓️ [{i}/{total}] {task[:200]}")
+        # cap check + create_job are synchronous with no await between (same guarantee as
+        # start_exec_job) so the project can't be double-claimed by a racing message.
+        job = jobs.create_job(bot_name, cwd, message.channel.id)
+        prompt = f"{context}[from {message.author.display_name}] {task}{mention_hint}"
+        await _drive_exec_job(job, message, bot_name, prompt, "auto", cwd)
+        ran += 1
+        if job.status != jobs.DONE:
+            if total > 1:
+                await message.channel.send(
+                    f"🔗 auto chain 於任務 {i}/{total} 停止（job `{job.id}` 狀態：{job.status}）")
+            return
+    if total > 1:
+        await message.channel.send(f"✅ auto chain 完成：{ran}/{total} 個任務已合併")
 
 
 async def _drive_exec_job(job, message: discord.Message, bot_name: str, prompt: str,
@@ -363,12 +518,14 @@ async def _drive_exec_job(job, message: discord.Message, bot_name: str, prompt: 
             await _safe_edit(status_msg, base_note + disposition)
             return
 
-        # DONE — post the agent's textual reply first, then gate the file changes.
+        # DONE — post the agent's textual reply first, then gate the file changes. The
+        # reply may carry DISCORD_ATTACH markers; an exec job's containment root is its
+        # workspace (the worktree for a git job, the live cwd for a direct run).
         memory.record_bot_reply(channel.id, bot_name, reply, cwd=cwd)
         await _safe_edit(status_msg, f"✅ **[job `{job.id}` · `{where}`]** 完成")
         cwd_tag = "" if cwd == config.DEFAULT_CWD else f"[{where}] "
-        for c in chunk_message(f"{cwd_tag}**[mode={mode} · job {job.id}]** {reply}"):
-            await channel.send(c)
+        await _send_reply(channel, reply, workdir,
+                          prefix=f"{cwd_tag}**[mode={mode} · job {job.id}]** ")
         await memory.maybe_token_flush(channel, bot_name, cwd)
 
         if not use_worktree:
@@ -392,6 +549,13 @@ async def _drive_exec_job(job, message: discord.Message, bot_name: str, prompt: 
             return
         stat, full = await worktree.job_diff(cwd, job.base, job.id)
         jobs.save_diff(job, full)
+        # Gate resolution: auto tier resolves machine-side (verify + evaluator verdict),
+        # every other tier posts the human ✅/❌ diff gate. The auto path owns its OWN
+        # verify call (exception→park) rather than reusing the advisory _post_verify,
+        # which swallows exceptions and always proceeds to the gate.
+        if mode == "auto":
+            await _resolve_auto_gate(job, channel, bot_name, cwd, stat, full)
+            return
         # M4 post-task verification (phase-2 gated): run the per-project verify command
         # in the executor (contained egress + stripped env) and post the outcome above
         # the diff gate. runner.m4_live() is the single source of the gate condition.
@@ -659,6 +823,126 @@ async def _do_merge(job, channel) -> None:
         await channel.send(f"❌ job `{job.id}` 合併失敗：{detail[:300]}（分支保留，可 `!discard`）")
 
 
+# ── Auto tier: machine-driven gate resolution (unattended-auto-mode §2) ──────
+_AUTO_STAT_MAX = 1000
+_AUTO_VERIFY_MAX = 1200
+_AUTO_FINDINGS_MAX = 2000
+
+
+def _dep_audit_note(deps: list[str]) -> str:
+    """Auto mode SURFACES dependency changes, never gates on them (design §2): verify
+    already ran `pip install && pytest` before any gate, so a merge-time veto protects
+    nothing and a blanket park guts auto's purpose. The audit note preserves the post-hoc
+    signal so the operator's read of the trail sees exactly which merges touched deps."""
+    if not deps:
+        return ""
+    shown = "、".join(f"`{discord.utils.escape_markdown(Path(p).name)}`" for p in deps[:3])
+    more = f" 等 {len(deps)} 個" if len(deps) > 3 else ""
+    return (f"\n📦 **依賴/lockfile/設定檔變更**：{shown}{more}"
+            f"（auto 不因此擋合併——合併後 host/CI 安裝會跑第三方 install-time 程式碼，"
+            f"請事後核對；完整清單見 diff）")
+
+
+async def _post_auto_audit(job, channel, headline: str, *, stat: str, base8: str,
+                           verify_tail: str, verdict: str, dep_note: str,
+                           findings: str = "") -> None:
+    """The audit message every auto-resolved job posts — same visibility as the human
+    gate, minus the wait: diffstat, verify tail, evaluator verdict, dep-note, and (on a
+    park) the evaluator findings so the operator can act without re-running review."""
+    parts = [f"🤖 **[auto job `{job.id}` · base `{base8}`]** {headline}{dep_note}"]
+    s = stat.strip()[:_AUTO_STAT_MAX]
+    if s:
+        parts.append(f"**diffstat**\n```\n{s}\n```")
+    vt = (verify_tail or "").strip()[-_AUTO_VERIFY_MAX:].replace("```", "`­``")
+    if vt:
+        parts.append(f"**verify tail**\n```\n{vt}\n```")
+    parts.append(f"**evaluator verdict**：`{verdict}`")
+    if findings:
+        parts.append(f"**評審意見**\n{findings.strip()[:_AUTO_FINDINGS_MAX]}")
+    for c in chunk_message("\n".join(parts)):
+        await channel.send(c)
+
+
+async def _auto_park(job, channel, reason: str, *, stat: str, base8: str,
+                     verify_tail: str, verdict: str, dep_note: str,
+                     findings: str = "") -> None:
+    """Park an auto job as awaiting-review (branch + persisted diff survive) with the
+    audit trail and the stop reason. Keeps the branch — the operator can still `!merge`
+    after inspecting. Only flips a still-RUNNING job (a concurrent !cancel wins)."""
+    await _post_auto_audit(job, channel, f"🅿️ 保留待審（{reason}）", stat=stat, base8=base8,
+                           verify_tail=verify_tail, verdict=verdict, dep_note=dep_note,
+                           findings=findings)
+    if job.status == jobs.RUNNING:
+        jobs.set_status(job, jobs.AWAITING_REVIEW)
+        try:
+            await worktree.remove_worktree(job.project, job.id)
+        except Exception:
+            pass
+    await channel.send(f"（`!merge {job.id}` 合併 / `!discard {job.id}` 丟棄）")
+
+
+async def _resolve_auto_gate(job, channel, author_bot: str, project: str,
+                             stat: str, full: str) -> None:
+    """Auto tier gate resolution (design §2): auto-merge IFF verify is configured AND
+    passes AND the evaluator's first-line verdict is `approve`; every other outcome parks
+    with the reason. Runs its OWN request_verify (exception→park; NOT _post_verify).
+    Dependency changes are surfaced in the audit note, never gated. Any exception here is
+    a fail-safe park via _drive_exec_job's finally (job left RUNNING → parked committed)."""
+    base8 = (job.base or "")[:8]
+    dep_note = _dep_audit_note(worktree.dependency_changes(full))
+
+    # verify — the auto path owns the call so an exception parks, never silently proceeds.
+    try:
+        workdir = job.worktree
+        if not workdir:
+            await _auto_park(job, channel, "worktree 遺失", stat=stat, base8=base8,
+                             verify_tail="", verdict="—", dep_note=dep_note)
+            return
+        configured, passed, tail = await runner.request_verify(project, workdir)
+    except Exception:
+        log.exception("auto verify raised for job %s → park", job.id)
+        await _auto_park(job, channel, "verify 執行出錯", stat=stat, base8=base8,
+                         verify_tail="", verdict="—", dep_note=dep_note)
+        return
+    if not configured:
+        await _auto_park(job, channel, "未設定 verify（discord-verify/ 無此專案）—— auto 絕不合併未驗證的變更",
+                         stat=stat, base8=base8, verify_tail=tail, verdict="—", dep_note=dep_note)
+        return
+    if not passed:
+        await _auto_park(job, channel, "verify 失敗", stat=stat, base8=base8,
+                         verify_tail=tail, verdict="—", dep_note=dep_note)
+        return
+
+    # evaluator verdict — structured first line only; unavailable/unparseable → unsure.
+    verdict, findings = "unsure", ""
+    try:
+        res = await discuss.evaluate_diff(author_bot, job.project, job.id, job.base, stat, full)
+        if res is not None:
+            _evaluator, findings = res
+            verdict = discuss.parse_verdict(findings)
+    except Exception:
+        log.exception("auto evaluator raised for job %s → treat as unsure", job.id)
+
+    if job.status == jobs.CANCELLED:  # !cancel arrived during verify/review
+        await worktree.discard_job(project, job.id)
+        await channel.send(f"🛑 job `{job.id}` 已在自動審查期間取消——變更已丟棄")
+        return
+
+    if verdict != "approve":
+        await _auto_park(job, channel, f"evaluator verdict = {verdict}（非 approve）", stat=stat,
+                         base8=base8, verify_tail=tail, verdict=verdict, dep_note=dep_note,
+                         findings=findings)
+        return
+
+    # green signals → post the audit, then merge under the UNCHANGED protocol. _do_merge
+    # itself may still park (dirty/diverged/conflict) and posts its own outcome line —
+    # that is a non-DONE outcome the chain driver treats as a stop.
+    await _post_auto_audit(job, channel, "✅ 兩個訊號通過（verify + evaluator approve）→ 執行合併協定",
+                           stat=stat, base8=base8, verify_tail=tail, verdict=verdict,
+                           dep_note=dep_note, findings=findings)
+    await _do_merge(job, channel)
+
+
 async def _safe_edit(msg, content: str) -> None:
     try:
         await msg.edit(content=content[:1990])
@@ -668,7 +952,7 @@ async def _safe_edit(msg, content: str) -> None:
 
 # ── Command handlers ────────────────────────────────────────────────────
 HELP_TEXT = """**Bridge 指令參考**
-`!mode plan|edit|bypass|approve` — 設 channel 預設模式（bypass/approve 需 whitelist + opt-in tier）
+`!mode plan|edit|bypass|approve|auto` — 設 channel 預設模式（bypass/approve/auto 需 whitelist + opt-in tier）
 `!once <mode>` — 單一訊息使用該模式（末尾加，不獨佔一行）
 `!yolo` — bypass 跳過 plan-then-execute（單訊息）
 `!discuss <topic>` — A↔B 強制輪流辯論
@@ -685,6 +969,11 @@ HELP_TEXT = """**Bridge 指令參考**
 `plan` 只讀規劃；`edit` 可寫檔/執行（受 settings.json deny 規則約束）。
 `approve` 逐指令核可：非白名單指令會丟 Discord 等你 ✅ 才跑（需 `ENABLE_APPROVER_TIER`）。
 `bypass` 全自動 plan-then-execute 等你 ✅（需 `ENABLE_BYPASS_TIER`，預設關閉）。
+`auto` 自動合併：job 完成後由 verify + evaluator 雙訊號決定 merge/park，不等人審（需
+`ENABLE_AUTO_MERGE` + whitelist，且 verify 路徑與 evaluator 都就緒）。訊息可帶多個
+編號/項目符號任務，逐一執行、每個合併後再接下一個（上限 `AUTO_MAX_JOBS`，預設 5）。
+**auto chain 前請確保 live tree 乾淨**——有未 commit 變更會讓每次合併都判 dirty，整條
+chain 在第一個任務就停。auto 只 surface 依賴變更、不因此擋合併。
 要實際改專案 code：先 `!cd <專案>` 再 `!mode edit`（或 `approve` 走逐指令核可）
 """
 
@@ -724,7 +1013,7 @@ async def cmd_cd(channel, args: str) -> str:
 async def cmd_mode(channel, args: str, author_id: int) -> str:
     target = args.strip().lower()
     if target not in config.VALID_MODES:
-        return f"❓ 用法：`!mode plan|edit|bypass|approve`（目前 valid: {sorted(config.VALID_MODES)}）"
+        return f"❓ 用法：`!mode plan|edit|bypass|approve|auto`（目前 valid: {sorted(config.VALID_MODES)}）"
     if target == "bypass":
         if not config.BYPASS_TIER_ENABLED:
             return ("🛡 `bypass` tier 未啟用（預設關閉）。需操作者設 `ENABLE_BYPASS_TIER=1` "
@@ -737,6 +1026,22 @@ async def cmd_mode(channel, args: str, author_id: int) -> str:
                     "才能開啟——每條非白名單指令會丟 Discord 等你 ✅ 才執行。")
         if author_id not in config.ALLOWED_USER_IDS:
             return "🛡 `approve` 需要 whitelist 權限"
+    if target == "auto":
+        # Refuse-to-serve with the specific reason (fail-closed, never a silent
+        # park-everything). auto carries more authority than bypass → flag + whitelist,
+        # PLUS both machine signals live before it may resolve a merge unattended.
+        if not config.AUTO_MERGE_ENABLED:
+            return ("🛡 `auto` tier 未啟用（預設關閉）。需操作者設 `ENABLE_AUTO_MERGE=1` 才能開啟"
+                    "——auto 會用 verify + evaluator 雙訊號取代人審自動合併。")
+        if author_id not in config.ALLOWED_USER_IDS:
+            return "🛡 `auto` 需要 whitelist 權限（權限高於 bypass）"
+        if not runner.m4_live():
+            return ("🛡 `auto` 拒絕啟用：verify 路徑不可用（需 phase-2 executor + "
+                    "`ENABLE_EXEC_BASH`，且其 egress canary 已驗證）。auto 不 fail-open——"
+                    "沒有可運作的 verify 就不啟用，而不是靜默把每個 job 都保留待審。")
+        if not config.EVALUATOR_ENABLED:
+            return ("🛡 `auto` 拒絕啟用：cross-account evaluator 不可用（需 "
+                    "`ENABLE_EXEC_EVALUATOR`）。缺了它就沒有第二訊號，拒絕啟用。")
     st = sessions.load_channel_state(channel.id)
     st["mode"] = target
     sessions.save_channel_state(channel.id, st)
@@ -938,13 +1243,15 @@ def make_client(bot_name: str) -> discord.Client:
         else:
             effective_mode = sessions.load_channel_state(message.channel.id).get("mode", config.DEFAULT_CHANNEL_MODE)
 
-        # Default-closed opt-in tiers: any path to bypass/approve is downgraded to the
-        # safe default unless that tier is enabled AND the requester is whitelisted.
-        if effective_mode in ("bypass", "approve") and not trust._tier_allowed(effective_mode, message.author.id):
-            if once_mode in ("bypass", "approve"):
+        # Default-closed opt-in tiers: any path to bypass/approve/auto is downgraded to
+        # the safe default unless that tier is enabled AND the requester is whitelisted
+        # (auto additionally requires its preconditions live — trust.auto_allowed). This
+        # is the per-message re-validation: a revoked flag/whitelist takes effect at once.
+        if effective_mode in ("bypass", "approve", "auto") and not trust._tier_allowed(effective_mode, message.author.id):
+            if once_mode in ("bypass", "approve", "auto"):
                 await message.channel.send(
-                    f"🛡 `!once {once_mode}` 不可用（該 tier 未啟用或你不在 whitelist）。"
-                    "已改用安全的 `plan` 模式。"
+                    f"🛡 `!once {once_mode}` 不可用（該 tier 未啟用、你不在 whitelist、"
+                    "或 auto 前置條件未就緒）。已改用安全的 `plan` 模式。"
                 )
             effective_mode = config.DEFAULT_CHANNEL_MODE
 
@@ -974,7 +1281,13 @@ def make_client(bot_name: str) -> discord.Client:
         # execution layer — and in M1 that runs as a streaming, cancellable BACKGROUND
         # JOB (never blocking conversation), not a synchronous call.
         if runner.exec_layer_for(is_bot_msg, effective_mode) == "execute":
-            await start_exec_job(message, bot_name, prompt, effective_mode, cwd)
+            if effective_mode == "auto":
+                # auto mode: the message MAY be an ordered task list; the chain driver
+                # runs each task through the auto gate, advancing only on a merged (DONE)
+                # predecessor. A single task is just a chain of length 1.
+                await _run_auto_chain(message, bot_name, context, cleaned_content, mention_hint, cwd)
+            else:
+                await start_exec_job(message, bot_name, prompt, effective_mode, cwd)
             return
 
         spf = memory.build_combined_system_prompt(message.channel.id, cwd, bot_name)
@@ -986,8 +1299,9 @@ def make_client(bot_name: str) -> discord.Client:
         memory.record_bot_reply(message.channel.id, bot_name, reply, cwd=cwd)
         cwd_tag = "" if cwd == config.DEFAULT_CWD else f"[{Path(cwd).name}] "
         prefix = f"**[mode={effective_mode} · once]** " if once_mode else ""
-        for c in chunk_message(cwd_tag + prefix + reply):
-            await message.channel.send(c)
+        # A chat/converse reply's containment root for DISCORD_ATTACH markers is the live
+        # project checkout — the only workspace a chat reply has.
+        await _send_reply(message.channel, reply, cwd, prefix=cwd_tag + prefix)
         await memory.maybe_token_flush(message.channel, bot_name, cwd)
 
     @client.event
@@ -1036,10 +1350,12 @@ STARTUP_ANNOUNCEMENT = """🚀 **Bridge v3 上線**
 • `!jobs` 看進行中/待審任務  •  `!cancel <id>` 取消執行中的任務
 
 **🔐 授權執行**
-• `!mode plan|edit|bypass` 切 channel 模式
+• `!mode plan|edit|bypass|approve|auto` 切 channel 模式
 • `!once <mode>` 單訊息 override
 • bypass 預設會先給 plan 等你 ✅ 才執行
 • `!yolo` 跳過 plan 確認
+• `auto` 自動合併（verify + evaluator 雙訊號取代人審；需 opt-in + whitelist）；訊息可帶
+  任務清單逐一連跑（上限 `AUTO_MAX_JOBS`）——開跑前先確認 live tree 乾淨
 
 **ℹ️ 其他**
 • `!state` 看當前狀態  •  `!help` 完整指令參考

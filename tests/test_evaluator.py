@@ -58,7 +58,7 @@ def test_evaluate_diff_hands_diff_to_other_bot(converse_recorder):
     assert "deadbeef" in call["prompt"]          # base pointer
     assert "挑剔" in call["prompt"]              # skeptical framing
     assert "未受信任" in call["prompt"]          # untrusted-data framing (M3 posture)
-    assert "由人類的 ✅/❌ 決定" in call["prompt"]  # advisory framing
+    assert "VERDICT: approve" in call["prompt"]  # structured first-line verdict contract
 
 
 def test_evaluate_diff_reverse_direction(converse_recorder):

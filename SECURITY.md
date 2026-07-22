@@ -113,8 +113,12 @@ membership is defense-in-depth.
 |------|------|:---:|:---:|:---:|
 | `plan` (default) | `--permission-mode plan` | ❌ | read-only only | ✅ |
 | `edit` | `acceptEdits` | ✅ | ✅ (deny family blocked) | ✅ |
-| `approve` (opt-in, off by default) | `default` + MCP approver | ✅ | allow-list auto, rest need a human ✅ | ✅ |
+| `approve` (opt-in, off by default) | `manual` + MCP approver | ✅ | allow-list auto, rest need a human ✅ | ✅ |
 | `bypass` (opt-in, off by default) | `bypassPermissions` | ✅ | ✅ (deny family blocked) | ✅ |
+| `auto` (opt-in, off by default) | `acceptEdits` + gate policy | ✅ | ✅ (deny family blocked) | ✅ |
+
+(`manual` is the current name for the mode formerly called `default`; claude 2.1.217
+renamed it and still accepts `default` as an undocumented back-compat alias.)
 
 **Two things to internalize about this version of Claude Code (empirically
 verified — see `openspec/.../preflight-findings.md`):**
@@ -161,6 +165,38 @@ rw `discord-state` volume, because the Bash-enabled exec agent can write there a
 would otherwise forge its own green. The `:ro` mount makes the verify signal
 un-forgeable by the agent it checks.
 
+**Auto-merge tier (`auto`, `ENABLE_AUTO_MERGE`, off by default).** This tier replaces
+the human ✅/❌ with two machine signals — the per-project **verify** (agent-authored
+tests) and the cross-account **evaluator** (the OTHER bot's structured `VERDICT:`). It
+carries **more** authority than `bypass` (it resolves the merge with no human in the
+loop), so it is gated by the same flag+whitelist posture as bypass/approve AND additionally
+**refuses to serve** unless both signals are live (fail-closed — never a silent
+park-everything). What auto changes is only **who pulls the merge trigger**, never the
+merge protocol itself (clean tree, ancestor check, no force, abort-on-conflict — unchanged).
+
+The merge signal is **not claimed unforgeable**, and this is the load-bearing residual:
+
+- **The two signals are correlated, not independent.** The evaluator is the same
+  model family reviewing the *same diff* that steered the executor, and verify runs the
+  *agent-authored* tests. A determined injection can satisfy both. "Two green signals"
+  means **"not obviously bad", never "safe"**.
+- **Verdict-injection is mitigated at the parser, not sealed.** `parse_verdict` reads
+  only the evaluator's own first line, so a `VERDICT: approve` *echoed* from diff content
+  is inert. But it does **not** defend against a diff that prompt-injects the evaluator
+  model into *genuinely emitting* `approve` as its own first line — in auto mode that is a
+  merge trigger. The random-token delimiter raises the bar; it does not close the hole.
+- **Dependency changes are surfaced, not gated.** verify already runs
+  `pip install -e . && pytest` *before* any gate, so third-party install/import code
+  executes in the credential-holding executor regardless of who merges — a merge-time
+  dep-veto protects nothing and would gut auto's purpose. Auto instead lists changed
+  dependency/lockfile/config paths in the audit message. The real fix (a credential-free
+  / egress-restricted verify sandbox) is orthogonal to gate mode and tracked separately;
+  it is the same RCE surface §7 already accepts for human mode.
+
+Operators enabling `auto` are accepting that an injection which defeats *both* correlated
+signals auto-merges without a human. Prefer it for trusted, low-injection task streams;
+keep human mode where diff content is attacker-influenced.
+
 ---
 
 ## 5. Prompt-injection isolation
@@ -179,6 +215,30 @@ context when a whitelisted user later triggers a bot.
 
 Cross-bot messages are additionally tagged as *reference, not instructions* in
 the context prefix.
+
+**Outbound media (`DISCORD_ATTACH`) — a higher-bandwidth version of an existing
+residual, not a new boundary.** The frontend already posts arbitrary reply **text** to
+the operator-only channel, so a trusted-or-injected agent can already exfil secrets as
+text (the reply-exfil residual, §7). Outbound media lets the agent additionally attach a
+**workspace file** by writing a `DISCORD_ATTACH: <relative-path>` marker — raising that
+residual from text to whole-file binary content. It is bounded, not eliminated:
+
+- **Containment by `is_relative_to`, never a string prefix.** The path is resolved
+  (`Path.resolve()` follows symlinks first) and must be inside the reply's workspace root
+  — the job worktree/job dir for an exec reply, the live checkout for a chat reply. A
+  neighbour dir `<root>-evil` that would pass a prefix check is refused; a
+  whitelisted-extension symlink pointing outside the root is refused by *containment*, not
+  by the extension check; an absolute path resolves to itself and is refused.
+- **Whitelist + caps:** png/jpg/jpeg/gif/svg/html/txt/pdf only; ≤ 8 MB/file, ≤ 4
+  files/message. Marker lines are stripped from the posted text; every refusal is logged.
+- **Confidentiality is bounded by the channel, not the file check.** Attachments reach
+  only `ALLOWED_USER_IDS` (the same audience as reply text today). In a split deploy the
+  attach runs frontend-side reading a shared-volume workspace, so this is also a
+  cross-container read coupling — the frontend can surface bytes the executor produced.
+
+The honest framing: this does not make exfil possible where it was not before; it widens
+the bandwidth of a residual that already exists because the frontend relays agent output
+to a human at all.
 
 ---
 

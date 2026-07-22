@@ -248,16 +248,25 @@ PROJECT_DIRS: list[Path] = []
 # record absolute gitdir pointers that the operator also reads from the host.
 PROJECT_BASE_DIR: Path = Path("/home/user/projects")
 
-VALID_MODES = {"plan", "edit", "bypass", "approve"}
-# "approve" is the M4 per-command tier: runs claude in `default` permission mode
-# (the only mode --permission-prompt-tool is consulted in).
+VALID_MODES = {"plan", "edit", "bypass", "approve", "auto"}
+# "approve" is the M4 per-command tier: runs claude in `manual` permission mode (the
+# only mode --permission-prompt-tool is consulted in). `manual` is the canonical name
+# for the mode formerly called `default` — claude 2.1.217 dropped `default` from the
+# documented --permission-mode choices (still an undocumented back-compat alias), so the
+# bridge tracks the documented name.
+#
+# "auto" is a BRIDGE-SIDE gate policy (auto-merge), NOT the CLI `--permission-mode auto`
+# classifier (whose 3/20-block session-abort makes it unusable for an unattended job).
+# The subprocess runs on acceptEdits exactly like `edit`; only the diff-gate resolution
+# differs (machine-driven verify+evaluator instead of a human ✅/❌). See design §1.
 MODE_ALIASES = {
     "plan": "plan",
     "edit": "acceptEdits",
     "acceptedits": "acceptEdits",
     "bypass": "bypassPermissions",
     "bypasspermissions": "bypassPermissions",
-    "approve": "default",
+    "approve": "manual",
+    "auto": "acceptEdits",
 }
 DEFAULT_CHANNEL_MODE = "plan"  # safe default; bypass requires opt-in
 
@@ -275,12 +284,22 @@ EVALUATOR_ENABLED: bool = False
 # startup); in the single-container posture the gate is unproven and the tier stays
 # inert regardless of the flag — see runner.m4_live(). Fail-closed by construction.
 EXEC_BASH_ENABLED: bool = False
+# unattended-auto-mode — auto-merge tier (ENABLE_AUTO_MERGE), OFF by default. Gates the
+# `auto` channel mode TOGETHER with the ALLOWED_USER_IDS whitelist (trust.auto_allowed):
+# auto carries MORE authority than bypass (it resolves the merge without a human), so it
+# demands the same flag+whitelist posture, PLUS its two machine signals (verify path +
+# evaluator) live. Fail-closed.
+AUTO_MERGE_ENABLED: bool = False
+# Hard bound on how many jobs one auto-mode task list may chain (int > 0). A malformed or
+# non-positive value falls back to the default rather than disabling the bound.
+AUTO_MAX_JOBS: int = 5
 
 # The env-derived globals load_config() owns — single source of truth so tests can
 # snapshot/restore them without a hand-maintained list drifting out of sync.
 _CONFIG_GLOBALS = ("CHANNEL_ID", "ALLOWED_USER_IDS", "USE_API_KEY", "BOTS",
                    "PROJECT_DIRS", "PROJECT_BASE_DIR", "BYPASS_TIER_ENABLED",
-                   "APPROVER_TIER_ENABLED", "EVALUATOR_ENABLED", "EXEC_BASH_ENABLED")
+                   "APPROVER_TIER_ENABLED", "EVALUATOR_ENABLED", "EXEC_BASH_ENABLED",
+                   "AUTO_MERGE_ENABLED", "AUTO_MAX_JOBS")
 
 
 def load_config() -> None:
@@ -289,6 +308,7 @@ def load_config() -> None:
     Ends by validating (fail-closed)."""
     global CHANNEL_ID, ALLOWED_USER_IDS, USE_API_KEY, BOTS, PROJECT_DIRS, PROJECT_BASE_DIR
     global BYPASS_TIER_ENABLED, APPROVER_TIER_ENABLED, EVALUATOR_ENABLED, EXEC_BASH_ENABLED
+    global AUTO_MERGE_ENABLED, AUTO_MAX_JOBS
     CHANNEL_ID = int(os.environ["DISCORD_CHANNEL_ID"])
     ALLOWED_USER_IDS = {
         int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").split(",") if x.strip()
@@ -298,6 +318,13 @@ def load_config() -> None:
     APPROVER_TIER_ENABLED = os.environ.get("ENABLE_APPROVER_TIER", "").strip().lower() in ("1", "true", "yes", "on")
     EVALUATOR_ENABLED = os.environ.get("ENABLE_EXEC_EVALUATOR", "").strip().lower() in ("1", "true", "yes", "on")
     EXEC_BASH_ENABLED = os.environ.get("ENABLE_EXEC_BASH", "").strip().lower() in ("1", "true", "yes", "on")
+    AUTO_MERGE_ENABLED = os.environ.get("ENABLE_AUTO_MERGE", "").strip().lower() in ("1", "true", "yes", "on")
+    try:
+        AUTO_MAX_JOBS = int(os.environ.get("AUTO_MAX_JOBS", "5"))
+    except ValueError:
+        AUTO_MAX_JOBS = 5
+    if AUTO_MAX_JOBS < 1:
+        AUTO_MAX_JOBS = 5
     BOTS = {
         n: {"token": os.environ[f"DISCORD_BOT_{n}_TOKEN"],
             "config_dir": BOT_CONFIG_DIRS[n],

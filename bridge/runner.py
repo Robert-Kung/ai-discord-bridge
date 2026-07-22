@@ -193,7 +193,7 @@ async def run_settings_canary(bot_name: str = "B", settings_path: str | None = N
     load with the deny family still firing (claude silently ignores an invalid
     --settings file — the exact OV1 hazard, now checked for the exec tier too)."""
     cfg = config.BOTS[bot_name]
-    args = build_claude_args("default", settings_path=settings_path)
+    args = build_claude_args("manual", settings_path=settings_path)
     env = build_subprocess_env(cfg)
     try:
         rc, stdout, _ = await _run_claude_subprocess(
@@ -767,7 +767,9 @@ async def _call_claude(
 
 
 # ── Two trust layers — the only public entries to the chokepoint (D3) ────────
-_EXEC_MODES = {"edit", "acceptEdits", "bypass", "bypassPermissions", "approve"}
+# "auto" is an execution tier whose SUBPROCESS runs on acceptEdits (like edit); its
+# distinctness is the gate policy, resolved frontend-side, not a different CLI mode.
+_EXEC_MODES = {"edit", "acceptEdits", "bypass", "bypassPermissions", "approve", "auto"}
 
 
 async def converse(
@@ -788,9 +790,11 @@ async def converse(
 
 def exec_layer_for(is_bot_msg: bool, effective_mode: str) -> str:
     """Routing decision (D3 layer split): 'execute' ONLY for a human-driven
-    execution-tier request (`edit`, or the M4 `approve` tier); every other case
-    routes to 'converse'. Pure, so the structural guarantee is unit-testable."""
-    if not is_bot_msg and effective_mode in ("edit", "approve"):
+    execution-tier request (`edit`, the M4 `approve` tier, or the `auto` auto-merge
+    tier); every other case routes to 'converse'. A bot-origin mention NEVER reaches
+    execute, so the conversation layer can never drive an auto-merge. Pure, so the
+    structural guarantee is unit-testable."""
+    if not is_bot_msg and effective_mode in ("edit", "approve", "auto"):
         return "execute"
     return "converse"
 

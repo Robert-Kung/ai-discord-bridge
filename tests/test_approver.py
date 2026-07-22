@@ -170,8 +170,10 @@ def test_build_args_no_approver_flags_by_default():
     assert "--settings" in args  # 5.3: with approver off, deny/sandbox still apply
 
 
-def test_approve_mode_maps_to_default():
-    assert config.MODE_ALIASES["approve"] == "default"  # only mode the prompt-tool is consulted in
+def test_approve_mode_maps_to_manual():
+    # `manual` is the canonical name for the mode formerly called `default` (claude
+    # 2.1.217 renamed it); still the only mode --permission-prompt-tool is consulted in.
+    assert config.MODE_ALIASES["approve"] == "manual"
 
 
 def test_approve_tier_default_closed(monkeypatch):

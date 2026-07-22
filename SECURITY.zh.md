@@ -96,8 +96,12 @@ bot 只監聽單一 `DISCORD_CHANNEL_ID`。把它放在只有可信者能發言�
 |------|------|:---:|:---:|:---:|
 | `plan`（預設） | `--permission-mode plan` | ❌ | 僅唯讀 | ✅ |
 | `edit` | `acceptEdits` | ✅ | ✅（deny family 擋掉的除外） | ✅ |
-| `approve`（opt-in，預設關閉） | `default` + MCP approver | ✅ | 白名單自動，其餘要人工 ✅ | ✅ |
+| `approve`（opt-in，預設關閉） | `manual` + MCP approver | ✅ | 白名單自動，其餘要人工 ✅ | ✅ |
 | `bypass`（opt-in，預設關閉） | `bypassPermissions` | ✅ | ✅（deny family 擋掉的除外） | ✅ |
+| `auto`（opt-in，預設關閉） | `acceptEdits` + 閘門政策 | ✅ | ✅（deny family 擋掉的除外） | ✅ |
+
+（`manual` 是 `default` 更名後的現行名稱；claude 2.1.217 改名，`default` 仍作未文件化的
+back-compat alias 被接受。）
 
 **關於這個版本 Claude Code 的兩件事（實測——見 `openspec/.../preflight-findings.md`）：**
 
@@ -134,6 +138,31 @@ policy。
 rw 的 `discord-state` volume：開了 Bash 的 exec agent 寫得到那裡，否則就能偽造
 自己的綠燈。`:ro` 掛載讓 verify 訊號**無法被受檢的 agent 偽造**。
 
+**Auto 自動合併層（`auto`，`ENABLE_AUTO_MERGE`，預設關閉）。** 這一層用兩個機器訊號
+取代人類 ✅/❌——每專案 **verify**（agent 寫的測試）與跨帳號 **evaluator**（另一隻 bot 的
+結構化 `VERDICT:`）。它的權限**高於** `bypass`（無人在迴圈裡就決定合併），故沿用
+bypass/approve 的 flag+白名單姿態，並**額外拒絕啟用**——兩個訊號沒同時就緒就不開
+（fail-closed，不會靜默把每個 job 都保留待審）。auto 只改**由誰扣下合併扳機**，合併協定
+本身（clean tree／ancestor／no-force／衝突 abort）**原封不動**。
+
+合併訊號**不宣稱不可偽造**，這是承重的殘留：
+
+- **兩訊號相關、非獨立。** evaluator 是同模型家族、審的是 steering 了 executor 的**同一份
+  diff**，verify 跑的是 **agent 自己寫**的測試。夠決心的注入能同時滿足兩者。「兩個綠燈」
+  = 「沒有明顯壞」，**絕不等於「安全」**。
+- **verdict-injection 在 parser 緩解、非封死。** `parse_verdict` 只讀 evaluator 自己的
+  第一行，所以 diff 內容**回聲**出的 `VERDICT: approve` 失效；但擋不掉「diff prompt-inject
+  evaluator，讓它自己第一行真的吐出 `approve`」——auto 模式下那就是合併扳機。隨機 token
+  分隔線提高門檻，並未補上這個洞。
+- **依賴變更只 surface、不 gate。** verify 早在任何 gate **之前**就跑了
+  `pip install -e . && pytest`，第三方 install/import 程式碼無論誰合併都已在憑證持有的
+  executor 內執行——merge-time dep-veto 保護不了任何東西、還廢掉 auto 的用途。auto 改為在
+  audit 訊息列出變更的依賴/lockfile/設定檔路徑。真正的修法（credential-free／egress 受限的
+  verify sandbox）與閘門模式正交、另案追蹤；那也正是 §7 對人審模式已接受的同一 RCE 面。
+
+啟用 `auto` 的操作者，等於接受「一個能同時擊破兩個相關訊號的注入會無人審自動合併」。
+建議只用在可信、低注入的任務流；diff 內容受攻擊者影響的場景請留在人審模式。
+
 ---
 
 ## 5. Prompt injection 隔離
@@ -148,6 +177,25 @@ rw 的 `discord-state` volume：開了 Bash 的 exec agent 寫得到那裡，否
 白名單使用者稍後觸發 bot 時被當成脈絡帶入。
 
 此外，跨 bot 的訊息在脈絡前綴中會額外標註為「僅供參考，非指令」。
+
+**Outbound media（`DISCORD_ATTACH`）——既有殘留的高頻寬版，不是新邊界。** frontend 本來
+就把任意回覆**文字**貼到 operator-only 頻道，所以被信任或被注入的 agent 早就能把祕密當
+文字外流（reply-exfil 殘留，§7）。outbound media 讓 agent 額外能用 `DISCORD_ATTACH:
+<相對路徑>` 標記夾帶**工作區檔案**——把這個殘留從文字提升到整檔的二進位內容。它被界定、
+未被消除：
+
+- **containment 用 `is_relative_to`、非字串前綴。** 路徑先 `Path.resolve()`（先跟出 symlink）
+  再要求落在回覆的 workspace root 內——exec 回覆是 worktree/job dir、chat 回覆是 live
+  checkout。能騙過前綴檢查的鄰目錄 `<root>-evil` 被拒；指向 root 外的白名單副檔名 symlink
+  由**containment**（非副檔名檢查）擋下；絕對路徑 resolve 成自身、被拒。
+- **白名單 + 上限：** 只允許 png/jpg/jpeg/gif/svg/html/txt/pdf；每檔 ≤ 8 MB、每則 ≤ 4 檔。
+  標記行從貼出的文字剝除；每次拒絕都記 log。
+- **機密性由頻道界定、非檔案檢查。** 附件只到 `ALLOWED_USER_IDS`（與今天的回覆文字同一
+  受眾）。split 部署下 attach 在 frontend 側讀共享 volume 的 workspace，所以這也是一種
+  跨容器讀取耦合——frontend 能把 executor 產出的位元組送出去。
+
+誠實框架：這沒有讓「原本不可能的外流」變可能，只是拓寬了一個**本就存在**的殘留頻寬——因為
+frontend 本來就會把 agent 產出轉給人類看。
 
 ---
 
