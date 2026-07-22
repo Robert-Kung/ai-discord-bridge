@@ -271,6 +271,13 @@ def resolve_attachment_markers(reply: str, root: str) -> "tuple[str, list[str], 
         # an unresolvable root refuses everything but still strips the markers
         cleaned = _ATTACH_MARKER_RE.sub("", reply).strip()
         return cleaned, [], ["<all>（workspace root 無法解析）"]
+    # Refuse when the root is the home/default dir (no project selected): that is not a
+    # project workspace and rooting containment there would expose the whole home tree as
+    # a higher-bandwidth exfil surface (review M3). Attachments need a selected project or
+    # an exec worktree.
+    if root_resolved == Path(config.DEFAULT_CWD).resolve():
+        cleaned = _ATTACH_MARKER_RE.sub("", reply).strip()
+        return cleaned, [], ["<all>（未選專案，home 目錄不允許夾帶附件——先 `!cd <專案>`）"]
     accepted: list[str] = []
     refusals: list[str] = []
     for m in _ATTACH_MARKER_RE.finditer(reply):
@@ -366,7 +373,7 @@ async def start_exec_job(message: discord.Message, bot_name: str, prompt: str,
 
 
 async def _run_auto_chain(message: discord.Message, bot_name: str, context: str,
-                          task_text: str, mention_hint: str, cwd: str) -> None:
+                          task_text: str, cwd: str) -> None:
     """Auto-mode driver (unattended-auto-mode §3): run an ordered task list, advancing to
     task N+1 ONLY when task N reached `status == DONE` (its merge commit exists). An
     `approve` verdict that still parks (dirty/diverged/conflict) is NOT DONE and stops the
@@ -394,12 +401,15 @@ async def _run_auto_chain(message: discord.Message, bot_name: str, context: str,
             await message.channel.send(
                 f"🛑 `{_where(cwd)}` 已有進行中/待審任務，auto chain 停止（`!jobs` 查看）")
             return
+        # occupancy check + create_job MUST stay await-free between them so a racing
+        # on_message can't pass the same check and double-claim the project; the per-task
+        # progress line is therefore sent AFTER create_job holds the slot.
+        job = jobs.create_job(bot_name, cwd, message.channel.id)
         if total > 1:
             await message.channel.send(f"⛓️ [{i}/{total}] {task[:200]}")
-        # cap check + create_job are synchronous with no await between (same guarantee as
-        # start_exec_job) so the project can't be double-claimed by a racing message.
-        job = jobs.create_job(bot_name, cwd, message.channel.id)
-        prompt = f"{context}[from {message.author.display_name}] {task}{mention_hint}"
+        # mention_hint is deliberately dropped in auto mode: an unattended chain must not
+        # @-ping the other bot mid-run (that spawns conversation turns no human is watching).
+        prompt = f"{context}[from {message.author.display_name}] {task}"
         await _drive_exec_job(job, message, bot_name, prompt, "auto", cwd)
         ran += 1
         if job.status != jobs.DONE:
@@ -434,6 +444,19 @@ async def _drive_exec_job(job, message: discord.Message, bot_name: str, prompt: 
         except discord.HTTPException:
             status_msg = await channel.send(_render_job_status(job, where, None))
         jobs.set_msg(job, status_msg.id)
+
+        # Auto mode REQUIRES the worktree + diff-gate machinery (its whole contract is
+        # "verify + evaluator gate every change"). A non-git cwd has no gate — the M1
+        # direct-on-live path below would run ungated, unaudited, and count as a
+        # chain-advancing DONE (security/code-review H1; DEFAULT_CWD is non-git, so this
+        # is reachable by default). Refuse fail-closed BEFORE the agent runs; FAILED (not
+        # DONE) also stops any chain.
+        if mode == "auto" and not use_worktree:
+            jobs.set_status(job, jobs.FAILED)
+            await _safe_edit(status_msg,
+                             f"🛑 **[job `{job.id}`]** auto 模式需要 git 專案（diff gate + verify 才成立）；"
+                             f"`{where}` 不是 git 專案，已拒絕。先 `!cd <git 專案>` 再用 auto。")
+            return
 
         if use_worktree:
             try:
@@ -868,7 +891,16 @@ async def _auto_park(job, channel, reason: str, *, stat: str, base8: str,
                      findings: str = "") -> None:
     """Park an auto job as awaiting-review (branch + persisted diff survive) with the
     audit trail and the stop reason. Keeps the branch — the operator can still `!merge`
-    after inspecting. Only flips a still-RUNNING job (a concurrent !cancel wins)."""
+    after inspecting. If a concurrent `!cancel` won (status already CANCELLED), the
+    operator threw the work away — discard the branch/worktree and do NOT post a
+    contradictory 'awaiting-review' audit (M4)."""
+    if job.status == jobs.CANCELLED:
+        try:
+            await worktree.discard_job(job.project, job.id)
+        except Exception:
+            pass
+        await channel.send(f"🛑 job `{job.id}` 已在自動審查期間取消——變更已丟棄")
+        return
     await _post_auto_audit(job, channel, f"🅿️ 保留待審（{reason}）", stat=stat, base8=base8,
                            verify_tail=verify_tail, verdict=verdict, dep_note=dep_note,
                            findings=findings)
@@ -904,6 +936,10 @@ async def _resolve_auto_gate(job, channel, author_bot: str, project: str,
         await _auto_park(job, channel, "verify 執行出錯", stat=stat, base8=base8,
                          verify_tail="", verdict="—", dep_note=dep_note)
         return
+    if job.status == jobs.CANCELLED:  # !cancel landed during verify
+        await worktree.discard_job(project, job.id)
+        await channel.send(f"🛑 job `{job.id}` 已在 verify 期間取消——變更已丟棄")
+        return
     if not configured:
         await _auto_park(job, channel, "未設定 verify（discord-verify/ 無此專案）—— auto 絕不合併未驗證的變更",
                          stat=stat, base8=base8, verify_tail=tail, verdict="—", dep_note=dep_note)
@@ -922,6 +958,13 @@ async def _resolve_auto_gate(job, channel, author_bot: str, project: str,
             verdict = discuss.parse_verdict(findings)
     except Exception:
         log.exception("auto evaluator raised for job %s → treat as unsure", job.id)
+
+    # The evaluator only sees the first _EVAL_DIFF_CAP chars; on an approve of a larger
+    # diff no human is present at the truncation warning, so flag it in the audit trail
+    # (verify still ran the whole tree — this is a secondary-signal caveat, not a bypass).
+    if len(full) > discuss._EVAL_DIFF_CAP:
+        dep_note += (f"\n✂️ **evaluator 只看了前 {discuss._EVAL_DIFF_CAP // 1000}k 字元**"
+                     f"（diff 共 {len(full) // 1000}k）——其 verdict 基於部分視圖，verify 仍跑了整棵樹。")
 
     if job.status == jobs.CANCELLED:  # !cancel arrived during verify/review
         await worktree.discard_job(project, job.id)
@@ -1285,7 +1328,7 @@ def make_client(bot_name: str) -> discord.Client:
                 # auto mode: the message MAY be an ordered task list; the chain driver
                 # runs each task through the auto gate, advancing only on a merged (DONE)
                 # predecessor. A single task is just a chain of length 1.
-                await _run_auto_chain(message, bot_name, context, cleaned_content, mention_hint, cwd)
+                await _run_auto_chain(message, bot_name, context, cleaned_content, cwd)
             else:
                 await start_exec_job(message, bot_name, prompt, effective_mode, cwd)
             return

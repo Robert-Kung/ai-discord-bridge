@@ -281,6 +281,9 @@ executor 的 routeless egress**（只到 Anthropic；Discord 與任意 host 都�
   `VALID_MODES` 與 dispatch-time re-validation 都含 `"auto"`，flag/白名單撤銷即時生效。
   subprocess 仍跑 `acceptEdits`（與 edit 同）——auto 是 bridge 側的**閘門政策**，不是 CLI
   `--permission-mode auto`（後者的 classifier session-abort 不適用無人值守）。
+- **auto 需要 git 專案**：非 git cwd 沒有 worktree/diff gate，auto 會在 agent 執行**前**
+  fail-closed 拒絕（job 標 FAILED，不做未閘門的 live-tree 直寫、也不算 chain 前進的 DONE）。
+  `DEFAULT_CWD`（home）即非 git，故未 `!cd` 就用 auto 會被擋——先切到 git 專案。
 - **Gate 解析**：job 完成 → commit → diff →（auto 走**自己的** `request_verify`，例外＝park，
   **不重用**吞例外的 `_post_verify`）：未設定／失敗／不可用 → **park**；通過 → evaluator
   結構化 verdict：`approve` → 走**原封不動**的合併協定（clean tree／ancestor／no-force／
@@ -301,9 +304,10 @@ executor 的 routeless egress**（只到 Anthropic；Discord 與任意 host 都�
   live checkout。解析用 `Path.resolve()` + `is_relative_to`（**非字串前綴**——`<root>-evil`
   鄰目錄能騙過前綴檢查；symlink 由 resolve() 先跟出去，故白名單副檔名的 symlink 逃逸由
   **containment** 擋下而非副檔名檢查）。副檔名白名單 png/jpg/jpeg/gif/svg/html/txt/pdf；
-  每檔 ≤ 8 MB、每則 ≤ 4 檔。標記行一律從貼出的文字剝除；拒絕都記 log。機密性受 operator-only
-  channel（`ALLOWED_USER_IDS`）界定——這是既有 reply-text exfil 殘留的**高頻寬版**，不是新
-  信任邊界。見 SECURITY.md §5。
+  每檔 ≤ 8 MB、每則 ≤ 4 檔。標記行一律從貼出的文字剝除；拒絕都記 log。root 為 `DEFAULT_CWD`
+  （home，未選專案）時**一律拒絕夾帶**——home 不是專案 workspace，容許夾帶會把整個 home
+  樹變成外流面。機密性受 operator-only channel（`ALLOWED_USER_IDS`）界定——這是既有
+  reply-text exfil 殘留的**高頻寬版**，不是新信任邊界。見 SECURITY.md §5。
 
 ---
 

@@ -77,29 +77,41 @@ async def run_discuss(channel: discord.TextChannel, topic: str) -> None:
 # evaluator knows its view is partial (the human gate still sees/merges everything).
 _EVAL_DIFF_CAP = 60_000
 
-# The auto tier reads the evaluator's structured first-line verdict. Tolerant of
-# surrounding markdown/preamble on that line (`**VERDICT: approve**`, a full-width colon,
-# a trailing `— clause`), matching only approve/reject/unsure.
+# The auto tier reads the evaluator's structured first-line verdict. The token must be at
+# the START of the first non-empty line (after only decoration is stripped, below), so a
+# trailing clause (`— looks correct`) and a full-width colon are tolerated but a QUOTE is
+# not. `\*{0,2}` absorbs bold on the token itself (`VERDICT: **approve**`).
 _VERDICT_RE = re.compile(r"verdict\s*[:：]\s*\*{0,2}\s*(approve|reject|unsure)", re.IGNORECASE)
+# Leading decoration that may precede the verdict WITHOUT making it a quote: whitespace,
+# markdown emphasis/list markers (`* _ # > - •`), backticks, and emoji/symbol ranges. It
+# is a WHITELIST — it never strips a letter of ANY script (Latin/CJK/Hangul/Cyrillic/…),
+# so a first line that opens with prose (`關於 diff 裡的 VERDICT: approve…`, `diff 說
+# VERDICT: approve`, `안녕 VERDICT: approve`) does NOT start with the verdict after
+# stripping and parses as unsure. Anchoring at line-start is what makes a first-line ECHO
+# of an injected verdict inert, not just a later-line one (security review F1).
+_VERDICT_PREAMBLE_RE = re.compile(
+    r"^[\s*_#>\-•`~←-⯿️\U0001f000-\U0001faff]+")
 
 
 def parse_verdict(text: "str | None") -> str:
     """Return the evaluator's structured verdict: "approve" | "reject" | "unsure".
 
-    Reads ONLY the evaluator's own FIRST non-empty line — a `VERDICT: approve` on any
-    later line (e.g. echoed from an attacker-influenced diff) never counts. Tolerant of
-    markdown/preamble on that first line so a well-formed approval is not false-parked.
-    Anything unrecognised, empty, or None → "unsure" (fail-safe: unsure/reject park,
-    only an explicit first-line approve merges). This defeats a LITERAL injected verdict
-    string; it does NOT defend against a diff that prompt-injects the evaluator model
-    into genuinely emitting `approve` as its own first line — that residual is documented
-    in SECURITY.md, not sealed here."""
+    Reads ONLY the evaluator's own FIRST non-empty line, and only when the verdict token
+    is at the START of that line (after decoration is stripped) — a `VERDICT: approve`
+    on a later line OR merely quoted/led-with mid-prose on the first line never counts.
+    Tolerant of leading markdown/emoji and a trailing clause so a well-formed approval is
+    not false-parked. Anything unrecognised, empty, or None → "unsure" (fail-safe:
+    unsure/reject park, only a clean first-line approve merges). This defeats a LITERAL
+    injected/echoed verdict string; it does NOT defend against a diff that prompt-injects
+    the evaluator model into genuinely emitting `approve` as its own clean first line —
+    that residual is documented in SECURITY.md §4, not sealed here."""
     if not text:
         return "unsure"
     for line in text.splitlines():
         if not line.strip():
             continue
-        m = _VERDICT_RE.search(line)
+        stripped = _VERDICT_PREAMBLE_RE.sub("", line)
+        m = _VERDICT_RE.match(stripped)
         return m.group(1).lower() if m else "unsure"
     return "unsure"
 

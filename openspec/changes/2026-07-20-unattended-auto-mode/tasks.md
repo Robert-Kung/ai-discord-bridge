@@ -97,8 +97,20 @@
       headless `-p` (semantics unchanged — this is the only thing static analysis can't prove)
 
 ## 6. Review gate
-- [ ] 6.1 reviewer + security-reviewer on the full diff（auto-merge 決策面＋outbound 外流面；
-      重點：H2 verdict-injection、雙訊號相關性、containment `is_relative_to`）
+- [x] 6.1 reviewer + security-reviewer on the full diff（auto-merge 決策面＋outbound 外流面）
+      — both converged; blockers fixed:
+      - H1 (both, HIGH): `auto` on a non-git cwd ran UNGATED + chain-advanced (DEFAULT_CWD
+        non-git → default-reachable) → now refused fail-closed before the agent runs
+      - F1 (sec, MED): `parse_verdict` first-line LEADING echo parsed approve → now
+        line-start-anchored (whitelist decoration strip, any script)
+      - M2 (code): occupancy TOCTOU + wrong "no await" comment → send moved after create_job
+      - M3 (code): outbound root = DEFAULT_CWD (home) exposed whole home tree → refused
+      - M4 (code): !cancel during verify leaked worktree + contradictory park → discard
+      - F2 (sec, LOW): evaluator saw truncated diff on approve → audit now flags it
+      - LOW: mention_hint dropped from unattended auto prompts; AUTO_MAX_JOBS clamped ≤ 50
+      Accepted residuals (documented, out of scope): R1 evaluator genuine-obedience
+      injection (correlated signals), R2 verify-RCE (gate-independent), F3 per-message
+      (not per-task) tier re-validation (latent — flags are process globals).
 - [ ] 6.2 Live smoke: auto job with passing verify round-trips to merged; park paths
       (unverified / reject / evaluator-unavailable / refuse-to-serve) visible;
       dep-touching job auto-merges WITH a dep-note in the audit message

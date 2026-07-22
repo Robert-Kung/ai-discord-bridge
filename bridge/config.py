@@ -325,6 +325,7 @@ def load_config() -> None:
         AUTO_MAX_JOBS = 5
     if AUTO_MAX_JOBS < 1:
         AUTO_MAX_JOBS = 5
+    AUTO_MAX_JOBS = min(AUTO_MAX_JOBS, 50)  # upper clamp: a typo'd 100000 must not chain unbounded
     BOTS = {
         n: {"token": os.environ[f"DISCORD_BOT_{n}_TOKEN"],
             "config_dir": BOT_CONFIG_DIRS[n],

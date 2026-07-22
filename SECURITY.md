@@ -171,8 +171,10 @@ tests) and the cross-account **evaluator** (the OTHER bot's structured `VERDICT:
 carries **more** authority than `bypass` (it resolves the merge with no human in the
 loop), so it is gated by the same flag+whitelist posture as bypass/approve AND additionally
 **refuses to serve** unless both signals are live (fail-closed — never a silent
-park-everything). What auto changes is only **who pulls the merge trigger**, never the
-merge protocol itself (clean tree, ancestor check, no force, abort-on-conflict — unchanged).
+park-everything). It also **refuses a non-git cwd fail-closed** (no worktree ⇒ no gate ⇒
+no unattended write; `DEFAULT_CWD` is non-git, so `!mode auto` without `!cd` is refused).
+What auto changes is only **who pulls the merge trigger**, never the merge protocol itself
+(clean tree, ancestor check, no force, abort-on-conflict — unchanged).
 
 The merge signal is **not claimed unforgeable**, and this is the load-bearing residual:
 
@@ -181,10 +183,13 @@ The merge signal is **not claimed unforgeable**, and this is the load-bearing re
   *agent-authored* tests. A determined injection can satisfy both. "Two green signals"
   means **"not obviously bad", never "safe"**.
 - **Verdict-injection is mitigated at the parser, not sealed.** `parse_verdict` reads
-  only the evaluator's own first line, so a `VERDICT: approve` *echoed* from diff content
-  is inert. But it does **not** defend against a diff that prompt-injects the evaluator
-  model into *genuinely emitting* `approve` as its own first line — in auto mode that is a
-  merge trigger. The random-token delimiter raises the bar; it does not close the hole.
+  only the evaluator's own first line AND requires the verdict token at that line's start
+  (after markdown/emoji decoration is stripped — a whitelist that never strips a letter of
+  any script). So a `VERDICT: approve` *echoed or quoted* from diff content — on a later
+  line, or led-with mid-first-line (`關於 diff 裡的 VERDICT: approve…`) — is inert. It does
+  **not** defend against a diff that prompt-injects the evaluator model into *genuinely
+  emitting* `approve` as its own clean first line — in auto mode that is a merge trigger.
+  The random-token delimiter and the line-start anchor raise the bar; they do not close it.
 - **Dependency changes are surfaced, not gated.** verify already runs
   `pip install -e . && pytest` *before* any gate, so third-party install/import code
   executes in the credential-holding executor regardless of who merges — a merge-time

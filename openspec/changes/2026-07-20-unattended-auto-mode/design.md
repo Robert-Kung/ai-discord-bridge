@@ -79,7 +79,14 @@ job done → commit (HEAD≠base semantics per fix/job-loss-family) → diff
   gate mode, protects human mode too, and is tracked as a separate change.
 - `_do_merge` unchanged: MERGING claim, project lock, clean-tree, ancestor, no-force.
   Auto mode changes only WHO pulls the trigger, not what the trigger does.
-- Failure posture: any exception in the auto path → PARK (never discard, never merge).
+- **Non-git cwd → refuse fail-closed (review H1):** a non-git cwd has no worktree and no
+  diff gate, so the M1 direct-on-live path would run the agent UNGATED and (worse) return
+  `DONE`, which the chain would read as "merged" and advance. `DEFAULT_CWD` is non-git, so
+  this is reachable by default. `_drive_exec_job` therefore refuses an `auto` job on a
+  non-git cwd BEFORE the agent runs (status → FAILED, which also stops any chain).
+- Failure posture: any exception in the auto path → PARK (never discard, never merge). A
+  `!cancel` landing during verify/evaluator → discard the branch (the operator threw it
+  away), never a contradictory "awaiting-review" park (review M4).
 
 ## 3. Auto-continue chain
 
@@ -112,6 +119,9 @@ simply stops — the audit trail says where.
   Resolution: `Path(root, rel).resolve()` must satisfy `is_relative_to(root)` after
   symlink resolution — NOT a string prefix (a `worktree` vs `worktree-evil` sibling
   would pass a prefix check). Else refuse + log the offending path.
+  - **`DEFAULT_CWD` (home) root → refuse all (review M3):** with no project selected the
+    chat root is the home dir; rooting containment there would expose the whole home tree.
+    Attachments require a selected project (or an exec worktree), never the home root.
 - **Extension whitelist**: png jpg jpeg gif svg html txt pdf; per-file ≤ 8 MB (Discord
   cap), ≤ 4 files/message.
 - **Exfil stance (corrected)**: the earlier "attached bytes == the bytes the operator

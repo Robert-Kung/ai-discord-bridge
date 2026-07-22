@@ -142,8 +142,10 @@ rw 的 `discord-state` volume：開了 Bash 的 exec agent 寫得到那裡，否
 取代人類 ✅/❌——每專案 **verify**（agent 寫的測試）與跨帳號 **evaluator**（另一隻 bot 的
 結構化 `VERDICT:`）。它的權限**高於** `bypass`（無人在迴圈裡就決定合併），故沿用
 bypass/approve 的 flag+白名單姿態，並**額外拒絕啟用**——兩個訊號沒同時就緒就不開
-（fail-closed，不會靜默把每個 job 都保留待審）。auto 只改**由誰扣下合併扳機**，合併協定
-本身（clean tree／ancestor／no-force／衝突 abort）**原封不動**。
+（fail-closed，不會靜默把每個 job 都保留待審）。它也**對非 git cwd fail-closed 拒絕**
+（沒有 worktree ⇒ 沒有 gate ⇒ 不做無人值守寫入；`DEFAULT_CWD` 即非 git，故未 `!cd` 就下
+`!mode auto` 會被擋）。auto 只改**由誰扣下合併扳機**，合併協定本身（clean tree／ancestor／
+no-force／衝突 abort）**原封不動**。
 
 合併訊號**不宣稱不可偽造**，這是承重的殘留：
 
@@ -151,9 +153,11 @@ bypass/approve 的 flag+白名單姿態，並**額外拒絕啟用**——兩個�
   diff**，verify 跑的是 **agent 自己寫**的測試。夠決心的注入能同時滿足兩者。「兩個綠燈」
   = 「沒有明顯壞」，**絕不等於「安全」**。
 - **verdict-injection 在 parser 緩解、非封死。** `parse_verdict` 只讀 evaluator 自己的
-  第一行，所以 diff 內容**回聲**出的 `VERDICT: approve` 失效；但擋不掉「diff prompt-inject
-  evaluator，讓它自己第一行真的吐出 `approve`」——auto 模式下那就是合併扳機。隨機 token
-  分隔線提高門檻，並未補上這個洞。
+  第一行，**且要求 verdict token 在該行開頭**（剝除 markdown/emoji 裝飾後——那是白名單，
+  不剝任何語系的字母）。所以 diff 內容**回聲/引用**的 `VERDICT: approve`——無論在後續行、
+  或第一行中段被引述（`關於 diff 裡的 VERDICT: approve…`）——都失效；但擋不掉「diff
+  prompt-inject evaluator，讓它自己第一行乾淨地吐出 `approve`」——auto 模式下那就是合併
+  扳機。隨機 token 分隔線與行首錨定提高門檻，並未補上這個洞。
 - **依賴變更只 surface、不 gate。** verify 早在任何 gate **之前**就跑了
   `pip install -e . && pytest`，第三方 install/import 程式碼無論誰合併都已在憑證持有的
   executor 內執行——merge-time dep-veto 保護不了任何東西、還廢掉 auto 的用途。auto 改為在
