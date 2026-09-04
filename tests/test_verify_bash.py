@@ -80,6 +80,38 @@ def test_exec_settings_used_only_for_live_stream(tmp_path, monkeypatch):
     assert _settings_of(True) == str(base)        # tier off → base even for stream
 
 
+def test_approver_job_keeps_base_settings_not_bash_allow(tmp_path, monkeypatch):
+    """approve tier must NOT receive the Bash-allowing exec-settings even when m4 is live:
+    a `Bash` entry in permissions.allow would auto-run WITHOUT consulting the MCP approver,
+    defeating per-command approval. The approver must be the sole Bash gate → base deny
+    settings + the --permission-prompt-tool wired instead. (regression: approve was
+    silently getting exec-settings + no approver → Edit denied, Bash unprompted.)"""
+    base = tmp_path / "settings.json"
+    base.write_text(json.dumps({"permissions": {"deny": ["Bash(curl)"]}}))
+    exec_path = tmp_path / "exec-settings.json"
+    monkeypatch.setattr(config, "BRIDGE_SETTINGS_PATH", str(base))
+    monkeypatch.setattr(config, "EXEC_SETTINGS_PATH", str(exec_path))
+    monkeypatch.setattr(config, "BOTS", {"A": {"config_dir": "/c", "api_key": None}})
+    monkeypatch.setattr(config, "USE_API_KEY", False)
+    monkeypatch.setattr(config, "EXEC_BASH_ENABLED", True)
+    monkeypatch.setattr(config, "EXECUTOR_SOCKET", "/s/x.sock")
+
+    def _spawn(approver):
+        req = {"bot": "A", "api_mode": "manual", "session_id": None,
+               "system_prompt_file": None, "cwd": "/p", "prompt": "x",
+               "timeout": 60, "approver": approver, "stream": True}
+        return runner._exec_request_to_spawn(req)
+
+    args, env, _ = _spawn(approver=True)
+    assert args[args.index("--settings") + 1] == str(base)   # base, NOT exec-settings
+    assert not exec_path.exists()                            # exec-settings never written
+    assert "--permission-prompt-tool" in args                # approver wired as the gate
+    assert env.get("APPROVER_SOCKET") == config.APPROVER_SOCKET_PATH
+    # a non-approver stream job still gets the Bash-allow exec-settings (unchanged)
+    args2, _, _ = _spawn(approver=False)
+    assert args2[args2.index("--settings") + 1] == str(exec_path)
+
+
 # ── 4.2 verify: config from discord-state, stripped env, own timeout ─────────
 @pytest.fixture
 def verify_env(tmp_path, monkeypatch):
