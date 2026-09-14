@@ -696,9 +696,11 @@ async def _post_verify(job, channel, project: str) -> None:
             return
         configured, passed, tail = await runner.request_verify(project, workdir)
         if not configured:
-            await channel.send(
-                f"🧪 job `{job.id}`：未設定 verify（`discord-verify/` 無此專案的設定檔）"
-                "——無自動驗證結果，請自行判斷 diff")
+            # A non-empty tail is an executor refusal / IPC failure, not an absent config —
+            # say so, or the operator goes hunting for a verify file that does exist.
+            reason = (f"verify 無法執行：{tail.strip()[:300]}" if tail.strip()
+                      else "未設定 verify（`discord-verify/` 無此專案的設定檔）")
+            await channel.send(f"🧪 job `{job.id}`：{reason}——無自動驗證結果，請自行判斷 diff")
             return
         head = "✅ 通過" if passed else "❌ 失敗"
         body = f"🧪 **[job `{job.id}` verify · {head}]**"
@@ -941,7 +943,9 @@ async def _resolve_auto_gate(job, channel, author_bot: str, project: str,
         await channel.send(f"🛑 job `{job.id}` 已在 verify 期間取消——變更已丟棄")
         return
     if not configured:
-        await _auto_park(job, channel, "未設定 verify（discord-verify/ 無此專案）—— auto 絕不合併未驗證的變更",
+        reason = ("verify 無法執行（executor 拒絕或 IPC 失敗，見 verify tail）" if tail.strip()
+                  else "未設定 verify（discord-verify/ 無此專案）")
+        await _auto_park(job, channel, f"{reason}—— auto 絕不合併未驗證的變更",
                          stat=stat, base8=base8, verify_tail=tail, verdict="—", dep_note=dep_note)
         return
     if not passed:

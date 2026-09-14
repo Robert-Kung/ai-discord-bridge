@@ -192,6 +192,22 @@ def test_validator_accepts_worktree_cwd(exec_config):
     assert runner._validate_exec_request(_req(exec_config, cwd=str(wt))) is None
 
 
+def test_verify_validator_accepts_project_under_parent_whitelist(tmp_path, monkeypatch):
+    """The live deploy whitelists ONE parent dir (compose x-project-root). The verify gate
+    must use the same containment rule as !cd / exec cwd — an exact-match check refused
+    every real project, so auto mode parked everything as unverified (live smoke 2026-09-14)."""
+    root = tmp_path / "projects"
+    proj = root / "smoke"
+    proj.mkdir(parents=True)
+    monkeypatch.setattr(config, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(config, "PROJECT_DIRS", [root.resolve()])
+    wt = str(config.STATE_DIR / "worktrees" / "x" / "j1")
+    assert runner._validate_verify_request({"project": str(proj), "workdir": wt}) is None
+    for bad in (tmp_path / "elsewhere", root / ".." / "escape"):
+        err = runner._validate_verify_request({"project": str(bad), "workdir": wt})
+        assert err and "whitelist" in err
+
+
 # ── unix-socket round-trips against a fake claude ────────────────────────────
 @pytest.fixture
 def split_env(exec_config, tmp_path, monkeypatch):

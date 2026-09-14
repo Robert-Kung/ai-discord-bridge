@@ -40,10 +40,7 @@ def resolve_project_cwd(raw: str) -> tuple[str | None, str]:
         resolved = candidate.resolve()
     except (OSError, RuntimeError):
         return None, f"無法解析路徑：{raw}"
-    in_whitelist = any(
-        resolved == p or resolved.is_relative_to(p) for p in config.PROJECT_DIRS
-    )
-    if not in_whitelist:
+    if not config.project_whitelisted(resolved):
         return None, f"🛡 `{resolved}` 不在專案白名單內"
     if not (resolved / ".git").is_dir():
         return None, f"🛡 `{resolved}` 不是 git 專案（缺 .git）"

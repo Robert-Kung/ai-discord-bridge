@@ -272,7 +272,7 @@ def _validate_exec_request(req: dict) -> "str | None":
     rcwd = Path(cwd).resolve()
     wt_root = (config.STATE_DIR / "worktrees").resolve()
     allowed = (rcwd == Path(config.DEFAULT_CWD).resolve()
-               or any(rcwd == p or rcwd.is_relative_to(p) for p in config.PROJECT_DIRS)
+               or config.project_whitelisted(rcwd)
                or rcwd.is_relative_to(wt_root))
     if not allowed:
         return f"cwd {cwd!r} not in the project/worktree whitelist"
@@ -308,7 +308,7 @@ def _validate_verify_request(req: dict) -> "str | None":
     if not isinstance(project, str):
         return "missing project"
     rproj = Path(project).resolve()
-    if not any(rproj == p for p in config.PROJECT_DIRS):
+    if not config.project_whitelisted(rproj):
         return f"project {project!r} not in the whitelist"
     workdir = req.get("workdir")
     if not isinstance(workdir, str):

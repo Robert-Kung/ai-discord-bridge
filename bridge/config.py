@@ -241,6 +241,13 @@ def install_guardrail_env(base_env: "dict | None" = None) -> dict:
 DEFAULT_CWD = "/home/user"
 PROJECT_DIRS: list[Path] = []
 
+
+def project_whitelisted(resolved: Path) -> bool:
+    """True iff an already-resolved path is a PROJECT_DIRS entry or lies under one. The one
+    containment rule shared by every project gate (!cd, executor cwd, verify): the live
+    deploy whitelists a single PARENT dir, so an exact-match check refuses every project."""
+    return any(resolved == p or resolved.is_relative_to(p) for p in PROJECT_DIRS)
+
 # Expansion base for a bare `!cd <name>` (never for absolute input). NOT a security
 # boundary: expansion happens before the PROJECT_DIRS whitelist + .git check, so a wrong
 # value can only cause false rejections, never false accepts. Host and container paths

@@ -322,6 +322,22 @@ def test_auto_park_on_unconfigured_verify(auto_env, monkeypatch):
     assert any("未設定 verify" in s for s in channel.sent)
 
 
+def test_auto_park_on_verify_refusal_not_labelled_unconfigured(auto_env, monkeypatch):
+    """An executor refusal comes back configured=False with the error in the tail. It must
+    still park (fail-closed) but say 'cannot run', not 'not configured' — the live smoke hit
+    this and the label pointed at a verify file that did exist."""
+    project = auto_env
+    _stub_verify(monkeypatch, configured=False, passed=False,
+                 tail="verify refused: project '/x' not in the whitelist")
+    _stub_evaluator(monkeypatch, "VERDICT: approve")
+    channel = _GateChannel()
+    job = _drive_auto(project, channel)
+    assert job.status == jobs.AWAITING_REVIEW
+    assert (Path(project) / "a.txt").read_text() == "orig\n"
+    assert any("verify 無法執行" in s for s in channel.sent)
+    assert not any("未設定 verify" in s for s in channel.sent)
+
+
 def test_auto_park_on_failing_verify(auto_env, monkeypatch):
     project = auto_env
     _stub_verify(monkeypatch, configured=True, passed=False, tail="1 failed")
