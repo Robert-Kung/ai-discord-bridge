@@ -193,7 +193,7 @@ async def run_settings_canary(bot_name: str = "B", settings_path: str | None = N
     load with the deny family still firing (claude silently ignores an invalid
     --settings file — the exact OV1 hazard, now checked for the exec tier too)."""
     cfg = config.BOTS[bot_name]
-    args = build_claude_args("default", settings_path=settings_path)
+    args = build_claude_args("manual", settings_path=settings_path)
     env = build_subprocess_env(cfg)
     try:
         rc, stdout, _ = await _run_claude_subprocess(
@@ -272,7 +272,7 @@ def _validate_exec_request(req: dict) -> "str | None":
     rcwd = Path(cwd).resolve()
     wt_root = (config.STATE_DIR / "worktrees").resolve()
     allowed = (rcwd == Path(config.DEFAULT_CWD).resolve()
-               or any(rcwd == p or rcwd.is_relative_to(p) for p in config.PROJECT_DIRS)
+               or config.project_whitelisted(rcwd)
                or rcwd.is_relative_to(wt_root))
     if not allowed:
         return f"cwd {cwd!r} not in the project/worktree whitelist"
@@ -284,6 +284,18 @@ def _validate_exec_request(req: dict) -> "str | None":
         return "missing prompt"
     if not isinstance(req.get("approver"), bool) or not isinstance(req.get("stream"), bool):
         return "approver/stream must be booleans"
+    if req["approver"]:
+        # Split posture: the frontend binds the approval socket and writes the mcp-config,
+        # but the approver runs in THIS (executor) container — both must sit on the shared
+        # STATE_DIR volume or the spawned mcp_approver can't reach the frontend (every
+        # escalation would silently fail-closed deny) / --strict-mcp-config points at a
+        # missing file. Refuse to spawn rather than degrade to a broken tier.
+        state_dir = str(config.STATE_DIR.resolve()) + os.sep
+        for name, p in (("APPROVER_MCP_CONFIG_PATH", config.APPROVER_MCP_CONFIG_PATH),
+                        ("APPROVER_SOCKET_PATH", config.APPROVER_SOCKET_PATH)):
+            if not str(Path(p).resolve()).startswith(state_dir):
+                return (f"approver tier needs {name} on the shared volume "
+                        f"({config.STATE_DIR}); got {p!r} — set it in compose for both services")
     return None
 
 
@@ -296,7 +308,7 @@ def _validate_verify_request(req: dict) -> "str | None":
     if not isinstance(project, str):
         return "missing project"
     rproj = Path(project).resolve()
-    if not any(rproj == p for p in config.PROJECT_DIRS):
+    if not config.project_whitelisted(rproj):
         return f"project {project!r} not in the whitelist"
     workdir = req.get("workdir")
     if not isinstance(workdir, str):
@@ -430,8 +442,12 @@ def _exec_request_to_spawn(req: dict) -> tuple[list, dict, str]:
     # exec-tier stream jobs get the Bash-permitting settings only when the M4 tier is
     # live; every other call keeps the base deny-only settings. Regenerate the file
     # here (not just at startup) so a prior job's tamper of the rw path can't persist.
+    # APPROVE TIER EXCEPTION: an approver job keeps the BASE deny settings (no Bash allow)
+    # so the MCP approver is the SOLE gate for Bash — a Bash entry in permissions.allow
+    # would auto-run without ever consulting --permission-prompt-tool, defeating per-command
+    # approval. (Uses the RO canary-proven base directly; strictly safer than exec-settings.)
     settings = None
-    if req["stream"] and m4_live():
+    if req["stream"] and m4_live() and not req["approver"]:
         write_exec_settings()
         settings = config.EXEC_SETTINGS_PATH
     args = build_claude_args(
@@ -767,7 +783,9 @@ async def _call_claude(
 
 
 # ── Two trust layers — the only public entries to the chokepoint (D3) ────────
-_EXEC_MODES = {"edit", "acceptEdits", "bypass", "bypassPermissions", "approve"}
+# "auto" is an execution tier whose SUBPROCESS runs on acceptEdits (like edit); its
+# distinctness is the gate policy, resolved frontend-side, not a different CLI mode.
+_EXEC_MODES = {"edit", "acceptEdits", "bypass", "bypassPermissions", "approve", "auto"}
 
 
 async def converse(
@@ -788,9 +806,11 @@ async def converse(
 
 def exec_layer_for(is_bot_msg: bool, effective_mode: str) -> str:
     """Routing decision (D3 layer split): 'execute' ONLY for a human-driven
-    execution-tier request (`edit`, or the M4 `approve` tier); every other case
-    routes to 'converse'. Pure, so the structural guarantee is unit-testable."""
-    if not is_bot_msg and effective_mode in ("edit", "approve"):
+    execution-tier request (`edit`, the M4 `approve` tier, or the `auto` auto-merge
+    tier); every other case routes to 'converse'. A bot-origin mention NEVER reaches
+    execute, so the conversation layer can never drive an auto-merge. Pure, so the
+    structural guarantee is unit-testable."""
+    if not is_bot_msg and effective_mode in ("edit", "approve", "auto"):
         return "execute"
     return "converse"
 
@@ -961,17 +981,22 @@ async def run_streaming_exec(
     project = cwd if project is None else project
     cfg = config.BOTS[bot_name]
     api_mode = config.MODE_ALIASES.get(mode, mode)
+    # The `approve` tier is per-command approval: wire the MCP approver so each non-
+    # auto-allowed tool escalates to a Discord ✅ (approver_policy decides). Background
+    # exec jobs are the live execution path (agent-exec-loop moved edit/approve here), so
+    # the approver MUST be wired HERE — not only in the now-latent _call_claude path.
+    approver = mode == "approve"
     worktree_job = cwd != project
     sid = None if worktree_job else sessions.load_session(bot_name, project)
-    log.info("[%s] exec-job start mode=%s cwd=%s project=%s prompt_len=%d",
-             bot_name, api_mode, cwd, project, len(prompt))
+    log.info("[%s] exec-job start mode=%s approver=%s cwd=%s project=%s prompt_len=%d",
+             bot_name, api_mode, approver, cwd, project, len(prompt))
 
     if config.EXECUTOR_SOCKET:
         async with state.cwd_locks[project]:
             final, outcome = await _remote_stream_exec(
                 _build_remote_request(bot_name, prompt, api_mode=api_mode, sid=sid,
                                       system_prompt_file=system_prompt_file, cwd=cwd,
-                                      timeout=timeout, approver=False, stream=True),
+                                      timeout=timeout, approver=approver, stream=True),
                 on_trace=on_trace, on_proc=on_proc, should_abort=should_abort)
         if outcome is not None:
             return (None, outcome)
@@ -981,8 +1006,11 @@ async def run_streaming_exec(
     args = build_claude_args(
         api_mode, session_id=sid,
         system_prompt_file=str(system_prompt_file) if system_prompt_file else None,
+        approver_mcp_config=config.APPROVER_MCP_CONFIG_PATH if approver else None,
         stream=True)
     env = build_subprocess_env(cfg)
+    if approver:
+        env["APPROVER_SOCKET"] = config.APPROVER_SOCKET_PATH
 
     async with state.cwd_locks[project]:
         proc = await asyncio.create_subprocess_exec(

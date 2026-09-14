@@ -263,8 +263,51 @@ executor 的 routeless egress**（只到 Anthropic；Discord 與任意 host 都�
 ### 6.5 Dual-account evaluator（M5，optional）
 - `ENABLE_EXEC_EVALUATOR`（預設關）：job 的 diff 交給**另一隻** bot 審（sessionless、
   plan-mode、懷疑式 + 未受信任資料框架），findings 貼在 diff gate 上方。
-- **advisory by construction**：evaluator 路徑碰不到 `pending_actions` 與 merge 路徑；
-  任何失敗降級為 log；就算它說「merge it」也不會 merge——人類 ✅ 是唯一合併權威。
+- **結構化 verdict**：prompt 要求 evaluator 第一行寫 `VERDICT: approve|reject|unsure`，
+  之後才列理由。`parse_verdict` **只讀 evaluator 自己的第一非空行**，容忍該行的
+  markdown/preamble（`**VERDICT: approve**`、全形冒號、`— 後綴`），但第一行之外的
+  verdict **一律不算**——diff 裡回聲的 `VERDICT: approve` 因此失效。無法解析／空／None → `unsure`。
+- **人審模式下仍 advisory by construction**：evaluator 路徑碰不到 `pending_actions` 與
+  merge 路徑；任何失敗降級為 log；就算它說「merge it」也不會 merge——人類 ✅ 是唯一合併權威。
+  （auto 模式才把這個 verdict 升級為 merge 訊號，見 §6.6。）
+- **殘留（未封死）**：容忍式第一行規則擋得掉**字面**注入字串，但擋不掉「diff prompt-inject
+  evaluator 讓它自己第一行真的吐出 `approve`」。evaluator 是同模型家族的另一隻 bot、審的是
+  steering 了 executor 的**同一份 diff**，兩訊號**相關**、非獨立。見 SECURITY.md §4。
+
+### 6.6 Auto 自動合併層 + outbound media（unattended-auto-mode，optional）
+- **Auto tier（`ENABLE_AUTO_MERGE`，預設關，權限高於 bypass）**：`!mode auto` 只在
+  flag 開 **AND** author 在 `ALLOWED_USER_IDS` **AND** verify 路徑（`m4_live()`）與
+  evaluator 都就緒時才啟用；缺任一則**拒絕啟用並附原因**（fail-closed，不靜默 park 全部）。
+  `VALID_MODES` 與 dispatch-time re-validation 都含 `"auto"`，flag/白名單撤銷即時生效。
+  subprocess 仍跑 `acceptEdits`（與 edit 同）——auto 是 bridge 側的**閘門政策**，不是 CLI
+  `--permission-mode auto`（後者的 classifier session-abort 不適用無人值守）。
+- **auto 需要 git 專案**：非 git cwd 沒有 worktree/diff gate，auto 會在 agent 執行**前**
+  fail-closed 拒絕（job 標 FAILED，不做未閘門的 live-tree 直寫、也不算 chain 前進的 DONE）。
+  `DEFAULT_CWD`（home）即非 git，故未 `!cd` 就用 auto 會被擋——先切到 git 專案。
+- **Gate 解析**：job 完成 → commit → diff →（auto 走**自己的** `request_verify`，例外＝park，
+  **不重用**吞例外的 `_post_verify`）：未設定／失敗／不可用 → **park**；通過 → evaluator
+  結構化 verdict：`approve` → 走**原封不動**的合併協定（clean tree／ancestor／no-force／
+  衝突 abort）；`reject`/`unsure`/None/unparseable → **park**（附 findings）。**每個** auto job
+  都貼 audit 訊息（diffstat + verify tail + verdict + dep-note）。
+- **依賴變更只 surface、不 gate**：verify 早在任何 gate 之前就跑了 `pip install -e . && pytest`
+  （supply-chain 程式碼無論誰合併都已執行），故 merge-time dep-veto 保護不了憑證持有的
+  executor，且一律 park 會廢掉 auto 的用途。改為在 audit 訊息**顯著列出** dep/lockfile/設定檔
+  變更，保留事後訊號。真正的緩解（credential-free verify sandbox）是另一個獨立、更高優先的變更。
+- **Auto-continue chain**：auto 模式的 operator 訊息可帶編號/項目任務清單；**只在**前一 job
+  真的到 `status == DONE`（合併 commit 存在）才接下一個任務（從合併後的新 HEAD 建分支）。
+  `approve` 但仍 park（dirty/diverged/conflict）**不算** DONE、停止 chain。上限 `AUTO_MAX_JOBS`
+  （int > 0，預設 5）與既有「一專案一 job」佔用規則；任一 park/失敗/cancel 即停。
+  **operational**：live tree 有未 commit 變更會讓每次合併判 dirty，整條 chain 在任務 1 就
+  fail-closed——開跑前先確保乾淨。
+- **Outbound media**：agent 回覆含 `DISCORD_ATTACH: <相對路徑>` 標記行時，frontend 才夾帶
+  該檔。containment root 依回覆的 workspace 而定：exec job → worktree/job dir；chat/converse →
+  live checkout。解析用 `Path.resolve()` + `is_relative_to`（**非字串前綴**——`<root>-evil`
+  鄰目錄能騙過前綴檢查；symlink 由 resolve() 先跟出去，故白名單副檔名的 symlink 逃逸由
+  **containment** 擋下而非副檔名檢查）。副檔名白名單 png/jpg/jpeg/gif/svg/html/txt/pdf；
+  每檔 ≤ 8 MB、每則 ≤ 4 檔。標記行一律從貼出的文字剝除；拒絕都記 log。root 為 `DEFAULT_CWD`
+  （home，未選專案）時**一律拒絕夾帶**——home 不是專案 workspace，容許夾帶會把整個 home
+  樹變成外流面。機密性受 operator-only channel（`ALLOWED_USER_IDS`）界定——這是既有
+  reply-text exfil 殘留的**高頻寬版**，不是新信任邊界。見 SECURITY.md §5。
 
 ---
 
@@ -278,8 +321,9 @@ executor 的 routeless egress**（只到 Anthropic；Discord 與任意 host 都�
 |------|---------|------|
 | `plan`（預設）| `plan` | 只讀規劃（對話層；唯一不走背景 job 的模式）|
 | `edit` | `acceptEdits` | 自動接受檔案編輯；跑背景 job + diff gate；受 deny family 約束 |
-| `approve` | `default` + MCP approver | **逐指令核可**：allow-list（`approver-allowlist.json`）自動放行，其餘丟 Discord 等 ✅；逾時/錯誤 = 拒絕（fail-closed）。需 `ENABLE_APPROVER_TIER` |
+| `approve` | `manual` + MCP approver | **逐指令核可**：allow-list（`approver-allowlist.json`）自動放行，其餘丟 Discord 等 ✅；逾時/錯誤 = 拒絕（fail-closed）。需 `ENABLE_APPROVER_TIER`（`manual` 為 `default` 更名後的正式名，claude 2.1.217；`default` 仍作未文件化 back-compat）|
 | `bypass` | `bypassPermissions` | 全自動；需 `ENABLE_BYPASS_TIER`（預設**結構性不可達**）+ 白名單；先過 plan-then-execute ✅（`!yolo` 跳過）|
+| `auto` | `acceptEdits` + 閘門政策 | **自動合併**：diff gate 由 verify + evaluator 雙訊號決定 merge/park，不等人審；需 `ENABLE_AUTO_MERGE` + 白名單 + 兩訊號就緒（否則拒絕啟用）。可帶任務清單連跑（上限 `AUTO_MAX_JOBS`）。詳見 §6.6、殘留見 SECURITY.md §4 |
 
 - 每次 call 都帶 `--settings settings.json`（deny family：憑證路徑 Read、env dump、
   curl/wget/WebFetch），**deny 在所有模式含 bypass 都優先**。開機 **settings canary**

@@ -1,8 +1,10 @@
 # Tasks — unattended auto mode + outbound media
 
 ## 0. Preconditions
-- [ ] 0.1 PR #20 (fix/job-loss-family) merged — commit semantics the chain depends on
-- [ ] 0.2 PR #21 (egress allowlist A) merged — WebSearch/doc lookups for the verify tier.
+- [x] 0.1 PR #20 (fix/job-loss-family) merged — commit semantics the chain depends on
+      (in `main` as eadecf1).
+- [x] 0.2 PR #21 (egress allowlist A) merged — WebSearch/doc lookups for the verify tier
+      (in `main` as ddf2220).
       NOTE (updated 2026-07-21, superseding the original "needs a registry mirror first"
       note; source: `registry-egress-opt-in`, PR #23, archived):
       - **Python: available today.** `pypi.org` + `files.pythonhosted.org` are reachable
@@ -19,35 +21,105 @@
         PyPI splits them (uploads live on `upload.pypi.org`), so its two read hosts pass.
         "The container holds credentials" is NOT the criterion — an injected dependency
         can carry its own token.
-      - **Residual risk to carry into the auto gate:** verify runs
-        `pip install -e . && pytest`, and pytest imports installed packages, so a
-        typosquat executes inside the credential-holding executor with no prompt
-        injection required. See `SECURITY.md` §6.
+      - **Residual risk carried into the auto gate (decision 2026-07-22):** verify runs
+        `pip install -e . && pytest` and pytest imports installed packages, so a typosquat
+        executes inside the credential-holding executor with no prompt injection — AND
+        this happens at verify time, *before* any gate, so it is identical in human and
+        auto mode. Auto mode does NOT amplify this execution (only its unattended
+        frequency), so no dep-veto is added; the risk is documented-accepted in
+        SECURITY.md §6 and the real fix (credential-free verify sandbox) is a separate,
+        higher-priority change. Dep changes ARE surfaced in the audit message (§2.3).
 
 ## 1. Structured evaluator verdict (bridge/discuss.py)
-- [ ] 1.1 Verdict contract in the evaluator prompt (first line `VERDICT: …`)
-- [ ] 1.2 `parse_verdict(text) -> "approve"|"reject"|"unsure"` — first line only, default unsure
-- [ ] 1.3 Tests: parse matrix incl. buried/injected verdict lines, empty/None findings
-- [ ] 1.4 doc-delta: SPEC §6.2 evaluator paragraph（zh 同步：SPEC 本文即 zh）
+- [x] 1.1 Verdict contract in the evaluator prompt (first line `VERDICT: …`)
+- [x] 1.2 `parse_verdict(text) -> "approve"|"reject"|"unsure"` — evaluator's OWN first
+      line only, tolerant of surrounding markdown/preamble (`**VERDICT: approve**`,
+      trailing clause), default unsure; a verdict past line 1 never counts
+- [x] 1.3 Tests: parse matrix incl. (a) adversarial buried/injected verdict lines,
+      (b) realistic well-formed markdown/preamble approval (must NOT false-park),
+      (c) an LLM-obedience red-team — a diff crafted to steer the evaluator into
+      emitting `approve` as its first line (documents the residual, not just the parser),
+      (d) empty/None findings
+      （tests/test_auto_mode.py::test_parse_verdict_*）
+- [x] 1.4 doc-delta: SPEC §6.5 evaluator verdict + verdict-injection & correlation
+      residual（zh 同步：SPEC 本文即 zh）
 
-## 2. Auto gate (bridge/frontend.py + config)
-- [ ] 2.1 `ENABLE_AUTO_MERGE` + `AUTO_MAX_JOBS` in config (fail-closed defaults) + compose env ×2
-- [ ] 2.2 `!mode auto` refusal path when tier off (mirror bypass tier tests)
-- [ ] 2.3 Gate resolution branch per design §2 (park-on-anything-unclear; audit message)
-- [ ] 2.4 Tests: park-on-unverified / park-on-reject / merge-on-approve (stub verify+evaluator)
-- [ ] 2.5 doc-delta: SPEC §6.2 gate modes、SECURITY.md+zh §4 auto tier posture、README both
+## 2. Auto gate (bridge/frontend.py + config + trust)
+- [x] 2.1 `ENABLE_AUTO_MERGE` + `AUTO_MAX_JOBS` (int > 0) in config; `VALID_MODES += "auto"`;
+      dispatch-time downgrade list gains `"auto"`; compose env (frontend service, explicit
+      environment — auto is a frontend gate policy like bypass/approve/evaluator, so it
+      lives beside them on the frontend, not both services) + .env.example
+- [x] 2.2 `trust.py`: `!mode auto` honoured only with `ENABLE_AUTO_MERGE` AND
+      `author_id in ALLOWED_USER_IDS` (mirror bypass/approve); refuse-to-serve when
+      `m4_live` or `EVALUATOR_ENABLED` is unavailable（`auto_allowed` + `auto_preconditions_ok`;
+      cmd_mode gives the specific refusal reason）
+- [x] 2.3 Gate resolution branch per design §2: auto path runs its OWN `request_verify`
+      (exception→park; do NOT reuse `_post_verify`), tolerant verdict parse, dep-note
+      appended to the audit message from `worktree.dependency_changes(full)`,
+      park-on-anything-unclear（`_resolve_auto_gate`）
+- [x] 2.4 Tests: refuse-to-serve on missing flag/whitelist/verify/evaluator;
+      park-on-unverified / park-on-reject / park-on-evaluator-unavailable /
+      merge-on-approve (stub verify+evaluator); dep-note present when deps change
+- [x] 2.5 doc-delta: SPEC §6.6 gate modes、SECURITY.md+zh §4 auto tier posture（含
+      whitelist 要求、verdict-injection 殘留、雙訊號相關性、dep 只 surface 不 gate）、
+      README both
 
 ## 3. Auto-continue chain (bridge/frontend.py)
-- [ ] 3.1 Task-list splitter + chain driver (stop on park/fail/cap/cancel)
-- [ ] 3.2 Tests: chain bounds, branch-from-new-HEAD, stop-on-park
-- [ ] 3.3 doc-delta: HELP_TEXT + startup announcement
+- [x] 3.1 Task-list splitter + chain driver: advance only on `status == DONE`
+      (re-read HEAD after the merge commit); stop on park/fail/cap/cancel
+      （`split_task_list` + `_run_auto_chain`）
+- [x] 3.2 Tests: chain bounds (`AUTO_MAX_JOBS`), branch-from-new-HEAD, stop-on-park,
+      approve-but-parked (dirty/diverged) does NOT advance
+- [x] 3.3 doc-delta: HELP_TEXT + startup announcement (incl. "start from a clean live
+      tree" operational note)
 
 ## 4. Outbound media (bridge/frontend.py)
-- [ ] 4.1 Marker parse + path containment (resolve under worktree/job dir only) + whitelist/caps
-- [ ] 4.2 Attach via discord.File; strip markers from posted text
-- [ ] 4.3 Tests: traversal/symlink escape refusal, extension/size/count caps, marker stripping
-- [ ] 4.4 doc-delta: SECURITY.md+zh §5 outbound surface、README usage
+- [x] 4.1 Marker parse + containment: exec reply → root = worktree/job dir; chat reply →
+      root = live checkout; resolve with `Path.resolve()` + `is_relative_to` (NOT string
+      prefix — call out the `worktree-evil` sibling trap) + whitelist/caps
+      （`resolve_attachment_markers`）
+- [x] 4.2 Attach via discord.File; strip markers from posted text (both exec + chat paths)
+      （`_send_reply`, wired into the exec-job reply + the standard converse reply）
+- [x] 4.3 Tests: traversal/symlink escape refusal using a **whitelisted-extension**
+      target (so containment, not the extension check, is what refuses), extension/size/
+      count caps, marker stripping, chat vs exec root selection
+- [x] 4.4 doc-delta: SECURITY.md+zh §5 outbound surface（誠實標為既有 reply-exfil residual
+      的高頻寬版、operator-only channel 界定機密性、跨容器讀取耦合）、README usage
 
-## 5. Review gate
-- [ ] 5.1 reviewer + security-reviewer on the full diff（auto-merge 決策面＋outbound 外流面）
-- [ ] 5.2 Live smoke: auto job with passing verify round-trips to merged; park paths visible
+## 5. `default` → `manual` permission-mode migration (bridge/config.py + runner.py)
+- [x] 5.1 `config.py` `approve → "default"` becomes `approve → "manual"`;
+      `runner.py` `build_claude_args("default", …)` becomes `"manual"`
+      (re-confirmed on claude 2.1.217: `default` dropped from documented `--permission-mode`
+      choices, `manual` is the successor; `default` still runs as undocumented back-compat)
+- [x] 5.2 Grep the tree for any remaining `"default"`/`'default'` permission-mode literal;
+      none survive outside comments/DEFAULT_* (grep clean)
+- [x] 5.3 Live smoke: the `approve` tier on `manual` behaves as it did on `default` in
+      headless `-p` (semantics unchanged — this is the only thing static analysis can't prove)
+      — operator-run 2026-09-14 on smoke-auto: per-command 🔐 escalation, ✅ runs / ❌ denies,
+      diff gate merge
+
+## 6. Review gate
+- [x] 6.1 reviewer + security-reviewer on the full diff（auto-merge 決策面＋outbound 外流面）
+      — both converged; blockers fixed:
+      - H1 (both, HIGH): `auto` on a non-git cwd ran UNGATED + chain-advanced (DEFAULT_CWD
+        non-git → default-reachable) → now refused fail-closed before the agent runs
+      - F1 (sec, MED): `parse_verdict` first-line LEADING echo parsed approve → now
+        line-start-anchored (whitelist decoration strip, any script)
+      - M2 (code): occupancy TOCTOU + wrong "no await" comment → send moved after create_job
+      - M3 (code): outbound root = DEFAULT_CWD (home) exposed whole home tree → refused
+      - M4 (code): !cancel during verify leaked worktree + contradictory park → discard
+      - F2 (sec, LOW): evaluator saw truncated diff on approve → audit now flags it
+      - LOW: mention_hint dropped from unattended auto prompts; AUTO_MAX_JOBS clamped ≤ 50
+      Accepted residuals (documented, out of scope): R1 evaluator genuine-obedience
+      injection (correlated signals), R2 verify-RCE (gate-independent), F3 per-message
+      (not per-task) tier re-validation (latent — flags are process globals).
+- [x] 6.2 Live smoke: auto job with passing verify round-trips to merged; park paths
+      (unverified / reject / evaluator-unavailable / refuse-to-serve) visible;
+      dep-touching job auto-merges WITH a dep-note in the audit message
+      — operator-run 2026-09-14 on smoke-auto / smoke-noverify sandboxes:
+      2-task chain merged (734466 → 9d9d4a, 2nd branched from 1st's merge, dep-note on
+      requirements-dev.txt); reject park 689608; unverified park 0f213d; evaluator-unavailable
+      park b3929c (frontend CLAUDE_TIMEOUT=3 → verdict unsure); `!mode auto` refused with
+      evaluator off; H1 non-git cwd refused before the agent ran (690e77, no file written).
+      First run surfaced a real bug — executor verify gate exact-matched PROJECT_DIRS, so
+      every project was refused since the 7/21 parent-dir compose change → fixed in 3618267

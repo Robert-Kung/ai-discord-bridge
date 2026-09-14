@@ -16,7 +16,7 @@ It's a **control plane over Claude Code**: two Discord bots (Bot-A, Bot-B); an `
 - **Flush-before-compaction**: triggered on `!flush`, message threshold, token thresholds, and `!cd` project switch — preserves decisions before Claude's context window auto-compacts
 - **Dual-agent debate**: `!discuss <topic>` — A and B take turns on a shared rolling transcript with an independent turn budget that doesn't starve normal @-mentions
 - **Review-gated exec loop**: execution-mode tasks become background jobs (`!jobs` / `!cancel`) streaming live progress; changes land in a throwaway git worktree, and the resulting diff waits for your ✅ to merge / ❌ to discard (`!merge` / `!discard` after a timeout). Optional per-project **post-task verification** and an optional **second-account advisory review** post above the gate.
-- **Permission tiers**: `plan` / `edit` / `approve` / `bypass` per channel; `approve` is a per-command human-approval tier (MCP approver), `bypass` is structurally unreachable unless opted in; fail-closed auth + prompt-injection isolation + a canary-proven credential-read deny family (see [SECURITY.md](SECURITY.md))
+- **Permission tiers**: `plan` / `edit` / `approve` / `bypass` / `auto` per channel; `approve` is a per-command human-approval tier (MCP approver), `bypass` is structurally unreachable unless opted in, `auto` replaces the human diff gate with a verify+evaluator auto-merge (opt-in, correlated-signal residual documented); fail-closed auth + prompt-injection isolation + a canary-proven credential-read deny family (see [SECURITY.md](SECURITY.md))
 - **Egress containment (two-container split)**: a `discord-frontend` (Discord egress only, holds bot tokens) and an `executor` (holds Claude credentials; egress limited to `api.anthropic.com` plus a GET-only read-only doc allow-list, and optionally the read-only PyPI hosts so agents can install Python dependencies — still no publish-capable host, opt-in and off by default, see [SECURITY.md](SECURITY.md) §6) on routeless internal networks behind default-deny proxies — each secret lives where the other secret's egress can't reach a write-capable host. Fail-closed startup canaries prove each deny direction.
 
 ## Prerequisites
@@ -115,14 +115,14 @@ In `#ai-chat`:
 | A mentions `@Bot-B` in reply | B responds (debate mode) |
 | You send any message | Resets A↔B turn counter |
 
-In `plan` mode (the default) a mention is a normal conversation call. In `edit` / `approve` / `bypass` mode it becomes a **background exec job**: work happens in a throwaway git worktree, progress streams into a status message, and the finished diff waits for your ✅/❌. Attachments on the triggering message are ingested as untrusted context.
+In `plan` mode (the default) a mention is a normal conversation call. In `edit` / `approve` / `bypass` / `auto` mode it becomes a **background exec job**: work happens in a throwaway git worktree, progress streams into a status message, and the finished diff waits for your ✅/❌. Attachments on the triggering message are ingested as untrusted context. In `auto` mode (opt-in, off by default) the diff gate resolves **machine-side** — verify + the cross-account evaluator's `VERDICT: approve` auto-merge, everything else parks — and a message may carry a task list that chains one job per merge (see [SECURITY.md](SECURITY.md) §4 for the residual). An agent reply can attach a workspace file with a `DISCORD_ATTACH: <path>` marker (whitelisted extensions, size/count caps, containment-checked).
 
 **Commands** (prefix with `!`, handled by Bot-A to avoid double-triggering):
 
 | Command | Effect |
 |---------|--------|
 | `!cd <project>` | Switch working directory (whitelisted git projects only); flushes previous project context first |
-| `!mode plan\|edit\|bypass\|approve` | Set permission mode for this channel (`bypass`/`approve` need their opt-in tier) |
+| `!mode plan\|edit\|bypass\|approve\|auto` | Set permission mode for this channel (`bypass`/`approve`/`auto` need their opt-in tier; `auto` also needs verify + evaluator live) |
 | `!jobs` | List background exec jobs (running / awaiting review) |
 | `!cancel <id>` | Cancel a running job (kills the whole process group) |
 | `!merge <id>` / `!discard <id>` | Merge or drop a parked awaiting-review diff |

@@ -32,8 +32,9 @@ Discord control plane** 的參考實作——不是即裝即用的產品。每�
   改動落在 throwaway git worktree，完成後貼 diff 等你 ✅ 合併 / ❌ 丟棄（逾時後
   `!merge` / `!discard`）。可選的每專案 **post-task verify** 與**另一帳號 advisory 審查**
   會貼在審查門上方。
-- **權限分層**：per-channel 的 `plan` / `edit` / `approve` / `bypass`；`approve` 是逐指令
-  人工核可 tier（MCP approver），`bypass` 未 opt-in 時結構性不可達；fail-closed 授權 +
+- **權限分層**：per-channel 的 `plan` / `edit` / `approve` / `bypass` / `auto`；`approve` 是逐指令
+  人工核可 tier（MCP approver），`bypass` 未 opt-in 時結構性不可達，`auto` 以 verify+evaluator
+  雙訊號取代人審 diff gate（opt-in，相關訊號殘留已記錄）；fail-closed 授權 +
   prompt injection 隔離 + canary 驗證過的憑證讀取 deny family（見 [SECURITY.zh.md](SECURITY.zh.md)）
 - **egress 圍堵（雙容器 split）**：`discord-frontend`（只能連 Discord，持 bot token）與
   `executor`（持 Claude 憑證；egress 限 `api.anthropic.com` 加一小串 GET-only 唯讀文件
@@ -148,16 +149,20 @@ fail-closed 授權、`!cd` 路徑/逃逸防護、信任過濾、env 去敏、exe
 | A 在回覆中 @-mention `@Bot-B` | B 回應（辯論模式） |
 | 你發任何訊息 | 重置 A↔B 輪數計數器 |
 
-`plan` 模式（預設）下 mention 是一般對話呼叫。`edit` / `approve` / `bypass` 模式下則變成
-**背景 exec job**：工作在 throwaway git worktree 進行、進度串流到狀態訊息、完成的 diff
-等你 ✅/❌。觸發訊息上的附件會被收進 job 當未受信任的 context。
+`plan` 模式（預設）下 mention 是一般對話呼叫。`edit` / `approve` / `bypass` / `auto` 模式下
+則變成**背景 exec job**：工作在 throwaway git worktree 進行、進度串流到狀態訊息、完成的 diff
+等你 ✅/❌。觸發訊息上的附件會被收進 job 當未受信任的 context。`auto` 模式（opt-in，預設關閉）
+下 diff gate 改由**機器側**解析——verify + 跨帳號 evaluator 的 `VERDICT: approve` 自動合併、
+其餘一律 park——且訊息可帶任務清單、每合併一個接下一個（殘留見 [SECURITY.md](SECURITY.md) §4）。
+agent 回覆可用 `DISCORD_ATTACH: <路徑>` 標記夾帶工作區檔案（白名單副檔名、大小/數量上限、
+containment 檢查）。
 
 **指令**（前綴 `!`，只由 Bot-A 處理以避免雙觸發）：
 
 | 指令 | 效果 |
 |------|------|
 | `!cd <專案>` | 切工作目錄（限白名單 git 專案）；先 flush 前一專案脈絡 |
-| `!mode plan\|edit\|bypass\|approve` | 設此頻道的權限模式（`bypass`/`approve` 需各自的 opt-in tier） |
+| `!mode plan\|edit\|bypass\|approve\|auto` | 設此頻道的權限模式（`bypass`/`approve`/`auto` 需各自的 opt-in tier；`auto` 另需 verify + evaluator 就緒） |
 | `!jobs` | 列出背景 exec job（執行中 / 待審） |
 | `!cancel <id>` | 取消執行中的 job（終止整個 process group） |
 | `!merge <id>` / `!discard <id>` | 合併 / 丟棄某個待審 diff |

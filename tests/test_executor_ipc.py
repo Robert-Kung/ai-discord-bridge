@@ -163,9 +163,49 @@ def test_validator_pins_system_prompt_to_state_dir(exec_config, tmp_path):
     assert err and "system_prompt_file" in err
 
 
+def test_validator_approver_requires_shared_volume_paths(exec_config, monkeypatch):
+    """Split posture: an approver job's socket + mcp-config must live on the shared
+    STATE_DIR volume, else the executor-spawned mcp_approver can't reach the frontend and
+    every escalation silently fail-closed denies. The validator refuses fail-closed."""
+    proj = exec_config
+    shared = config.STATE_DIR
+    monkeypatch.setattr(config, "APPROVER_MCP_CONFIG_PATH", str(shared / "approver-mcp.json"))
+    monkeypatch.setattr(config, "APPROVER_SOCKET_PATH", str(shared / "approver.sock"))
+    assert runner._validate_exec_request(
+        _req(proj, api_mode="manual", approver=True, stream=True)) is None
+    # container-local /tmp default → refused (unreachable across the split)
+    monkeypatch.setattr(config, "APPROVER_MCP_CONFIG_PATH", "/tmp/approver-mcp.json")
+    err = runner._validate_exec_request(_req(proj, api_mode="manual", approver=True, stream=True))
+    assert err and "APPROVER_MCP_CONFIG_PATH" in err
+    # mcp-config back on the shared volume, but a bad socket path is still caught
+    monkeypatch.setattr(config, "APPROVER_MCP_CONFIG_PATH", str(shared / "approver-mcp.json"))
+    monkeypatch.setattr(config, "APPROVER_SOCKET_PATH", "/tmp/approver.sock")
+    err2 = runner._validate_exec_request(_req(proj, api_mode="manual", approver=True, stream=True))
+    assert err2 and "APPROVER_SOCKET_PATH" in err2
+    # a non-approver job is unaffected by the approver-path rule
+    assert runner._validate_exec_request(
+        _req(proj, api_mode="manual", approver=False, stream=True)) is None
+
+
 def test_validator_accepts_worktree_cwd(exec_config):
     wt = config.STATE_DIR / "worktrees" / "proj" / "j1"
     assert runner._validate_exec_request(_req(exec_config, cwd=str(wt))) is None
+
+
+def test_verify_validator_accepts_project_under_parent_whitelist(tmp_path, monkeypatch):
+    """The live deploy whitelists ONE parent dir (compose x-project-root). The verify gate
+    must use the same containment rule as !cd / exec cwd — an exact-match check refused
+    every real project, so auto mode parked everything as unverified (live smoke 2026-09-14)."""
+    root = tmp_path / "projects"
+    proj = root / "smoke"
+    proj.mkdir(parents=True)
+    monkeypatch.setattr(config, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(config, "PROJECT_DIRS", [root.resolve()])
+    wt = str(config.STATE_DIR / "worktrees" / "x" / "j1")
+    assert runner._validate_verify_request({"project": str(proj), "workdir": wt}) is None
+    for bad in (tmp_path / "elsewhere", root / ".." / "escape"):
+        err = runner._validate_verify_request({"project": str(bad), "workdir": wt})
+        assert err and "whitelist" in err
 
 
 # ── unix-socket round-trips against a fake claude ────────────────────────────

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from bridge import config, state
+from bridge import config, runner, state
 
 
 def _is_trusted(m: dict) -> bool:
@@ -40,10 +40,7 @@ def resolve_project_cwd(raw: str) -> tuple[str | None, str]:
         resolved = candidate.resolve()
     except (OSError, RuntimeError):
         return None, f"無法解析路徑：{raw}"
-    in_whitelist = any(
-        resolved == p or resolved.is_relative_to(p) for p in config.PROJECT_DIRS
-    )
-    if not in_whitelist:
+    if not config.project_whitelisted(resolved):
         return None, f"🛡 `{resolved}` 不在專案白名單內"
     if not (resolved / ".git").is_dir():
         return None, f"🛡 `{resolved}` 不是 git 專案（缺 .git）"
@@ -62,12 +59,32 @@ def approve_allowed(author_id: int) -> bool:
     return config.APPROVER_TIER_ENABLED and author_id in config.ALLOWED_USER_IDS
 
 
+def auto_preconditions_ok() -> bool:
+    """The auto tier's two machine signals must both be LIVE before it may resolve a
+    merge without a human: the verify path (`runner.m4_live()` — only true inside the
+    phase-2 executor whose egress canary is proven) AND the cross-account evaluator
+    (`EVALUATOR_ENABLED`). Absent either, auto refuses to serve (fail-closed) rather than
+    silently parking everything."""
+    return runner.m4_live() and config.EVALUATOR_ENABLED
+
+
+def auto_allowed(author_id: int) -> bool:
+    """The unattended auto-merge tier is reachable only when ENABLE_AUTO_MERGE is on AND
+    the user is whitelisted AND both preconditions are live. Auto carries MORE authority
+    than bypass (resolves the merge with no human), so it mirrors bypass/approve's
+    flag+whitelist posture and adds the precondition gate. Default-closed."""
+    return (config.AUTO_MERGE_ENABLED and author_id in config.ALLOWED_USER_IDS
+            and auto_preconditions_ok())
+
+
 def _tier_allowed(mode: str, author_id: int) -> bool:
     """Whether an opt-in execution tier is currently reachable for this user. plan/edit
-    are always permitted here (edit's whitelist is enforced upstream); bypass/approve are
-    the default-closed opt-in tiers."""
+    are always permitted here (edit's whitelist is enforced upstream); bypass/approve/auto
+    are the default-closed opt-in tiers."""
     if mode == "bypass":
         return bypass_allowed(author_id)
     if mode == "approve":
         return approve_allowed(author_id)
+    if mode == "auto":
+        return auto_allowed(author_id)
     return True

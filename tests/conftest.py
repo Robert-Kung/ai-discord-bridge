@@ -23,7 +23,8 @@ _AUTH_ENV = ("USE_API_KEY", "ANTHROPIC_API_KEY_A", "ANTHROPIC_API_KEY_B",
              "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX")
 # Opt-in feature tiers — cleared so a host that dogfoods a tier (e.g. exports
 # ENABLE_EXEC_EVALUATOR=1) can't flip the "off by default" tests.
-_TIER_ENV = ("ENABLE_BYPASS_TIER", "ENABLE_APPROVER_TIER", "ENABLE_EXEC_EVALUATOR")
+_TIER_ENV = ("ENABLE_BYPASS_TIER", "ENABLE_APPROVER_TIER", "ENABLE_EXEC_EVALUATOR",
+             "ENABLE_EXEC_BASH", "ENABLE_AUTO_MERGE", "AUTO_MAX_JOBS", "EXECUTOR_SOCKET")
 
 
 @pytest.fixture(autouse=True)

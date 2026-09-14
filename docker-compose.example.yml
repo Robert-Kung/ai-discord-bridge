@@ -188,6 +188,11 @@ services:
       ENABLE_BYPASS_TIER: ${ENABLE_BYPASS_TIER:-}
       ENABLE_APPROVER_TIER: ${ENABLE_APPROVER_TIER:-}
       ENABLE_EXEC_EVALUATOR: ${ENABLE_EXEC_EVALUATOR:-}
+      # unattended-auto-mode: the auto-merge gate is a FRONTEND policy (like the tiers
+      # above) — it needs both ENABLE_EXEC_BASH-backed verify and ENABLE_EXEC_EVALUATOR
+      # live, refuses to serve otherwise. AUTO_MAX_JOBS bounds a task-list chain.
+      ENABLE_AUTO_MERGE: ${ENABLE_AUTO_MERGE:-}
+      AUTO_MAX_JOBS: ${AUTO_MAX_JOBS:-5}
       # M4: the frontend reads this to decide whether to request post-task verify.
       ENABLE_EXEC_BASH: ${ENABLE_EXEC_BASH:-}
       VERIFY_TIMEOUT: ${VERIFY_TIMEOUT:-600}  # keep identical to the executor's

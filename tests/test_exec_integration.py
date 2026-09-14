@@ -110,6 +110,43 @@ def test_full_exec_path_live_tree_changes_only_on_merge(repo_and_fake_claude):
     asyncio.run(go())
 
 
+def test_approve_mode_wires_the_mcp_approver(repo_and_fake_claude):
+    """approve-tier exec jobs MUST wire the per-command MCP approver in `manual` mode
+    (regression: run_streaming_exec silently omitted it, so `approve` behaved as manual
+    with no approval gate — Edit denied, Bash unprompted). `edit` stays approver-free."""
+    project, argv_log = repo_and_fake_claude
+
+    async def go():
+        wt, _b, _base = await worktree.create_job_worktree(project, "apj")
+        await runner.run_streaming_exec(
+            "A", "edit it", mode="approve", cwd=wt, project=project,
+            on_trace=lambda l: None, on_proc=lambda p: None,
+            should_abort=lambda: False, timeout=30)
+        (argv,) = _argv_calls(argv_log)
+        assert argv[argv.index("--permission-prompt-tool") + 1] == "mcp__approver__approve"
+        assert "--mcp-config" in argv and "--strict-mcp-config" in argv
+        # --permission-prompt-tool is consulted ONLY in manual mode
+        assert argv[argv.index("--permission-mode") + 1] == "manual"
+
+    asyncio.run(go())
+
+
+def test_edit_mode_has_no_approver(repo_and_fake_claude):
+    project, argv_log = repo_and_fake_claude
+
+    async def go():
+        wt, _b, _base = await worktree.create_job_worktree(project, "edj")
+        await runner.run_streaming_exec(
+            "A", "edit it", mode="edit", cwd=wt, project=project,
+            on_trace=lambda l: None, on_proc=lambda p: None,
+            should_abort=lambda: False, timeout=30)
+        (argv,) = _argv_calls(argv_log)
+        assert "--permission-prompt-tool" not in argv
+        assert argv[argv.index("--permission-mode") + 1] == "acceptEdits"
+
+    asyncio.run(go())
+
+
 def test_direct_job_keeps_resume_semantics(repo_and_fake_claude):
     """M1 path (cwd == project, no worktree): the session IS resumed and persisted."""
     project, argv_log = repo_and_fake_claude

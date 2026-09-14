@@ -11,13 +11,16 @@ RUN apt-get update \
     # worktree add/commit/diff/merge, and exec-tier jobs run inside a
     # `git worktree` checkout. Without it, startup GC and every exec job fail.
     && apt-get install -y --no-install-recommends nodejs git \
-    && npm install -g @anthropic-ai/claude-code \
+    # Floor at 2.1.217: the bridge's approve→`manual` permission-mode migration is
+    # invalid on older CLIs (`manual` was the 2.1.217 rename of `default`), so an
+    # older claude makes the settings canary error and the executor refuse to serve.
+    && npm install -g @anthropic-ai/claude-code@^2.1.217 \
     && apt-get purge -y --auto-remove curl gnupg \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 # Keep this version in sync with requirements-dev.txt (tests import the same dep).
-RUN pip install --no-cache-dir discord.py==2.4.0
+RUN pip install --no-cache-dir --timeout=120 --retries=10 discord.py==2.4.0
 
 # Install-time code-execution guardrails, belt to the per-spawn env injection in
 # bridge/config.py:INSTALL_GUARDRAIL_ENV. Written root-owned 0644: the app runs as
