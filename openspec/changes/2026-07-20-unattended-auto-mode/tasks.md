@@ -93,8 +93,10 @@
       choices, `manual` is the successor; `default` still runs as undocumented back-compat)
 - [x] 5.2 Grep the tree for any remaining `"default"`/`'default'` permission-mode literal;
       none survive outside comments/DEFAULT_* (grep clean)
-- [ ] 5.3 Live smoke: the `approve` tier on `manual` behaves as it did on `default` in
+- [x] 5.3 Live smoke: the `approve` tier on `manual` behaves as it did on `default` in
       headless `-p` (semantics unchanged — this is the only thing static analysis can't prove)
+      — operator-run 2026-09-14 on smoke-auto: per-command 🔐 escalation, ✅ runs / ❌ denies,
+      diff gate merge
 
 ## 6. Review gate
 - [x] 6.1 reviewer + security-reviewer on the full diff（auto-merge 決策面＋outbound 外流面）
@@ -111,6 +113,13 @@
       Accepted residuals (documented, out of scope): R1 evaluator genuine-obedience
       injection (correlated signals), R2 verify-RCE (gate-independent), F3 per-message
       (not per-task) tier re-validation (latent — flags are process globals).
-- [ ] 6.2 Live smoke: auto job with passing verify round-trips to merged; park paths
+- [x] 6.2 Live smoke: auto job with passing verify round-trips to merged; park paths
       (unverified / reject / evaluator-unavailable / refuse-to-serve) visible;
       dep-touching job auto-merges WITH a dep-note in the audit message
+      — operator-run 2026-09-14 on smoke-auto / smoke-noverify sandboxes:
+      2-task chain merged (734466 → 9d9d4a, 2nd branched from 1st's merge, dep-note on
+      requirements-dev.txt); reject park 689608; unverified park 0f213d; evaluator-unavailable
+      park b3929c (frontend CLAUDE_TIMEOUT=3 → verdict unsure); `!mode auto` refused with
+      evaluator off; H1 non-git cwd refused before the agent ran (690e77, no file written).
+      First run surfaced a real bug — executor verify gate exact-matched PROJECT_DIRS, so
+      every project was refused since the 7/21 parent-dir compose change → fixed in 3618267
